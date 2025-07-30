@@ -9,7 +9,6 @@ ffbuild_enabled() {
 
 ffbuild_dockerdl() {
     default_dl .
-    echo "./autogen.sh"
 }
 
 ffbuild_dockerbuild() {
@@ -26,7 +25,8 @@ ffbuild_dockerbuild() {
             --disable-rtcd
         )
     fi
-
+	
+	./autogen.sh
     ./configure "${myconf[@]}"
     make -j$(nproc)
     make install
