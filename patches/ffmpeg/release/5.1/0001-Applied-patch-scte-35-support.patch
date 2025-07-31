@@ -1,0 +1,415 @@
+From 0d7632479fbaa9d3e19a3a0046f50a919106475d Mon Sep 17 00:00:00 2001
+From: Alen Vrecko <alen.vrecko@fora.si>
+Date: Thu, 18 Apr 2024 11:13:39 +0200
+Subject: [PATCH 1/8] Applied patch: scte-35 support.
+
+---
+ doc/bitstream_filters.texi       |   9 +++
+ libavcodec/Makefile              |   1 +
+ libavcodec/bitstream_filters.c   |   1 +
+ libavcodec/defs.h                |  12 ++++
+ libavcodec/packet.h              |  11 ++++
+ libavcodec/scte35ptsadjust_bsf.c | 100 +++++++++++++++++++++++++++++++
+ libavformat/mpegts.c             |  11 +++-
+ libavformat/mpegts.h             |   1 +
+ libavformat/mpegtsenc.c          |  76 +++++++++++++++++++++--
+ 9 files changed, 217 insertions(+), 5 deletions(-)
+ create mode 100644 libavcodec/scte35ptsadjust_bsf.c
+
+diff --git a/doc/bitstream_filters.texi b/doc/bitstream_filters.texi
+index 50c95f035d..2b13e4df09 100644
+--- a/doc/bitstream_filters.texi
++++ b/doc/bitstream_filters.texi
+@@ -800,6 +800,15 @@ Remove extradata from all frames.
+ @end table
+ @end table
+ 
++@section scte35ptsadjust
++This bitstream filter makes use of side data injected by the MPEG-TS demux
++in order to rewrite the PTS adjust field within SCTE-35 packets.  This
++ensures the pts_adjust field contains a valid value if the caller changes
++the timebase of the stream.
++
++The bitstream filter is added automatically by the mpegtsenc mux, and no
++action is required on the part of the user.
++
+ @section setts
+ Set PTS and DTS in packets.
+ 
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 457ec58377..c88639aa4f 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1205,6 +1205,7 @@ OBJS-$(CONFIG_PCM_RECHUNK_BSF)            += pcm_rechunk_bsf.o
+ OBJS-$(CONFIG_PGS_FRAME_MERGE_BSF)        += pgs_frame_merge_bsf.o
+ OBJS-$(CONFIG_PRORES_METADATA_BSF)        += prores_metadata_bsf.o
+ OBJS-$(CONFIG_REMOVE_EXTRADATA_BSF)       += remove_extradata_bsf.o av1_parse.o
++OBJS-$(CONFIG_SCTE35PTSADJUST_BSF)        += scte35ptsadjust_bsf.o
+ OBJS-$(CONFIG_SETTS_BSF)                  += setts_bsf.o
+ OBJS-$(CONFIG_TEXT2MOVSUB_BSF)            += movsub_bsf.o
+ OBJS-$(CONFIG_TRACE_HEADERS_BSF)          += trace_headers_bsf.o
+diff --git a/libavcodec/bitstream_filters.c b/libavcodec/bitstream_filters.c
+index 444423ae93..b2d9f12b48 100644
+--- a/libavcodec/bitstream_filters.c
++++ b/libavcodec/bitstream_filters.c
+@@ -55,6 +55,7 @@ extern const FFBitStreamFilter ff_pcm_rechunk_bsf;
+ extern const FFBitStreamFilter ff_pgs_frame_merge_bsf;
+ extern const FFBitStreamFilter ff_prores_metadata_bsf;
+ extern const FFBitStreamFilter ff_remove_extradata_bsf;
++extern const FFBitStreamFilter ff_scte35ptsadjust_bsf;
+ extern const FFBitStreamFilter ff_setts_bsf;
+ extern const FFBitStreamFilter ff_text2movsub_bsf;
+ extern const FFBitStreamFilter ff_trace_headers_bsf;
+diff --git a/libavcodec/defs.h b/libavcodec/defs.h
+index 420a042b8f..0fa4155072 100644
+--- a/libavcodec/defs.h
++++ b/libavcodec/defs.h
+@@ -28,6 +28,7 @@
+ 
+ #include <stdint.h>
+ #include <stdlib.h>
++#include "libavutil/rational.h"
+ 
+ /**
+  * @ingroup lavc_decoding
+@@ -96,6 +97,17 @@ typedef struct AVPanScan {
+     int16_t position[3][2];
+ } AVPanScan;
+ 
++/**
++ * Original Transport Timestamp.  Provides the original timestamp
++ * of the packet as specified by the libavformat source  This allows that
++ * data to be used in calculations even if the clocks have been
++ * rebased or otherwise modified.
++ */
++typedef struct AVTransportTimestamp {
++    int64_t pts;
++    AVRational time_base;
++} AVTransportTimestamp;
++
+ /**
+  * This structure describes the bitrate properties of an encoded bitstream. It
+  * roughly corresponds to a subset the VBV parameters for MPEG-2 or HRD
+diff --git a/libavcodec/packet.h b/libavcodec/packet.h
+index 404d520071..bd434573e2 100644
+--- a/libavcodec/packet.h
++++ b/libavcodec/packet.h
+@@ -299,6 +299,17 @@ enum AVPacketSideDataType {
+      */
+     AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+ 
++    /**
++     * Provides the original PTS when passed through the demux.  This can
++     * be used to offset any subsequent changes made by the caller to
++     * adjust PTS values (such as pts_offset).  We need this for SCTE-35,
++     * since by the time the packets reach the output the PTS values have
++     * already been re-written, and we cannot calculate pre-roll values
++     * using the PTS values embedded in the packet content
++     * Format for this data can be found in AVTransportTimestamp struct
++     */
++    AV_PKT_DATA_TRANSPORT_TIMESTAMP,
++
+     /**
+      * The number of side data types.
+      * This is not part of the public API/ABI in the sense that it may
+diff --git a/libavcodec/scte35ptsadjust_bsf.c b/libavcodec/scte35ptsadjust_bsf.c
+new file mode 100644
+index 0000000000..9deffaafcb
+--- /dev/null
++++ b/libavcodec/scte35ptsadjust_bsf.c
+@@ -0,0 +1,100 @@
++/*
++ * SCTE-35 PTS fixup bitstream filter
++ * Copyright (c) 2023 LTN Global Communications, Inc.
++ *
++ * Author: Devin Heitmueller <dheitmueller@ltnglobal.com>
++ *
++ * Because SCTE-35 messages are represented in TS streams as sections
++ * rather than PES packets, we cannot rely on ffmpeg's standard
++ * mechanisms to adjust PTS values if reclocking the stream.
++ * This filter will leverage the SCTE-35 pts_adjust field to
++ * compensate for any change in the PTS values in the stream.
++ *
++ * See SCTE-35 2019 Sec 9.6 for information about the use of
++ * the pts_adjust field.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "bsf.h"
++#include "bsf_internal.h"
++#include "defs.h"
++#include "libavutil/intreadwrite.h"
++
++static int scte35ptsadjust_filter(AVBSFContext *ctx, AVPacket *pkt)
++{
++    const AVTransportTimestamp *transport_ts;
++    int64_t cur_pts_adjust;
++    int ret = 0;
++
++    ret = ff_bsf_get_packet_ref(ctx, pkt);
++    if (ret < 0)
++        return ret;
++
++    /* Retrieve the original PTS, which will be used to calculate the pts_adjust */
++    transport_ts = (AVTransportTimestamp *) av_packet_get_side_data(pkt, AV_PKT_DATA_TRANSPORT_TIMESTAMP, NULL);
++    if (transport_ts == NULL) {
++        /* No original PTS specified, so just pass the packet through */
++        return 0;
++    }
++
++    /* The pts_adjust field is logically buf[4]-buf[8] of the payload */
++    if (pkt->size < 9) {
++        ret = AVERROR_INVALIDDATA;
++        goto fail;
++    }
++
++    /* Extract the current pts_adjust value from the packet */
++    cur_pts_adjust = ((int64_t)(pkt->data[4] & 1) << 32 ) |
++	    AV_RB32(pkt->data + 5);
++
++    av_log(ctx, AV_LOG_DEBUG, "pts=%" PRId64 "(%d/%d) orig_pts=%" PRId64 "(%d/%d) pts_adjust=%" PRId64 "\n",
++           pkt->pts, pkt->time_base.num, pkt->time_base.den,
++           transport_ts->pts, transport_ts->time_base.num, transport_ts->time_base.den, cur_pts_adjust);
++
++    /* Compute the new PTS adjust value */
++    cur_pts_adjust -= av_rescale_q(transport_ts->pts, (AVRational){1, 90000}, (AVRational){1, 90000});
++    cur_pts_adjust += av_rescale_q(pkt->pts, (AVRational){1, 90000}, (AVRational){1, 90000});
++    cur_pts_adjust &= 0x1FFFFFFFFLL;
++
++    av_log(ctx, AV_LOG_DEBUG, "new pts_adjust=%" PRId64 "\n", cur_pts_adjust);
++
++    ret = av_packet_make_writable(pkt);
++    if (ret < 0)
++        goto fail;
++
++    /* Insert the updated pts_adjust value */
++    pkt->data[4] &= 0xfe; /* Preserve top 7 unrelated bits */
++    pkt->data[4] |= cur_pts_adjust >> 32;
++    AV_WB32(pkt->data + 5, cur_pts_adjust);
++
++fail:
++    if (ret < 0)
++        av_packet_unref(pkt);
++
++    return ret;
++}
++
++static const enum AVCodecID codec_ids[] = {
++    AV_CODEC_ID_SCTE_35, AV_CODEC_ID_NONE,
++};
++
++const FFBitStreamFilter ff_scte35ptsadjust_bsf = {
++    .p.name         = "scte35ptsadjust",
++    .p.codec_ids    = codec_ids,
++    .filter         = scte35ptsadjust_filter,
++};
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+index edbf126666..3deb83c173 100644
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -1780,8 +1780,17 @@ static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
+     prg = av_find_program_from_stream(ts->stream, NULL, idx);
+     if (prg && prg->pcr_pid != -1 && prg->discard != AVDISCARD_ALL) {
+         MpegTSFilter *f = ts->pids[prg->pcr_pid];
+-        if (f && f->last_pcr != -1)
++        if (f && f->last_pcr != -1) {
++            AVTransportTimestamp *transport_ts;
+             ts->pkt->pts = ts->pkt->dts = f->last_pcr/300;
++            transport_ts = (AVTransportTimestamp *) av_packet_new_side_data(ts->pkt,
++                                                                            AV_PKT_DATA_TRANSPORT_TIMESTAMP,
++                                                                            sizeof(AVTransportTimestamp));
++            if (transport_ts) {
++                transport_ts->pts = ts->pkt->pts;
++                transport_ts->time_base = ts->pkt->time_base;
++            }
++        }
+     }
+     ts->stop_parse = 1;
+ 
+diff --git a/libavformat/mpegts.h b/libavformat/mpegts.h
+index a48f14e768..a7aaabafe2 100644
+--- a/libavformat/mpegts.h
++++ b/libavformat/mpegts.h
+@@ -137,6 +137,7 @@
+ #define STREAM_TYPE_AUDIO_AC3       0x81
+ #define STREAM_TYPE_AUDIO_DTS       0x82
+ #define STREAM_TYPE_AUDIO_TRUEHD    0x83
++#define STREAM_TYPE_SCTE_35         0x86
+ #define STREAM_TYPE_AUDIO_EAC3      0x87
+ 
+ /* ISO/IEC 13818-1 Table 2-22 */
+diff --git a/libavformat/mpegtsenc.c b/libavformat/mpegtsenc.c
+index c964d58c8e..0a2d13a52f 100644
+--- a/libavformat/mpegtsenc.c
++++ b/libavformat/mpegtsenc.c
+@@ -418,6 +418,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
+     case AV_CODEC_ID_TIMED_ID3:
+         stream_type = STREAM_TYPE_METADATA;
+         break;
++    case AV_CODEC_ID_SCTE_35:
++        stream_type = STREAM_TYPE_SCTE_35;
++        break;
+     case AV_CODEC_ID_DVB_SUBTITLE:
+     case AV_CODEC_ID_DVB_TELETEXT:
+     case AV_CODEC_ID_ARIB_CAPTION:
+@@ -515,6 +518,16 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+         *q++ = 0xfc;        // private_data_byte
+     }
+ 
++    /* If there is an SCTE-35 stream, we need a registration descriptor
++       at the program level (SCTE 35 2016 Sec 8.1) */
++    for (i = 0; i < s->nb_streams; i++) {
++        AVStream *st = s->streams[i];
++        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
++            break;
++        }
++    }
++
+     val = 0xf000 | (q - program_info_length_ptr - 2);
+     program_info_length_ptr[0] = val >> 8;
+     program_info_length_ptr[1] = val;
+@@ -526,6 +539,14 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+         const char default_language[] = "und";
+         const char *language = lang && strlen(lang->value) >= 3 ? lang->value : default_language;
+         enum AVCodecID codec_id = st->codecpar->codec_id;
++        uint16_t pid;
++
++        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++            MpegTSSection *sect = st->priv_data;
++            pid = sect->pid;
++        } else {
++            pid = ts_st->pid;
++        }
+ 
+         if (s->nb_programs) {
+             int k, found = 0;
+@@ -549,7 +570,7 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+         stream_type = ts->m2ts_mode ? get_m2ts_stream_type(s, st) : get_dvb_stream_type(s, st);
+ 
+         *q++ = stream_type;
+-        put16(&q, 0xe000 | ts_st->pid);
++        put16(&q, 0xe000 | pid);
+         desc_length_ptr = q;
+         q += 2; /* patched after */
+ 
+@@ -810,6 +831,10 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+                 putbuf(&q, tag, strlen(tag));
+                 *q++ = 0;            /* metadata service ID */
+                 *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
++            } else if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++                *q++ = 0x8a; /* Cue Identifier Descriptor */
++                *q++ = 0x01; /* length */
++                *q++ = 0x01; /* Cue Stream Type (see Sec 8.2) */
+             }
+             break;
+         }
+@@ -1150,6 +1175,33 @@ static int mpegts_init(AVFormatContext *s)
+         AVStream *st = s->streams[i];
+         MpegTSWriteStream *ts_st;
+ 
++        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++            struct MpegTSSection *sect;
++            sect = av_mallocz(sizeof(MpegTSSection));
++            if (!sect) {
++                ret = AVERROR(ENOMEM);
++                continue;
++            }
++
++            if (st->id < 16) {
++                sect->pid = ts->start_pid + i;
++            } else if (st->id < 0x1FFF) {
++                sect->pid = st->id;
++            } else {
++                av_log(s, AV_LOG_ERROR,
++                       "Invalid stream id %d, must be less than 8191\n", st->id);
++                ret = AVERROR(EINVAL);
++                continue;
++            }
++
++            sect->write_packet = section_write_packet;
++            sect->opaque       = s;
++            sect->cc           = 15;
++            sect->discontinuity= ts->flags & MPEGTS_FLAG_DISCONT;
++            st->priv_data = sect;
++            continue;
++        }
++
+         ts_st = av_mallocz(sizeof(MpegTSWriteStream));
+         if (!ts_st) {
+             return AVERROR(ENOMEM);
+@@ -1866,6 +1918,19 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+             dts += delay;
+     }
+ 
++    if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++        MpegTSSection *s = st->priv_data;
++        uint8_t data[SECTION_LENGTH];
++
++        if (size > SECTION_LENGTH) {
++            av_log(s, AV_LOG_ERROR, "SCTE-35 section too long\n");
++            return AVERROR_INVALIDDATA;
++        }
++        memcpy(data, buf, size);
++        mpegts_write_section(s, data, size);
++        return 0;
++    }
++
+     if (!ts_st->first_timestamp_checked && (pts == AV_NOPTS_VALUE || dts == AV_NOPTS_VALUE)) {
+         av_log(s, AV_LOG_ERROR, "first pts and dts value must be set\n");
+         return AVERROR_INVALIDDATA;
+@@ -2106,7 +2171,8 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+         return 0;
+     }
+ 
+-    if (ts_st->payload_size && (ts_st->payload_size + size > ts->pes_payload_size ||
++    if (st->codecpar->codec_id != AV_CODEC_ID_SCTE_35 &&
++        ts_st->payload_size && (ts_st->payload_size + size > ts->pes_payload_size ||
+         (dts != AV_NOPTS_VALUE && ts_st->payload_dts != AV_NOPTS_VALUE &&
+          dts - ts_st->payload_dts >= max_audio_delay) ||
+         ts_st->opus_queued_samples + opus_samples >= 5760 /* 120ms */)) {
+@@ -2151,7 +2217,7 @@ static void mpegts_write_flush(AVFormatContext *s)
+     for (i = 0; i < s->nb_streams; i++) {
+         AVStream *st = s->streams[i];
+         MpegTSWriteStream *ts_st = st->priv_data;
+-        if (ts_st->payload_size > 0) {
++        if (st->codecpar->codec_id != AV_CODEC_ID_SCTE_35 && ts_st->payload_size > 0) {
+             mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
+                              ts_st->payload_pts, ts_st->payload_dts,
+                              ts_st->payload_flags & AV_PKT_FLAG_KEY, -1);
+@@ -2194,7 +2260,7 @@ static void mpegts_deinit(AVFormatContext *s)
+     for (i = 0; i < s->nb_streams; i++) {
+         AVStream *st = s->streams[i];
+         MpegTSWriteStream *ts_st = st->priv_data;
+-        if (ts_st) {
++        if (ts_st && st->codecpar->codec_id != AV_CODEC_ID_SCTE_35) {
+             av_freep(&ts_st->dvb_ac3_desc);
+             av_freep(&ts_st->payload);
+             if (ts_st->amux) {
+@@ -2228,6 +2294,8 @@ static int mpegts_check_bitstream(AVFormatContext *s, AVStream *st,
+                               (st->codecpar->extradata_size > 0 &&
+                                st->codecpar->extradata[0] == 1)))
+             ret = ff_stream_add_bitstream_filter(st, "hevc_mp4toannexb", NULL);
++    } else if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++        ret = ff_stream_add_bitstream_filter(st, "scte35ptsadjust", NULL);
+     }
+ 
+     return ret;
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,38 @@
+From 87619b57d835b37c8cfbb7b4166cafe8f5b9ec3e Mon Sep 17 00:00:00 2001
+From: Alen Vrecko <alen.vrecko@fora.si>
+Date: Thu, 18 Apr 2024 15:56:54 +0200
+Subject: [PATCH 5/8] Updated patch: pretend as if scte-35 is always present.
+
+---
+ libavformat/mux.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/libavformat/mux.c b/libavformat/mux.c
+index 8b99cadabc..7d97127643 100644
+--- a/libavformat/mux.c
++++ b/libavformat/mux.c
+@@ -934,7 +934,8 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+         const FFStream *const sti = cffstream(st);
+         const AVCodecParameters *const par = st->codecpar;
+         if (sti->last_in_packet_buffer ||
+-            par->codec_type == AVMEDIA_TYPE_SUBTITLE) {
++            par->codec_type == AVMEDIA_TYPE_SUBTITLE ||
++            par->codec_id == AV_CODEC_ID_SCTE_35) {
+             ++stream_count;
+         } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
+                    par->codec_id != AV_CODEC_ID_VP8 &&
+@@ -963,8 +964,10 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+             const PacketListEntry *const last = sti->last_in_packet_buffer;
+             int64_t last_dts;
+ 
+-            if (!last)
++            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
++                st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+                 continue;
++            }
+ 
+             last_dts = av_rescale_q(last->pkt.dts,
+                                     st->time_base,
+-- 
+2.39.5 (Apple Git-154)
+

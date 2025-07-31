@@ -1,0 +1,27 @@
+From 8d026765f43abac2d660b82af2f07dc3be850270 Mon Sep 17 00:00:00 2001
+From: Alen Vrecko <alen.vrecko@fora.si>
+Date: Thu, 18 Apr 2024 11:15:12 +0200
+Subject: [PATCH 3/8] Applied patch: pretend as if subtitles are always
+ present.
+
+---
+ libavformat/mux.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/mux.c b/libavformat/mux.c
+index 31361f9b46..8b99cadabc 100644
+--- a/libavformat/mux.c
++++ b/libavformat/mux.c
+@@ -933,7 +933,8 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+         const AVStream *const st  = s->streams[i];
+         const FFStream *const sti = cffstream(st);
+         const AVCodecParameters *const par = st->codecpar;
+-        if (sti->last_in_packet_buffer) {
++        if (sti->last_in_packet_buffer ||
++            par->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+             ++stream_count;
+         } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
+                    par->codec_id != AV_CODEC_ID_VP8 &&
+-- 
+2.39.5 (Apple Git-154)
+
