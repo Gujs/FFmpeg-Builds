@@ -25,7 +25,9 @@ if [[ -z "$2" ]]; then
 else
     "$2"
 fi
-rm -rf "$FFBUILD_PREFIX"/bin
+
+# Only clean bin/ if not explicitly needed
+[[ "$PRESERVE_BIN" != "1" ]] && rm -rf "$FFBUILD_PREFIX"/bin
 
 if [[ -n "$STAGENAME" ]]; then
     rm -rf "/$STAGENAME"

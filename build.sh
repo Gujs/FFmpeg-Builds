@@ -30,8 +30,8 @@ trap "rm -f -- '$BUILD_SCRIPT'" EXIT
 cat <<EOF >"$BUILD_SCRIPT"
     set -xe
     cd /ffbuild
-    if [[ -d /ffbuild/prefix/bin ]]; then
-        export PATH="/ffbuild/prefix/bin:\$PATH"
+    if [[ -d /opt/ffbuild//bin ]]; then
+        export PATH="\$PATH:/opt/ffbuild/bin"
     fi
     rm -rf ffmpeg prefix
 
