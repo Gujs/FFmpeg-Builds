@@ -35,7 +35,7 @@ ffbuild_dockerbuild() {
     elif [[ $ADDINS_STR == *7.1* ]]; then
         cd ffnvcodec4
     else
-        cd ffnvcodec
+        cd ffnvcodec4
     fi
 
     make PREFIX="$FFBUILD_PREFIX" install
