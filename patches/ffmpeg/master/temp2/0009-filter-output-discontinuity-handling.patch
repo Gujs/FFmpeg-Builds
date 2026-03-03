@@ -1,0 +1,151 @@
+From: FFmpeg Patches <patches@ffmpeg.org>
+Subject: [PATCH] fftools/ffmpeg_filter: handle timestamp discontinuities at filter output
+
+When demuxer-level timestamp correction (force_dts_monotonicity) handles
+large discontinuities, the decoder may still have buffered frames with
+old (uncorrected) timestamps. When these stale frames reach the filter
+output, they cause massive gaps that result in:
+- Video: Attempting to duplicate millions of frames
+- Audio: Non-monotonic DTS warnings from muxer
+
+This patch adds generic discontinuity handling at the filter output level:
+
+For video:
+- When frame duplication count exceeds threshold (30 seconds worth of frames),
+  drop the stale frame but do NOT reset next_pts
+- Track consecutive drops with discont_drop_count
+- After 30 consecutive drops, sync to new timeline position
+- This handles both stale decoder-buffered frames and real timeline shifts
+
+For audio:
+- Add gap detection before processing (30 second threshold)
+- Log warning for large gaps
+- Allow audio to continue (don't drop - causes audible glitches)
+- The existing next_pts update handles timeline reset naturally
+
+The key principle: do NOT adjust ts_offset at filter level. Let demuxer
+corrections flow through. Both video and audio continue from the current
+timeline position, maintaining A/V sync.
+
+This works in conjunction with the demuxer-level patch (0007) which
+ensures all streams receive the same timestamp correction offset.
+
+V2: Fixed threshold from dts_error_threshold*30 (3.24M frames) to
+    30 seconds worth of frames (~900 at 30fps). The old threshold
+    was too high and never triggered for typical discontinuities.
+
+Signed-off-by: FFmpeg Patches <patches@ffmpeg.org>
+---
+ fftools/ffmpeg_filter.c | 67 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
+index 23bd580..df5d98e 100644
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -176,6 +176,11 @@ typedef struct FPSConvContext {
+     int               last_dropped;
+     int               dropped_keyframe;
+
++    /* Counter for consecutive frames dropped due to discontinuity detection.
++     * Used to detect when we're stuck dropping frames and need to sync
++     * to a new timeline position. */
++    int               discont_drop_count;
++
+     enum VideoSyncMethod vsync_method;
+
+     AVRational        framerate;
+@@ -2680,12 +2685,47 @@ finish:
+                "*** dropping frame %"PRId64" at ts %"PRId64"\n",
+                fps->frame_number, fps->last_frame->pts);
+     }
++    /* Reset discontinuity drop counter when we're outputting frames normally */
++    if (*nb_frames > 0 && *nb_frames <= 100) {
++        fps->discont_drop_count = 0;
++    }
++
+     if (*nb_frames > (*nb_frames_prev && fps->last_dropped) + (*nb_frames > *nb_frames_prev)) {
+         uint64_t nb_frames_dup;
+-        if (*nb_frames > dts_error_threshold * 30) {
+-            av_log(ofp, AV_LOG_ERROR, "%"PRId64" frame duplication too large, skipping\n", *nb_frames - 1);
+-            atomic_fetch_add(&ofilter->nb_frames_drop, 1);
+-            *nb_frames = 0;
+-            return;
++        /* Discontinuity threshold: 30 seconds worth of frames at output rate */
++        int64_t discont_threshold = (int64_t)(30.0 / av_q2d(ofp->tb_out));
++        if (discont_threshold < 100)
++            discont_threshold = 100;  /* minimum 100 frames */
++        if (*nb_frames > discont_threshold) {
++            /*
++             * Large gap detected - likely a stale decoder-buffered frame after
++             * demuxer corrected a timestamp discontinuity.
++             *
++             * Strategy: Drop stale frames initially, but if we keep dropping
++             * for too long (> 1 second worth of frames), sync to the new
++             * timeline. This handles two cases:
++             * 1. Stale decoder-buffered frames: drop a few, then good frames arrive
++             * 2. Real timeline shift: after many drops, sync to new position
++             */
++            int64_t frame_pts = llrint(sync_ipts);
++            fps->discont_drop_count++;
++
++            if (fps->discont_drop_count > 30) {
++                /* Too many consecutive drops - sync to new timeline */
++                av_log(ofp, AV_LOG_WARNING,
++                       "Video discontinuity: syncing to new timeline after %d drops "
++                       "(next_pts: %"PRId64" -> %"PRId64", gap: %.1fs)\n",
++                       fps->discont_drop_count, ofp->next_pts, frame_pts,
++                       delta0 * av_q2d(ofp->tb_out));
++                ofp->next_pts = frame_pts;
++                fps->discont_drop_count = 0;
++                /* Don't drop this frame - it's our sync point */
++                *nb_frames = 1;
++            } else {
++                /* Still within tolerance - drop stale frame */
++                av_log(ofp, AV_LOG_WARNING,
++                       "Video discontinuity: %"PRId64" frame gap (%.1fs) - "
++                       "dropping frame %d (next_pts: %"PRId64")\n",
++                       *nb_frames - 1, delta0 * av_q2d(ofp->tb_out),
++                       fps->discont_drop_count, ofp->next_pts);
++                atomic_fetch_add(&ofilter->nb_frames_drop, 1);
++                *nb_frames = 0;
++                return;
++            }
+         }
+         nb_frames_dup = atomic_fetch_add(&ofilter->nb_frames_dup,
+                                          *nb_frames - (*nb_frames_prev && fps->last_dropped) - (*nb_frames > *nb_frames_prev));
+@@ -2781,6 +2821,25 @@ static int fg_output_frame(OutputFilterPriv *ofp, FilterGraphThread *fgt,
+     if (type == AVMEDIA_TYPE_VIDEO && (frame || fgt->got_frame))
+         video_sync_process(ofp, frame, &nb_frames, &nb_frames_prev);
+
++    /*
++     * Audio discontinuity detection: check for large timestamp gaps that
++     * indicate stale decoder-buffered frames after a discontinuity correction.
++     * Unlike video, we don't drop audio frames (causes audible glitches).
++     * Instead, log the gap and let the frame through - next_pts will be
++     * updated to the new position, maintaining sync with video.
++     */
++    if (type == AVMEDIA_TYPE_AUDIO && frame && ofp->next_pts != AV_NOPTS_VALUE) {
++        int64_t frame_pts = (frame->pts == AV_NOPTS_VALUE) ? ofp->next_pts :
++            av_rescale_q(frame->pts, frame->time_base, ofp->tb_out) -
++            av_rescale_q(ofp->ts_offset, AV_TIME_BASE_Q, ofp->tb_out);
++        int64_t gap = frame_pts - ofp->next_pts;
++        double gap_sec = gap * av_q2d(ofp->tb_out);
++
++        /* Check for large forward or backward gap (stale frame) - 30 second threshold */
++        if (gap_sec > 30.0 || gap_sec < -30.0) {
++            av_log(ofp, AV_LOG_WARNING,
++                   "Audio discontinuity: %.1fs gap detected "
++                   "(expected pts %"PRId64", got %"PRId64") - "
++                   "continuing with timeline reset\n",
++                   gap_sec, ofp->next_pts, frame_pts);
++            /* Don't drop audio - let it through. next_pts will be updated
++             * naturally at the end of processing (next_pts = frame->pts + duration) */
++        }
++    }
++
+     for (int64_t i = 0; i < nb_frames; i++) {
+         AVFrame *frame_out;
+         int ret;
+--
+2.39.0

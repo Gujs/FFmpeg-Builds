@@ -1,0 +1,143 @@
+From: Claude Assistant <noreply@anthropic.com>
+Date: Fri, 24 Jan 2025
+Subject: [PATCH 0006] fftools/ffmpeg_filter: selective video state reset on reconfig V3
+
+When the filter graph is reconfigured due to audio parameter changes
+(e.g., stereo->5.1), video state was being unnecessarily cleared.
+This caused frames to appear "from the past" because:
+
+1. fps.last_frame was cleared, losing the previous video frame
+2. The vsync logic would then produce incorrect frame references
+3. This manifested as video briefly jumping backward in time
+
+V3 changes from V2:
+- Added reinit_reason field to FilterGraphPriv to track WHAT changed
+- Only clear video state (frame_enc, fps.last_frame, history) when
+  VIDEO_CHANGED, MATRIX_CHANGED, or HWACCEL_CHANGED is set
+- Audio-only changes (AUDIO_CHANGED, DOWNMIX_CHANGED) no longer
+  affect video state at all
+- Moved ReinitReason enum to top of file for visibility
+
+This is a critical fix for live streaming scenarios where audio
+channel layout changes frequently (e.g., broadcast with stereo
+commercials and 5.1 program content).
+---
+ fftools/ffmpeg_filter.c | 64 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
+index 4387c99..d7c7e53 100644
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -40,6 +40,15 @@
+ #include "libavutil/time.h"
+ #include "libavutil/timestamp.h"
+ 
++// Reasons for filter graph reconfiguration - used to selectively reset state
++enum ReinitReason {
++    VIDEO_CHANGED   = (1 << 0),
++    AUDIO_CHANGED   = (1 << 1),
++    MATRIX_CHANGED  = (1 << 2),
++    DOWNMIX_CHANGED = (1 << 3),
++    HWACCEL_CHANGED = (1 << 4)
++};
++
+ typedef struct FilterGraphPriv {
+     FilterGraph      fg;
+ 
+@@ -58,6 +67,10 @@ typedef struct FilterGraphPriv {
+ 
+     int              nb_threads;
+ 
++    // Reason for current reconfiguration (bitmask of AUDIO_CHANGED, VIDEO_CHANGED, etc.)
++    // Set before configure_filtergraph(), used by cleanup_filtergraph()
++    int              reinit_reason;
++
+     // frame for temporarily holding output from the filtergraph
+     AVFrame         *frame;
+     // frame for sending output to the encoder
+@@ -2025,8 +2038,36 @@ static int configure_input_filter(FilterGraph *fg, AVFilterGraph *graph,
+ 
+ static void cleanup_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
+ {
+-    for (int i = 0; i < fg->nb_outputs; i++)
++    FilterGraphPriv *fgp = fgp_from_fg(fg);
++
++    // Check if video parameters changed - only then should we clear video state
++    // This prevents audio-only changes (stereo->5.1) from disrupting video output
++    int video_changed = fgp->reinit_reason & (VIDEO_CHANGED | MATRIX_CHANGED | HWACCEL_CHANGED);
++
++    // Only clear encoder frame buffer if video needs reconfiguration
++    if (video_changed)
++        av_frame_unref(fgp->frame_enc);
++
++    for (int i = 0; i < fg->nb_outputs; i++) {
++        OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[i]);
++
++        // Only clear video-specific state when video actually changed
++        // Audio parameter changes should NOT affect video vsync state
++        if (fg->outputs[i]->type == AVMEDIA_TYPE_VIDEO && video_changed) {
++            // Clear the last_frame buffer used for vsync frame duplication
++            if (ofp->fps.last_frame)
++                av_frame_unref(ofp->fps.last_frame);
++
++            // Reset vsync history to prevent stale timing decisions
++            memset(ofp->fps.frames_prev_hist, 0, sizeof(ofp->fps.frames_prev_hist));
++            ofp->fps.last_dropped = 0;
++
++            // Force a keyframe on the next frame to help encoder recover
++            ofp->fps.dropped_keyframe = 1;
++        }
++
+         fg->outputs[i]->filter = NULL;
++    }
+     for (int i = 0; i < fg->nb_inputs; i++)
+         fg->inputs[i]->filter = NULL;
+     avfilter_graph_free(&fgt->graph);
+@@ -3040,6 +3081,8 @@ static int send_eof(FilterGraphThread *fgt, InputFilter *ifilter,
+                 return ret;
+ 
+             if (ifilter_has_all_input_formats(ifilter->graph)) {
++                // Initial configuration - mark as full reinit
++                fgp_from_fg(ifilter->graph)->reinit_reason = VIDEO_CHANGED | AUDIO_CHANGED;
+                 ret = configure_filtergraph(ifilter->graph, fgt);
+                 if (ret < 0) {
+                     av_log(ifilter->graph, AV_LOG_ERROR, "Error initializing filters!\n");
+@@ -3059,14 +3102,6 @@ static int send_eof(FilterGraphThread *fgt, InputFilter *ifilter,
+     return 0;
+ }
+ 
+-enum ReinitReason {
+-    VIDEO_CHANGED   = (1 << 0),
+-    AUDIO_CHANGED   = (1 << 1),
+-    MATRIX_CHANGED  = (1 << 2),
+-    DOWNMIX_CHANGED = (1 << 3),
+-    HWACCEL_CHANGED = (1 << 4)
+-};
+-
+ static const char *unknown_if_null(const char *str)
+ {
+     return str ? str : "unknown";
+@@ -3199,6 +3234,10 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+             sch_filter_choke_inputs(fgp->sch, fgp->sch_idx);
+         }
+ 
++        // Store the reinit reason so cleanup_filtergraph knows what changed
++        // This prevents audio-only changes from clearing video state
++        fgp->reinit_reason = need_reinit;
++
+         ret = configure_filtergraph(fg, fgt);
+         if (ret < 0) {
+             av_log(fg, AV_LOG_ERROR, "Error reinitializing filters!\n");
+@@ -3306,6 +3345,8 @@ static int filter_thread(void *arg)
+ 
+     // if we have all input parameters the graph can now be configured
+     if (ifilter_has_all_input_formats(fg)) {
++        // Initial configuration - mark as full reinit
++        fgp->reinit_reason = VIDEO_CHANGED | AUDIO_CHANGED;
+         ret = configure_filtergraph(fg, &fgt);
+         if (ret < 0) {
+             av_log(fg, AV_LOG_ERROR, "Error configuring filter graph: %s\n",
+
+-- 
+2.39.0
