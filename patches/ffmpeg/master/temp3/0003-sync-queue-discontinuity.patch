@@ -1,0 +1,77 @@
+diff --git a/fftools/sync_queue.c b/fftools/sync_queue.c
+index fbf288c6d1..bf3dc891e2 100644
+--- a/fftools/sync_queue.c
++++ b/fftools/sync_queue.c
+@@ -28,6 +28,7 @@
+ #include "libavutil/mem.h"
+ #include "libavutil/samplefmt.h"
+ #include "libavutil/timestamp.h"
++#include "libavutil/time.h"
+ 
+ #include "sync_queue.h"
+ 
+@@ -243,11 +244,46 @@ static void queue_head_update(SyncQueue *sq)
+ static void stream_update_ts(SyncQueue *sq, unsigned int stream_idx, int64_t ts)
+ {
+     SyncQueueStream *st = &sq->streams[stream_idx];
++    static int64_t last_log_time = 0;
++    int64_t now;
+ 
+-    if (ts == AV_NOPTS_VALUE ||
+-        (st->head_ts != AV_NOPTS_VALUE && st->head_ts >= ts))
++    if (ts == AV_NOPTS_VALUE)
+         return;
+ 
++    /* NOTE: Discontinuity detection (backward/forward jump, divergence) has been
++     * removed. These resets caused more harm than good - when the demuxer rebases
++     * timestamps, different streams may rebase at slightly different times, causing
++     * false divergence detection. The muxer DTS fix (0010-muxer-dts-discontinuity.patch)
++     * handles timestamp continuity at the output level instead. */
++
++    /* Diagnostic logging: periodically log sync queue state */
++    now = av_gettime_relative();
++    if (now - last_log_time > 5000000) {  /* Every 5 seconds */
++        av_log(sq->logctx, AV_LOG_INFO,
++               "[SQ-DIAG] stream %u: new_ts=%"PRId64" head_ts=%"PRId64" head_stream=%d tb=%d/%d\n",
++               stream_idx, ts, st->head_ts, sq->head_stream, st->tb.num, st->tb.den);
++        for (unsigned int i = 0; i < sq->nb_streams; i++) {
++            SyncQueueStream *s = &sq->streams[i];
++            int64_t head_sec = (s->head_ts != AV_NOPTS_VALUE && s->tb.den) ?
++                               av_rescale_q(s->head_ts, s->tb, (AVRational){1,1}) : -1;
++            av_log(sq->logctx, AV_LOG_INFO,
++                   "[SQ-DIAG]   stream[%u]: head_ts=%"PRId64" (~%"PRId64"s) limiting=%d finished=%d\n",
++                   i, s->head_ts, head_sec, s->limiting, s->finished);
++        }
++        last_log_time = now;
++    }
++
++    /* Reject frames with non-advancing timestamps, but log significant gaps */
++    if (st->head_ts != AV_NOPTS_VALUE && st->head_ts >= ts) {
++        int64_t gap_us = av_rescale_q(st->head_ts - ts, st->tb, AV_TIME_BASE_Q);
++        if (gap_us > 100000) {  /* More than 100ms backward */
++            av_log(sq->logctx, AV_LOG_WARNING,
++                   "[SQ-DIAG] stream %u: frame ts=%"PRId64" rejected (head_ts=%"PRId64", gap=%.3fs backward)\n",
++                   stream_idx, ts, st->head_ts, gap_us / 1000000.0);
++        }
++        return;
++    }
++
+     st->head_ts = ts;
+ 
+     /* if this stream is now ahead of some finished stream, then
+@@ -362,6 +398,15 @@ int sq_send(SyncQueue *sq, unsigned int stream_idx, SyncQueueFrame frame)
+     av_log(sq->logctx, AV_LOG_DEBUG, "sq: send %u ts %s\n", stream_idx,
+            av_ts2timestr(ts, &st->tb));
+ 
++    /* Log frame submission details for audio streams (stream_idx 1+) every 500 frames */
++    if (stream_idx > 0 && (st->frames_sent % 500 == 0 || st->frames_sent < 5)) {
++        int64_t ts_sec = av_rescale_q(ts, st->tb, (AVRational){1,1});
++        av_log(sq->logctx, AV_LOG_INFO,
++               "[SQ-AUDIO] stream %u: frame %"PRIu64" submitted, ts=%"PRId64" (~%"PRId64"s), head_ts=%"PRId64"\n",
++               stream_idx, st->frames_sent, ts, ts_sec,
++               st->head_ts != AV_NOPTS_VALUE ? st->head_ts : -1);
++    }
++
+     ret = av_container_fifo_write(st->fifo, SQPTR(sq, frame), 0);
+     if (ret < 0)
+         return ret;

@@ -1,0 +1,77 @@
+diff --git a/fftools/ffmpeg_mux.c b/fftools/ffmpeg_mux.c
+index 25f66dd185..d5a7e785b2 100644
+--- a/fftools/ffmpeg_mux.c
++++ b/fftools/ffmpeg_mux.c
+@@ -179,22 +179,57 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
+             ms->last_mux_dts != AV_NOPTS_VALUE) {
+             int64_t max = ms->last_mux_dts + !(mux->fc->oformat->flags & AVFMT_TS_NONSTRICT);
+             if (pkt->dts < max) {
+-                int loglevel = max - pkt->dts > 2 || ost->type == AVMEDIA_TYPE_VIDEO ? AV_LOG_WARNING : AV_LOG_DEBUG;
+-                if (exit_on_error)
+-                    loglevel = AV_LOG_ERROR;
+-                av_log(ost, loglevel, "Non-monotonic DTS; "
+-                       "previous: %"PRId64", current: %"PRId64"; ",
+-                       ms->last_mux_dts, pkt->dts);
+-                if (exit_on_error) {
+-                    return AVERROR(EINVAL);
++                /* Calculate backward jump in seconds using output timebase.
++                 * For audio at 48kHz, 5 seconds = 240000 ticks.
++                 * For video at 90kHz, 5 seconds = 450000 ticks. */
++                AVRational tb = ost->st->time_base;
++                int64_t backward_jump = ms->last_mux_dts - pkt->dts;
++                int64_t threshold_ticks = 5 * tb.den / tb.num;  /* 5 seconds in timebase units */
++
++                if (backward_jump > threshold_ticks) {
++                    /* Large backward jump (>5 seconds) indicates a timestamp discontinuity
++                     * from stream rebasing. Reset our tracking to accept the new baseline
++                     * rather than corrupting timestamps by forcing them forward. */
++                    av_log(ost, AV_LOG_WARNING,
++                           "[MUX-DISCONT] Large DTS jump detected (%.3fs backward), "
++                           "accepting new baseline: previous=%"PRId64" new=%"PRId64"\n",
++                           backward_jump * av_q2d(tb), ms->last_mux_dts, pkt->dts);
++
++                    /* The underlying muxer tracks DTS independently and will reject
++                     * non-monotonic values. We must continue from where we left off,
++                     * not jump to a new baseline. Calculate shift to continue from
++                     * last_mux_dts + small_increment. */
++                    {
++                        int64_t increment = (pkt->duration > 0) ? pkt->duration : 1;
++                        int64_t new_dts = ms->last_mux_dts + increment;
++                        int64_t shift = new_dts - pkt->dts;
++                        av_log(ost, AV_LOG_WARNING,
++                               "[MUX-DISCONT] Rebasing: dts %"PRId64" -> %"PRId64" (shift=%"PRId64", %.3fs)\n",
++                               pkt->dts, new_dts, shift, shift * av_q2d(tb));
++                        if (pkt->pts != AV_NOPTS_VALUE)
++                            pkt->pts += shift;
++                        pkt->dts = new_dts;
++                    }
++                    /* Continue with rebased timestamps */
++                } else {
++                    /* Small backward jump - use original behavior */
++                    int loglevel = max - pkt->dts > 2 || ost->type == AVMEDIA_TYPE_VIDEO ? AV_LOG_WARNING : AV_LOG_DEBUG;
++                    if (exit_on_error)
++                        loglevel = AV_LOG_ERROR;
++                    av_log(ost, loglevel, "Non-monotonic DTS; "
++                           "previous: %"PRId64", current: %"PRId64"; ",
++                           ms->last_mux_dts, pkt->dts);
++                    if (exit_on_error) {
++                        return AVERROR(EINVAL);
++                    }
++
++                    av_log(ost, loglevel, "changing to %"PRId64". This may result "
++                           "in incorrect timestamps in the output file.\n",
++                           max);
++                    if (pkt->pts >= pkt->dts)
++                        pkt->pts = FFMAX(pkt->pts, max);
++                    pkt->dts = max;
+                 }
+-
+-                av_log(ost, loglevel, "changing to %"PRId64". This may result "
+-                       "in incorrect timestamps in the output file.\n",
+-                       max);
+-                if (pkt->pts >= pkt->dts)
+-                    pkt->pts = FFMAX(pkt->pts, max);
+-                pkt->dts = max;
+             }
+         }
+     }

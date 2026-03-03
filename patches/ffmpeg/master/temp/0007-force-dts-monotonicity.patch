@@ -1,0 +1,180 @@
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 7720dd9c59..a2a63f8759 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -756,6 +756,9 @@ extern char *vstats_filename;
+ extern float dts_delta_threshold;
+ extern float dts_error_threshold;
+ 
++extern int force_dts_monotonicity;
++extern int dts_monotonicity_threshold;
++
+ extern enum VideoSyncMethod video_sync_method;
+ extern float frame_drop_threshold;
+ extern int do_benchmark;
+@@ -773,6 +776,7 @@ extern int64_t stats_period;
+ extern int stdin_interaction;
+ extern AVIOContext *progress_avio;
+ extern float max_error_rate;
++extern int decoder_reorder_flush_threshold;
+ 
+ extern char *filter_nbthreads;
+ extern int filter_complex_nbthreads;
+diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
+index 193967fce1..7b6a312d60 100644
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -82,6 +82,12 @@ typedef struct DemuxStream {
+     /// dts of the last packet read for this stream (in AV_TIME_BASE units)
+     int64_t                  dts;
+ 
++    /**
++     * Per-stream cumulative offset for maintaining timestamp monotonicity
++     * across discontinuities (used when force_dts_monotonicity is enabled).
++     */
++    int64_t                  ts_monotonicity_offset;
++
+     const AVCodecDescriptor *codec_desc;
+ 
+     AVDictionary            *decoder_opts;
+@@ -228,8 +234,14 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
+     DemuxStream *ds = ds_from_ist(ist);
+     const int fmt_is_discont = ifile->ctx->iformat->flags & AVFMT_TS_DISCONT;
+     int disable_discontinuity_correction = copy_ts;
+-    int64_t pkt_dts = av_rescale_q_rnd(pkt->dts, pkt->time_base, AV_TIME_BASE_Q,
+-                                       AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
++    int64_t pkt_dts;
++
++    // Skip normal discontinuity detection when monotonicity mode is active
++    if (force_dts_monotonicity)
++        return;
++
++    pkt_dts = av_rescale_q_rnd(pkt->dts, pkt->time_base, AV_TIME_BASE_Q,
++                               AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+ 
+     if (copy_ts && ds->next_dts != AV_NOPTS_VALUE &&
+         fmt_is_discont && ist->st->pts_wrap_bits < 60) {
+@@ -289,6 +301,62 @@ static void ts_discontinuity_detect(Demuxer *d, InputStream *ist,
+     d->last_ts = av_rescale_q(pkt->dts, pkt->time_base, AV_TIME_BASE_Q);
+ }
+ 
++/**
++ * Apply monotonicity correction to timestamps.
++ * Corrects backward jumps to maintain DTS monotonicity.
++ * Resets accumulated offset on large forward jumps (discontinuities).
++ */
++static void ts_monotonicity_correct(Demuxer *d, InputStream *ist, AVPacket *pkt)
++{
++    DemuxStream *ds = ds_from_ist(ist);
++    int64_t dts_error = 0;
++
++    // Apply accumulated per-stream monotonicity offset
++    if (pkt->pts != AV_NOPTS_VALUE)
++        pkt->pts += ds->ts_monotonicity_offset;
++    if (pkt->dts != AV_NOPTS_VALUE)
++        pkt->dts += ds->ts_monotonicity_offset;
++
++    // Calculate error between expected and actual DTS
++    if (pkt->dts != AV_NOPTS_VALUE && ds->next_dts != AV_NOPTS_VALUE) {
++        int64_t expected_dts = av_rescale_q(ds->next_dts, AV_TIME_BASE_Q, pkt->time_base);
++        dts_error = expected_dts - pkt->dts;
++    }
++
++    // Large forward jump: bring timestamps back to maintain timeline continuity
++    // This prevents A/V desync when source has discontinuities (e.g., PCR wraparound)
++    // Threshold configurable via -dts_monotonicity_threshold (in microseconds)
++    if (dts_error * av_q2d(pkt->time_base) < -(dts_monotonicity_threshold / 1000000.0)) {
++        // dts_error is negative (expected - actual < 0 means actual > expected)
++        // Add dts_error (negative) to timestamps to bring them back to expected timeline
++        if (pkt->dts != AV_NOPTS_VALUE) {
++            pkt->dts += dts_error;
++            ds->ts_monotonicity_offset += dts_error;
++        }
++        if (pkt->pts != AV_NOPTS_VALUE)
++            pkt->pts += dts_error;
++        av_log(ist, AV_LOG_WARNING,
++               "Large forward jump corrected (%.1fs), offset now %"PRId64" (stream %d)\n",
++               -dts_error * av_q2d(pkt->time_base), ds->ts_monotonicity_offset, ist->st->id);
++        return;
++    }
++
++    // Backward jump: timestamp went backward, push it forward
++    if (dts_error > 0) {
++        if (pkt->dts != AV_NOPTS_VALUE) {
++            pkt->dts += dts_error;
++            ds->ts_monotonicity_offset += dts_error;
++        }
++        if (pkt->pts != AV_NOPTS_VALUE) {
++            pkt->pts += dts_error;
++        }
++        av_log(ist, AV_LOG_DEBUG,
++               "DTS backward jump corrected: %"PRId64" units, "
++               "offset now %"PRId64" (stream %d)\n",
++               dts_error, ds->ts_monotonicity_offset, ist->st->id);
++    }
++}
++
+ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
+                                      AVPacket *pkt)
+ {
+@@ -302,6 +370,15 @@ static void ts_discontinuity_process(Demuxer *d, InputStream *ist,
+     if (pkt->pts != AV_NOPTS_VALUE)
+         pkt->pts += offset;
+ 
++    // Apply monotonicity correction for all timed streams when enabled
++    // (video, audio, subtitles, and data streams like SCTE-35)
++    if (force_dts_monotonicity &&
++        (ist->par->codec_type == AVMEDIA_TYPE_VIDEO ||
++         ist->par->codec_type == AVMEDIA_TYPE_AUDIO ||
++         ist->par->codec_type == AVMEDIA_TYPE_SUBTITLE ||
++         ist->par->codec_type == AVMEDIA_TYPE_DATA))
++        ts_monotonicity_correct(d, ist, pkt);
++
+     // detect timestamp discontinuities for audio/video
+     if ((ist->par->codec_type == AVMEDIA_TYPE_VIDEO ||
+          ist->par->codec_type == AVMEDIA_TYPE_AUDIO) &&
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 80bb9236af..bc037c55a7 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -56,6 +56,9 @@ char *vstats_filename;
+ float dts_delta_threshold   = 10;
+ float dts_error_threshold   = 3600*30;
+ 
++int force_dts_monotonicity = 0;
++int dts_monotonicity_threshold = 30000000;  // 30 seconds default (in microseconds)
++
+ #if FFMPEG_OPT_VSYNC
+ enum VideoSyncMethod video_sync_method = VSYNC_AUTO;
+ #endif
+@@ -73,6 +76,7 @@ int abort_on_flags    = 0;
+ int print_stats       = -1;
+ int stdin_interaction = 1;
+ float max_error_rate  = 2.0/3;
++int decoder_reorder_flush_threshold = 5;
+ char *filter_nbthreads;
+ int filter_complex_nbthreads = 0;
+ int filter_buffered_frames = 0;
+@@ -1767,6 +1771,12 @@ const OptionDef options[] = {
+     { "dts_error_threshold",    OPT_TYPE_FLOAT, OPT_EXPERT,
+         { &dts_error_threshold },
+         "timestamp error delta threshold", "threshold" },
++    { "force_dts_monotonicity", OPT_TYPE_BOOL, OPT_EXPERT,
++        { &force_dts_monotonicity },
++        "correct dts monotonicity errors for live streaming" },
++    { "dts_monotonicity_threshold", OPT_TYPE_INT, OPT_EXPERT,
++        { &dts_monotonicity_threshold },
++        "dts correction threshold for forward jumps", "microseconds" },
+     { "xerror",                 OPT_TYPE_BOOL, OPT_EXPERT,
+         { &exit_on_error },
+         "exit on error", "error" },
+@@ -1865,6 +1875,9 @@ const OptionDef options[] = {
+     { "max_error_rate",      OPT_TYPE_FLOAT, OPT_EXPERT,
+         { &max_error_rate },
+         "ratio of decoding errors (0.0: no errors, 1.0: 100% errors) above which ffmpeg returns an error instead of success.", "maximum error rate" },
++    { "decoder_reorder_flush_threshold", OPT_TYPE_INT, OPT_EXPERT,
++        { &decoder_reorder_flush_threshold },
++        "flush decoder buffers after N consecutive decode errors to attempt recovery (0 disables, default 5)", "threshold" },
+     { "discard",             OPT_TYPE_STRING, OPT_PERSTREAM | OPT_INPUT | OPT_EXPERT,
+         { .off = OFFSET(discard) },
+         "discard", "" },
