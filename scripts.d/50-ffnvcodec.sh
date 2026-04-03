@@ -34,7 +34,7 @@ ffbuild_dockerbuild() {
     elif (( $FFVER < 701 )); then
         cd ffnvcodec3
     elif (( $FFVER < 800 )); then
-        cd ffnvcodec4
+        cd ffnvcodec
     else
         cd ffnvcodec
     fi

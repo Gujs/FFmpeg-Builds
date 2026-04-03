@@ -30,6 +30,9 @@ trap "rm -f -- '$BUILD_SCRIPT'" EXIT
 cat <<EOF >"$BUILD_SCRIPT"
     set -xe
     cd /ffbuild
+    if [[ -d /opt/ffbuild//bin ]]; then
+        export PATH="\$PATH:/opt/ffbuild/bin:/opt/ffbuild/nvvm/bin"
+    fi
     rm -rf ffmpeg prefix
 
     git clone --filter=blob:none --branch='$GIT_BRANCH' '$FFMPEG_REPO' ffmpeg

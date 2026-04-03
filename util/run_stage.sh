@@ -32,7 +32,8 @@ if [[ "$SELF" == */??-*/??-*.sh && -d "$FFBUILD_DESTDIR" ]]; then
     cp -al "$FFBUILD_DESTDIR"/. /
 fi
 
-rm -rf "$FFBUILD_DESTPREFIX"/bin
+# Only clean bin/ if not explicitly needed
+[[ "$PRESERVE_PKG" != "1" ]] && rm -rf "$FFBUILD_DESTPREFIX"/bin
 
 if [[ -n "$STAGENAME" ]]; then
     rm -rf "/$STAGENAME"
