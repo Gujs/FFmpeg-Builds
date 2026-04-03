@@ -1,8 +1,8 @@
 diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
-index 6838a6e97b..6029f2c17c 100644
+index c65c27aa7f..86b2c27d1f 100644
 --- a/fftools/ffmpeg.h
 +++ b/fftools/ffmpeg.h
-@@ -258,6 +258,8 @@ typedef struct OptionsContext {
+@@ -260,6 +260,8 @@ typedef struct OptionsContext {
      SpecifierOptList enc_stats_pre_fmt;
      SpecifierOptList enc_stats_post_fmt;
      SpecifierOptList mux_stats_fmt;
@@ -11,7 +11,7 @@ index 6838a6e97b..6029f2c17c 100644
  
      int depth;
  } OptionsContext;
-@@ -913,6 +915,23 @@ int dec_filter_add(Decoder *dec, InputFilter *ifilter, InputFilterOptions *opts,
+@@ -915,6 +917,23 @@ int dec_filter_add(Decoder *dec, InputFilter *ifilter, InputFilterOptions *opts,
  int dec_request_view(Decoder *dec, const ViewSpecifier *vs,
                       SchedulerNode *src);
  
@@ -35,7 +35,7 @@ index 6838a6e97b..6029f2c17c 100644
  int enc_alloc(Encoder **penc, const AVCodec *codec,
                Scheduler *sch, unsigned sch_idx, void *log_parent);
  void enc_free(Encoder **penc);
-@@ -931,6 +950,7 @@ int of_stream_init(OutputFile *of, OutputStream *ost,
+@@ -933,6 +952,7 @@ int of_stream_init(OutputFile *of, OutputStream *ost,
                     const AVCodecContext *enc_ctx);
  int of_write_trailer(OutputFile *of);
  int of_open(const OptionsContext *o, const char *filename, Scheduler *sch);
@@ -44,7 +44,7 @@ index 6838a6e97b..6029f2c17c 100644
  
  void of_enc_stats_close(void);
 diff --git a/fftools/ffmpeg_dec.c b/fftools/ffmpeg_dec.c
-index 5020684a28..83ad24b693 100644
+index 5020684a28..3a6bc7ade5 100644
 --- a/fftools/ffmpeg_dec.c
 +++ b/fftools/ffmpeg_dec.c
 @@ -22,6 +22,7 @@
@@ -64,7 +64,7 @@ index 5020684a28..83ad24b693 100644
  #include "ffmpeg.h"
  
  typedef struct DecoderPriv {
-@@ -72,6 +75,20 @@ typedef struct DecoderPriv {
+@@ -72,6 +75,21 @@ typedef struct DecoderPriv {
      AVFrame            *sub_prev[2];
      AVFrame            *sub_heartbeat;
  
@@ -76,6 +76,7 @@ index 5020684a28..83ad24b693 100644
 +    AVSubtitle          cc_pending_sub;   /* buffered subtitle waiting for debounce */
 +    int                 cc_pending_valid; /* 1 if cc_pending_sub has data */
 +    int64_t             cc_pending_pts;   /* PTS when pending text last changed */
++    int64_t             cc_pending_first_pts; /* PTS when current pending cycle started */
 +    char               *cc_pending_text;  /* text of pending subtitle (for comparison) */
 +    unsigned            cc_out_idx;       /* scheduler decoder output index for CC */
 +    AVCodecContext     *cc_dec_ctx;       /* EIA-608 decoder (cc_dec) context */
@@ -85,7 +86,7 @@ index 5020684a28..83ad24b693 100644
      Scheduler          *sch;
      unsigned            sch_idx;
  
-@@ -136,6 +153,12 @@ void dec_free(Decoder **pdec)
+@@ -136,6 +154,12 @@ void dec_free(Decoder **pdec)
          av_frame_free(&dp->sub_prev[i]);
      av_frame_free(&dp->sub_heartbeat);
  
@@ -98,16 +99,22 @@ index 5020684a28..83ad24b693 100644
      av_freep(&dp->parent_name);
  
      av_freep(&dp->views_requested);
-@@ -694,6 +717,176 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
+@@ -694,6 +718,224 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
      return process_subtitle(dp, frame);
  }
  
-+/* Debounce interval: only emit subtitle after text stops changing for this
-+ * long.  cc_dec real_time=1 mode fires a new subtitle on every CC buffer
-+ * change (character-by-character for roll-up), producing rapid incremental
-+ * fragments.  Buffering until a 500 ms quiet period eliminates the flicker
-+ * and only emits complete phrases. */
-+#define CC_DEBOUNCE_US  500000  /* 500 ms */
++/* Debounce intervals for CC subtitle emission.
++ *
++ * cc_dec real_time=1 fires a new subtitle on every CC buffer change.
++ * Roll-up mode (live news): character-by-character, every ~200ms.
++ * Pop-on mode (scripted): complete blocks with 2-10s natural pauses.
++ *
++ * Two timers control emission:
++ * - CC_DEBOUNCE_US (silence): emit after text unchanged for 500ms (pop-on)
++ * - CC_DEBOUNCE_MAX_US (deadline): emit after 300ms pending regardless
++ *   of ongoing changes (roll-up) */
++#define CC_DEBOUNCE_US      500000  /* 500 ms — silence-based (pop-on) */
++#define CC_DEBOUNCE_MAX_US  300000  /* 300 ms — max pending age (roll-up) */
 +
 +/**
 + * Send a subtitle (content or empty keepalive) to the CC encoder.
@@ -130,6 +137,25 @@ index 5020684a28..83ad24b693 100644
 +    cc_frame->pts       = frame->pts;
 +    cc_frame->time_base = frame->time_base;
 +
++    /* Enforce monotonic subtitle PTS — discontinuity rebasing can produce
++     * out-of-order PTS that crashes the muxer with EINVAL */
++    if (dp->cc_last_sub_pts != AV_NOPTS_VALUE) {
++        int64_t min_pts = dp->cc_last_sub_pts + 1;  /* strictly increasing */
++        int64_t frame_pts_us = av_rescale_q(frame->pts, frame->time_base,
++                                            AV_TIME_BASE_Q);
++        if (frame_pts_us < min_pts) {
++            av_log(dp, AV_LOG_DEBUG,
++                   "[CC] Clamping subtitle PTS from %.3fs to %.3fs (monotonicity)\n",
++                   (double)frame_pts_us / AV_TIME_BASE,
++                   (double)min_pts / AV_TIME_BASE);
++            cc_frame->pts = av_rescale_q(min_pts, AV_TIME_BASE_Q,
++                                         frame->time_base);
++            /* Also fix the subtitle.pts inside the frame buffer */
++            AVSubtitle *wrapped = (AVSubtitle *)cc_frame->buf[0]->data;
++            wrapped->pts = min_pts;
++        }
++    }
++
 +    ret = sch_dec_send(dp->sch, dp->sch_idx, dp->cc_out_idx, cc_frame);
 +    if (ret < 0) {
 +        av_frame_unref(cc_frame);
@@ -140,7 +166,9 @@ index 5020684a28..83ad24b693 100644
 +        return ret;
 +    }
 +
-+    dp->cc_last_sub_pts = av_rescale_q(frame->pts, frame->time_base,
++    /* Use cc_frame->pts (potentially clamped for monotonicity) so that
++     * the next call's monotonicity check compares against the sent value */
++    dp->cc_last_sub_pts = av_rescale_q(cc_frame->pts, cc_frame->time_base,
 +                                       AV_TIME_BASE_Q);
 +    return 0;
 +}
@@ -172,6 +200,20 @@ index 5020684a28..83ad24b693 100644
 +        goto strip;
 +
 +    cur_pts = av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q);
++
++    /* Reset CC state if PTS jumped backward (discontinuity rebased timeline) */
++    if (dp->cc_last_sub_pts != AV_NOPTS_VALUE &&
++        cur_pts < dp->cc_last_sub_pts - 500000) {  /* 500ms tolerance */
++        av_log(dp, AV_LOG_INFO,
++               "[CC] PTS jumped backward (%.3fs -> %.3fs), resetting CC state\n",
++               (double)dp->cc_last_sub_pts / AV_TIME_BASE,
++               (double)cur_pts / AV_TIME_BASE);
++        dp->cc_last_sub_pts = AV_NOPTS_VALUE;
++        if (dp->cc_pending_valid) {
++            avsubtitle_free(&dp->cc_pending_sub);
++            dp->cc_pending_valid = 0;
++        }
++    }
 +
 +    /* If PTS jumped forward significantly (discontinuity / ad boundary),
 +     * flush any pending subtitle immediately rather than losing it. */
@@ -217,6 +259,7 @@ index 5020684a28..83ad24b693 100644
 +
 +        if (!dp->cc_pending_text || strcmp(new_text, dp->cc_pending_text)) {
 +            /* Text changed — replace pending buffer and reset debounce timer */
++            int was_pending = dp->cc_pending_valid;
 +            if (dp->cc_pending_valid)
 +                avsubtitle_free(&dp->cc_pending_sub);
 +
@@ -228,7 +271,11 @@ index 5020684a28..83ad24b693 100644
 +            subtitle.pts = cur_pts;
 +            dp->cc_pending_sub   = subtitle;
 +            dp->cc_pending_valid = 1;
-+            dp->cc_pending_pts   = cur_pts;
++            dp->cc_pending_pts   = cur_pts;  /* silence timer: resets on each change */
++
++            /* Deadline timer: set only when first entering pending state */
++            if (!was_pending)
++                dp->cc_pending_first_pts = cur_pts;
 +
 +            av_freep(&dp->cc_pending_text);
 +            dp->cc_pending_text = av_strdup(new_text);
@@ -243,9 +290,11 @@ index 5020684a28..83ad24b693 100644
 +    }
 +
 +check_pending:
-+    /* Emit pending subtitle once text has been stable for CC_DEBOUNCE_US */
++    /* Emit pending subtitle once text has been stable for CC_DEBOUNCE_US
++     * (silence timer) or pending for CC_DEBOUNCE_MAX_US (deadline timer) */
 +    if (dp->cc_pending_valid &&
-+        cur_pts - dp->cc_pending_pts >= CC_DEBOUNCE_US) {
++        (cur_pts - dp->cc_pending_pts >= CC_DEBOUNCE_US ||
++         cur_pts - dp->cc_pending_first_pts >= CC_DEBOUNCE_MAX_US)) {
 +
 +        ret = cc_send_subtitle(dp, &dp->cc_pending_sub, frame);
 +        dp->cc_pending_valid = 0;  /* subtitle_wrap_frame zeroed the struct */
@@ -275,7 +324,7 @@ index 5020684a28..83ad24b693 100644
  static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
  {
      AVCodecContext *dec = dp->dec_ctx;
-@@ -801,6 +994,13 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
+@@ -801,6 +1043,13 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
                         "Error while processing the decoded data\n");
                  return ret;
              }
@@ -289,7 +338,7 @@ index 5020684a28..83ad24b693 100644
          }
  
          dp->dec.frames_decoded++;
-@@ -1089,6 +1289,83 @@ int dec_request_view(Decoder *d, const ViewSpecifier *vs,
+@@ -1089,6 +1338,83 @@ int dec_request_view(Decoder *d, const ViewSpecifier *vs,
      return 0;
  }
  
@@ -395,7 +444,7 @@ index 5f1e6e34c1..568be900fd 100644
  
      if (frame) {
 diff --git a/fftools/ffmpeg_mux.c b/fftools/ffmpeg_mux.c
-index 25f66dd185..2943176766 100644
+index 25f66dd185..1ac875b77e 100644
 --- a/fftools/ffmpeg_mux.c
 +++ b/fftools/ffmpeg_mux.c
 @@ -43,10 +43,7 @@ typedef struct MuxThreadContext {
@@ -410,6 +459,15 @@ index 25f66dd185..2943176766 100644
  
  static int64_t filesize(AVIOContext *pb)
  {
+@@ -837,6 +834,8 @@ static void ost_free(OutputStream **post)
+ 
+     av_freep(&ost->attachment_filename);
+ 
++    av_freep(&ms->cc_extract_lang);
++
+     enc_stats_uninit(&ost->enc_stats_pre);
+     enc_stats_uninit(&ost->enc_stats_post);
+     enc_stats_uninit(&ms->stats);
 diff --git a/fftools/ffmpeg_mux.h b/fftools/ffmpeg_mux.h
 index 4ca8ab73a4..2f9b7121a4 100644
 --- a/fftools/ffmpeg_mux.h
@@ -440,10 +498,10 @@ index 4ca8ab73a4..2f9b7121a4 100644
  {
      return (MuxStream*)ost;
 diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
-index 5484503924..8c3ea91c6d 100644
+index e1ed8b4c04..dc9c19dede 100644
 --- a/fftools/ffmpeg_mux_init.c
 +++ b/fftools/ffmpeg_mux_init.c
-@@ -2049,6 +2049,66 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
+@@ -2051,6 +2051,66 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
          }
      }
  
@@ -510,10 +568,34 @@ index 5484503924..8c3ea91c6d 100644
      ret = of_add_attachments(mux, o);
      if (ret < 0)
          return ret;
-@@ -3330,6 +3390,212 @@ static Muxer *mux_alloc(void)
+@@ -3334,6 +3394,222 @@ static Muxer *mux_alloc(void)
      return mux;
  }
  
++/**
++ * Map ISO 639-2/B language code to G0 national option subset index.
++ * Returns 0 (English) for unknown languages.
++ */
++static int lang_to_g0_subset(const char *lang)
++{
++    if (!lang || !lang[0])
++        return 0;
++    if (!strcmp(lang, "deu") || !strcmp(lang, "ger"))
++        return 1;
++    if (!strcmp(lang, "swe") || !strcmp(lang, "fin") || !strcmp(lang, "hun"))
++        return 2;
++    if (!strcmp(lang, "ita"))
++        return 3;
++    if (!strcmp(lang, "fra") || !strcmp(lang, "fre"))
++        return 4;
++    if (!strcmp(lang, "spa") || !strcmp(lang, "por"))
++        return 5;
++    if (!strcmp(lang, "cze") || !strcmp(lang, "ces") ||
++        !strcmp(lang, "slo") || !strcmp(lang, "slk"))
++        return 6;
++    return 0;
++}
++
 +int of_setup_cc_extraction(OutputFile *ofile)
 +{
 +    Muxer *mux = mux_from_of(ofile);
@@ -638,19 +720,20 @@ index 5484503924..8c3ea91c6d 100644
 +                     "cc_sub#%d:%d/%s", mux->of.index, cc_ost->index,
 +                     cc_enc_codec->name);
 +
-+            /* Set language metadata for the teletext descriptor in PMT */
++            /* Set language metadata and G0 national subset for teletext */
 +            {
++                static const char *subset_names[] = {
++                    "English", "German", "Swedish/Finnish", "Italian",
++                    "French", "Spanish/Portuguese", "Czech/Slovak"
++                };
 +                const char *cc_lang = "eng"; /* default fallback */
++                int subset;
 +
 +                if (video_ms->cc_extract_lang) {
 +                    cc_lang = video_ms->cc_extract_lang;
-+                    av_log(mux, AV_LOG_INFO,
-+                           "CC subtitle language: \"%s\" (from -cc_lang)\n",
-+                           cc_lang);
 +                } else {
 +                    /* Auto-detect from first audio stream in same input file */
 +                    const InputFile *ifile = source_ist->file;
-+                    int detected = 0;
 +                    for (int j = 0; j < ifile->nb_streams; j++) {
 +                        const InputStream *ist_a = ifile->streams[j];
 +                        if (ist_a->par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -660,19 +743,19 @@ index 5484503924..8c3ea91c6d 100644
 +                            if (e && e->value[0] &&
 +                                strcmp(e->value, "und") != 0) {
 +                                cc_lang = e->value;
-+                                detected = 1;
-+                                av_log(mux, AV_LOG_INFO,
-+                                       "CC subtitle language: \"%s\" "
-+                                       "(auto-detected from audio stream %d)\n",
-+                                       cc_lang, ist_a->index);
 +                                break;
 +                            }
 +                        }
 +                    }
-+                    if (!detected)
-+                        av_log(mux, AV_LOG_INFO,
-+                               "CC subtitle language: \"eng\" (default)\n");
 +                }
++
++                subset = lang_to_g0_subset(cc_lang);
++                av_opt_set_int(cc_ost->enc->enc_ctx->priv_data,
++                               "g0_subset", subset, 0);
++
++                av_log(mux, AV_LOG_INFO,
++                       "CC subtitle language: \"%s\" (G0 subset %d: %s)\n",
++                       cc_lang, subset, subset_names[subset]);
 +
 +                av_dict_set(&cc_st->metadata, "language", cc_lang, 0);
 +            }
@@ -697,21 +780,6 @@ index 5484503924..8c3ea91c6d 100644
 +                   video_ost->file->index, video_ost->index,
 +                   cc_ost->file->index, cc_ost->index,
 +                   cc_enc_codec->name);
-+
-+            /* Reduce max_interleave_delta to prevent the sparse CC subtitle
-+             * stream from blocking the lavf interleaver.
-+             *
-+             * The interleaver auto-flushes only when ALL interleaved streams
-+             * have buffered data (mux.c:969).  During discontinuity handling
-+             * and keyframe-wait, no video frames are decoded so no CC
-+             * keepalives are emitted — the subtitle stream goes silent.
-+             * With the default delta of 10s, video/audio buffer up for 10s
-+             * before a forced flush, creating a visible gap in the output.
-+             *
-+             * 100ms is sufficient for correct interleaving of live video
-+             * (33ms per frame at 30fps) and audio (23ms per AAC frame). */
-+            if (oc->max_interleave_delta > 100000)
-+                oc->max_interleave_delta = 100000; /* 100ms */
 +        }
 +
 +        video_ms->cc_extract_pending = 0;
@@ -724,10 +792,10 @@ index 5484503924..8c3ea91c6d 100644
  {
      Muxer *mux;
 diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
-index 056856b518..b6fa6106a7 100644
+index 0388f04040..2880cf3c33 100644
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
-@@ -1711,6 +1711,15 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
+@@ -1721,6 +1721,15 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
          goto fail;
      }
  
@@ -743,7 +811,7 @@ index 056856b518..b6fa6106a7 100644
      correct_input_start_times();
  
      ret = apply_sync_offsets();
-@@ -2199,6 +2208,12 @@ const OptionDef options[] = {
+@@ -2215,6 +2224,12 @@ const OptionDef options[] = {
          "set this video output stream to be a heartbeat stream for "
          "fix_sub_duration, according to which subtitles should be split at "
          "random access points" },
@@ -757,10 +825,10 @@ index 056856b518..b6fa6106a7 100644
      /* audio options */
      { "aframes",          OPT_TYPE_FUNC,    OPT_AUDIO | OPT_FUNC_ARG | OPT_PERFILE | OPT_OUTPUT | OPT_EXPERT | OPT_HAS_CANON,
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index 7d3e4aa1b4..6a2338bbd9 100644
+index 9f7ef689c5..16fbc37bea 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -352,6 +352,7 @@ OBJS-$(CONFIG_DSS_SP_DECODER)          += dss_sp.o
+@@ -353,6 +353,7 @@ OBJS-$(CONFIG_DSS_SP_DECODER)          += dss_sp.o
  OBJS-$(CONFIG_DST_DECODER)             += dstdec.o dsd.o
  OBJS-$(CONFIG_DVBSUB_DECODER)          += dvbsubdec.o
  OBJS-$(CONFIG_DVBSUB_ENCODER)          += dvbsubenc.o
@@ -769,10 +837,10 @@ index 7d3e4aa1b4..6a2338bbd9 100644
  OBJS-$(CONFIG_DVDSUB_ENCODER)          += dvdsubenc.o dvdsub.o
  OBJS-$(CONFIG_DVAUDIO_DECODER)         += dvaudiodec.o
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index 042b07c895..26714e470f 100644
+index 695214f192..26425d54c8 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
-@@ -729,6 +729,7 @@ extern const FFCodec ff_ass_decoder;
+@@ -732,6 +732,7 @@ extern const FFCodec ff_ass_decoder;
  extern const FFCodec ff_ccaption_decoder;
  extern const FFCodec ff_dvbsub_encoder;
  extern const FFCodec ff_dvbsub_decoder;
@@ -782,10 +850,10 @@ index 042b07c895..26714e470f 100644
  extern const FFCodec ff_jacosub_decoder;
 diff --git a/libavcodec/dvbteletextenc.c b/libavcodec/dvbteletextenc.c
 new file mode 100644
-index 0000000000..a76199e4d6
+index 0000000000..d37e360300
 --- /dev/null
 +++ b/libavcodec/dvbteletextenc.c
-@@ -0,0 +1,737 @@
+@@ -0,0 +1,854 @@
 +/*
 + * DVB Teletext subtitle encoder
 + * Copyright (c) 2026 Gregor Fuis
@@ -938,13 +1006,83 @@ index 0000000000..a76199e4d6
 + * or other content transitions where CC stops. */
 +#define TELETEXT_ERASE_TIMEOUT_US  10000000  /* 10 seconds */
 +
++/*
++ * G0 National Option Subsets per ETS 300 706 Tables 33-39.
++ *
++ * 13 character positions in the G0 Latin set can be replaced with national
++ * characters. The positions (in order) correspond to ASCII codes:
++ *   0x23 0x24 0x40 0x5B 0x5C 0x5D 0x5E 0x5F 0x60 0x7B 0x7C 0x7D 0x7E
++ * Each subset maps these 13 positions to different Unicode codepoints.
++ * Selected via C12-C14 control bits in the page header.
++ */
++#define G0_NATIONAL_POSITIONS 13
++
++static const uint8_t g0_position_bytes[G0_NATIONAL_POSITIONS] = {
++    0x23, 0x24, 0x40, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F,
++    0x60, 0x7B, 0x7C, 0x7D, 0x7E
++};
++
++/* Unicode codepoints for each national subset's 13 positions.
++ * 0 means same as default Latin G0 (no override). */
++static const uint32_t g0_national_subsets[7][G0_NATIONAL_POSITIONS] = {
++    /* Subset 0: English — default G0, no special chars */
++    { 0x00A3, 0x0024, 0x0040, 0x005B, 0x005C, 0x005D,  /* £ $ @ [ \ ]  */
++      0x005E, 0x005F, 0x0060, 0x007B, 0x007C, 0x007D,  /* ^ _ ` { | }  */
++      0x007E },                                          /* ~            */
++    /* Subset 1: German */
++    { 0x0023, 0x0024, 0x00A7, 0x00C4, 0x00D6, 0x00DC,  /* # $ § Ä Ö Ü  */
++      0x005E, 0x005F, 0x00B0, 0x00E4, 0x00F6, 0x00FC,  /* ^ _ ° ä ö ü  */
++      0x00DF },                                          /* ß            */
++    /* Subset 2: Swedish/Finnish/Hungarian */
++    { 0x0023, 0x00A4, 0x00C9, 0x00C4, 0x00D6, 0x00C5,  /* # ¤ É Ä Ö Å  */
++      0x00DC, 0x005F, 0x00E9, 0x00E4, 0x00F6, 0x00E5,  /* Ü _ é ä ö å  */
++      0x00FC },                                          /* ü            */
++    /* Subset 3: Italian */
++    { 0x00A3, 0x0024, 0x00B0, 0x00E7, 0x2192, 0x00E9,  /* £ $ ° ç → é  */
++      0x005E, 0x005F, 0x00F9, 0x00E0, 0x00F2, 0x00E8,  /* ^ _ ù à ò è  */
++      0x00EC },                                          /* ì            */
++    /* Subset 4: French */
++    { 0x00E9, 0x00EF, 0x00E0, 0x00EB, 0x00EA, 0x00F9,  /* é ï à ë ê ù  */
++      0x00EE, 0x0023, 0x00E8, 0x00E2, 0x00F4, 0x00FB,  /* î # è â ô û  */
++      0x00E7 },                                          /* ç            */
++    /* Subset 5: Spanish/Portuguese */
++    { 0x00E7, 0x0024, 0x00A1, 0x00E1, 0x00E9, 0x00ED,  /* ç $ ¡ á é í  */
++      0x00F3, 0x00FA, 0x00BF, 0x00FC, 0x00F1, 0x00E8,  /* ó ú ¿ ü ñ è  */
++      0x00E0 },                                          /* à            */
++    /* Subset 6: Czech/Slovak */
++    { 0x0023, 0x016F, 0x010D, 0x0165, 0x017E, 0x00FD,  /* # ů č ť ž ý  */
++      0x00ED, 0x0159, 0x00E9, 0x00E1, 0x011B, 0x00FA,  /* í ř é á ě ú  */
++      0x0161 },                                          /* š            */
++};
++
++/**
++ * Look up a Unicode codepoint in a G0 national option subset.
++ *
++ * @param cp      Unicode codepoint to look up
++ * @param subset  Subset index (0-6)
++ * @return The teletext byte position (0x23-0x7E), or 0 if not found
++ */
++static uint8_t g0_national_lookup(uint32_t cp, int subset)
++{
++    int i;
++    if (subset < 0 || subset > 6)
++        return 0;
++    for (i = 0; i < G0_NATIONAL_POSITIONS; i++) {
++        if (g0_national_subsets[subset][i] == cp)
++            return g0_position_bytes[i];
++    }
++    return 0;
++}
++
 +typedef struct DVBTeletextEncContext {
 +    AVClass *class;
 +    ASSSplitContext *ass_ctx;
 +    int magazine;           /* magazine number 1-8, default 8 */
 +    int page;               /* page number in hex (0x00-0xFF), default 0x88 */
++    int g0_subset;          /* G0 national option subset (0-6), default 0 (English) */
 +    int page_counter;       /* erase page sequence counter (C4 flag) */
 +    int content_active;     /* 1 if display has content (needs erase eventually) */
++    int last_nb_lines;      /* number of content rows in previous subtitle */
 +    int64_t last_content_pts; /* PTS (AV_TIME_BASE) of last content subtitle */
 +} DVBTeletextEncContext;
 +
@@ -1082,7 +1220,7 @@ index 0000000000..a76199e4d6
 +    buf[10] = hamming84_encode[0];               /* S3 */
 +    buf[11] = hamming84_encode[0x08];            /* S4=0, C5=0, C6=0, C7=1(SuppressHdr) */
 +    buf[12] = hamming84_encode[0x01];            /* C8=1 (Update Indicator), C9=0, C10=0, C11=0 */
-+    buf[13] = hamming84_encode[0];               /* C12-C14 (charset=0, Latin G0) */
++    buf[13] = hamming84_encode[ctx->g0_subset & 0x07]; /* C12-C14: national option subset */
 +
 +    /* Header display area: 26 bytes (positions 14-39 in data unit payload,
 +     * 8..33 in the character area after the 8 control bytes).
@@ -1114,7 +1252,7 @@ index 0000000000..a76199e4d6
 + * @param src  UTF-8 input string
 + * @return     Allocated ASCII string (caller frees with av_free), or NULL on OOM
 + */
-+static char *utf8_to_teletext_g0(const char *src)
++static char *utf8_to_teletext_g0(const char *src, int g0_subset)
 +{
 +    AVBPrint bp;
 +    const uint8_t *s = (const uint8_t *)src;
@@ -1150,10 +1288,19 @@ index 0000000000..a76199e4d6
 +
 +        /* Map codepoint to teletext Latin G0 character.
 +         * Complete coverage of all 79 non-ASCII characters that EIA-608
-+         * cc_dec can output (ccaption_dec.c charset_overrides[4][128]). */
++         * cc_dec can output (ccaption_dec.c charset_overrides[4][128]).
++         *
++         * First try the G0 national option subset — if the codepoint has
++         * a native representation, emit it directly. Otherwise fall
++         * through to accent-stripping for best-effort ASCII output. */
 +        if (cp >= 0x20 && cp < 0x7F) {
 +            av_bprint_chars(&bp, (char)cp, 1);
 +        } else {
++            uint8_t national_byte = g0_national_lookup(cp, g0_subset);
++            if (national_byte) {
++                av_bprint_chars(&bp, (char)national_byte, 1);
++                continue;
++            }
 +            switch (cp) {
 +            /* Quotation marks */
 +            case 0x2018: case 0x2019:             /* ' ' smart single quotes */
@@ -1246,7 +1393,24 @@ index 0000000000..a76199e4d6
 +static void text_extract_cb(void *priv, const char *text, int len)
 +{
 +    TextExtractCtx *ctx = priv;
-+    av_bprint_append_data(&ctx->buf, text, len);
++    int i;
++    /* ASS \h (hard space) and \n (soft newline) are not handled by
++     * ff_ass_split_override_codes and arrive as literal text.
++     * Replace them inline: \h → space, \n → newline. */
++    for (i = 0; i < len; i++) {
++        if (text[i] == '\\' && i + 1 < len) {
++            if (text[i + 1] == 'h') {
++                av_bprint_chars(&ctx->buf, ' ', 1);
++                i++;
++                continue;
++            } else if (text[i + 1] == 'n') {
++                av_bprint_chars(&ctx->buf, '\n', 1);
++                i++;
++                continue;
++            }
++        }
++        av_bprint_chars(&ctx->buf, text[i], 1);
++    }
 +}
 +
 +static void text_newline_cb(void *priv, int forced)
@@ -1294,9 +1458,18 @@ index 0000000000..a76199e4d6
 +    avctx->extradata      = extradata;
 +    avctx->extradata_size = 2;
 +
-+    av_log(avctx, AV_LOG_INFO,
-+           "DVB Teletext encoder: magazine %d, page %02X (subtitle)\n",
-+           ctx->magazine, ctx->page);
++    {
++        static const char *subset_names[] = {
++            "English", "German", "Swedish/Finnish", "Italian",
++            "French", "Spanish/Portuguese", "Czech/Slovak"
++        };
++        av_log(avctx, AV_LOG_INFO,
++               "DVB Teletext encoder: magazine %d, page %02X, "
++               "G0 subset %d (%s)\n",
++               ctx->magazine, ctx->page, ctx->g0_subset,
++               (ctx->g0_subset >= 0 && ctx->g0_subset <= 6)
++                   ? subset_names[ctx->g0_subset] : "unknown");
++    }
 +
 +    return 0;
 +}
@@ -1351,7 +1524,7 @@ index 0000000000..a76199e4d6
 +
 +    /* We need at minimum:
 +     * 1 byte (data_identifier) + 46 bytes (page header) + 46*2 (content rows) = 139
-+     * Keep generous margin */
++     * With padding to 3 data units: 1 + 46*3 = 139. */
 +    if (bufsize < 1 + 46 * 3) {
 +        av_log(avctx, AV_LOG_ERROR, "Buffer too small for teletext packet\n");
 +        return AVERROR_BUFFER_TOO_SMALL;
@@ -1387,7 +1560,7 @@ index 0000000000..a76199e4d6
 +        return 0;
 +    }
 +
-+    /* Split text into lines (max 2 for subtitle rows) */
++    /* Split text into lines (max 2 for subtitle rows 22-23) */
 +    {
 +        char *text_str = NULL;
 +        char *p, *saveptr = NULL;
@@ -1414,13 +1587,21 @@ index 0000000000..a76199e4d6
 +    /* Data identifier byte */
 +    buf[offset++] = TELETEXT_DATA_IDENTIFIER;
 +
-+    /* Page header (row 0) — erase page before new content, VBI line 7 */
-+    offset += write_page_header(buf + offset, ctx, 1, 7);
++    /* Page header (row 0) — smart erase flag:
++     * Set C4 (erase) only on first subtitle after silence or when the
++     * row count decreases (orphaned rows need clearing). Subsequent
++     * updates use erase=0 so the decoder replaces content in-place
++     * without a visible blank flash between updates. */
++    {
++        int erase = !ctx->content_active ||
++                    (nb_lines < ctx->last_nb_lines);
++        offset += write_page_header(buf + offset, ctx, erase, 7);
++    }
 +
-+    /* Content rows: place subtitle text at rows 23 and 24 (bottom of screen)
++    /* Content rows: place subtitle text at rows 22 and 23 (bottom of screen)
 +     * Each data unit gets a unique VBI line offset (8, 9, ...) */
 +    for (i = 0; i < nb_lines; i++) {
-+        char *safe_line = utf8_to_teletext_g0(lines[i]);
++        char *safe_line = utf8_to_teletext_g0(lines[i], ctx->g0_subset);
 +        const char *line = safe_line ? safe_line : lines[i];
 +        int len, pad_left, j;
 +        int row = (nb_lines == 1) ? TELETEXT_SUBTITLE_ROW2
@@ -1462,6 +1643,7 @@ index 0000000000..a76199e4d6
 +
 +    ctx->page_counter++;
 +    ctx->content_active    = 1;
++    ctx->last_nb_lines     = nb_lines;
 +    ctx->last_content_pts  = sub->pts;
 +
 +    /* Pad with stuffing data units to reach TELETEXT_MIN_DATA_UNITS total.
@@ -1502,6 +1684,9 @@ index 0000000000..a76199e4d6
 +      AV_OPT_TYPE_INT, { .i64 = 8 }, 1, 8, SE },
 +    { "page", "teletext page number (hex, e.g. 0x88)", OFFSET(page),
 +      AV_OPT_TYPE_INT, { .i64 = 0x88 }, 0x00, 0xFF, SE },
++    { "g0_subset", "G0 national option subset (0=English, 1=German, 2=Swedish/Finnish, "
++      "3=Italian, 4=French, 5=Spanish/Portuguese, 6=Czech/Slovak)", OFFSET(g0_subset),
++      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 6, SE },
 +    { NULL },
 +};
 +
