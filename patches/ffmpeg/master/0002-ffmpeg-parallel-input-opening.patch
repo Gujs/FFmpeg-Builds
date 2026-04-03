@@ -1,8 +1,8 @@
 diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
-index b4d3a2c2ac..6838a6e97b 100644
+index 3a19e5878d..c65c27aa7f 100644
 --- a/fftools/ffmpeg.h
 +++ b/fftools/ffmpeg.h
-@@ -940,6 +940,30 @@ int64_t of_filesize(OutputFile *of);
+@@ -942,6 +942,41 @@ int64_t of_filesize(OutputFile *of);
  int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch);
  void ifile_close(InputFile **f);
  
@@ -30,14 +30,25 @@ index b4d3a2c2ac..6838a6e97b 100644
 + */
 +size_t ifile_open_io_result_size(void);
 +
++/**
++ * Close the AVFormatContext held by an I/O result (if any).
++ * Use to clean up after ifile_open_io() when ifile_open_from_io() won't be called.
++ */
++void ifile_open_io_result_cleanup(IfileOpenIOResult *result);
++
++/**
++ * Return the error message from an I/O result, or NULL if none.
++ */
++const char *ifile_open_io_result_error(const IfileOpenIOResult *result);
++
  int ist_use(InputStream *ist, int decoding_needed,
              const ViewSpecifier *vs, SchedulerNode *src);
  int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,
 diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
-index c8d8a7e044..045694ad3f 100644
+index 04ee2cc2ed..621038ea84 100644
 --- a/fftools/ffmpeg_demux.c
 +++ b/fftools/ffmpeg_demux.c
-@@ -1800,6 +1800,411 @@ static const AVClass input_file_class = {
+@@ -1997,6 +1997,442 @@ static const AVClass input_file_class = {
      .category   = AV_CLASS_CATEGORY_DEMUXER,
  };
  
@@ -52,6 +63,7 @@ index c8d8a7e044..045694ad3f 100644
 +    AVFormatContext *ic;                // opened format context
 +    const AVInputFormat *file_iformat;  // detected input format
 +    int scan_all_pmts_set;              // whether scan_all_pmts was auto-set
++    int disable_stdin_interaction;      // set if input is pipe/fd/stdin
 +    int ret;                            // return value (0 on success, negative on error)
 +    char error_msg[256];                // error message if ret < 0
 +
@@ -97,6 +109,12 @@ index c8d8a7e044..045694ad3f 100644
 +
 +    if (!strcmp(filename, "-"))
 +        filename = "fd:";
++
++    /* Flag stdin/pipe inputs for deferred stdin_interaction update (Fix 4) */
++    if (!strncmp(filename, "pipe:", 5) ||
++        !strcmp(filename, "fd:") ||
++        !strcmp(filename, "/dev/stdin"))
++        result->disable_stdin_interaction = 1;
 +
 +    /* get default parameters from command line */
 +    ic = avformat_alloc_context();
@@ -198,7 +216,16 @@ index c8d8a7e044..045694ad3f 100644
 +    if (result->scan_all_pmts_set)
 +        av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
 +
-+    /* find stream info - ALSO A BLOCKING CALL */
++    /* find stream info - ALSO A BLOCKING CALL
++     *
++     * Known limitation vs ifile_open(): the sequential path calls
++     * choose_decoder() per-stream BEFORE find_stream_info, letting per-stream
++     * codec specifiers (e.g. -c:v:0 h264) influence probing.  Here we lack
++     * an InputFile, so choose_decoder() is deferred to ifile_open_from_io().
++     * Format-level codec hints (ic->video_codec_id etc.) ARE applied above,
++     * so the common case works.  Only per-stream codec overrides on inputs
++     * would behave differently — extremely rare in practice.
++     */
 +    if (o->find_stream_info) {
 +        AVDictionary **opts;
 +        int orig_nb_streams = ic->nb_streams;
@@ -237,6 +264,17 @@ index c8d8a7e044..045694ad3f 100644
 +    return sizeof(IfileOpenIOResult);
 +}
 +
++void ifile_open_io_result_cleanup(IfileOpenIOResult *result)
++{
++    if (result && result->ic)
++        avformat_close_input(&result->ic);
++}
++
++const char *ifile_open_io_result_error(const IfileOpenIOResult *result)
++{
++    return (result && result->error_msg[0]) ? result->error_msg : NULL;
++}
++
 +/**
 + * Finalize input file opening from I/O result.
 + * Must be called sequentially (not thread-safe) after ifile_open_io().
@@ -271,6 +309,10 @@ index c8d8a7e044..045694ad3f 100644
 +    d->sch = sch;
 +
 +    f->ctx = ic;
++    io_result->ic = NULL;  /* ownership transferred to Demuxer */
++
++    if (io_result->disable_stdin_interaction)
++        stdin_interaction = 0;
 +
 +    if (stop_time != INT64_MAX && recording_time != INT64_MAX) {
 +        stop_time = INT64_MAX;
@@ -289,9 +331,9 @@ index c8d8a7e044..045694ad3f 100644
 +
 +    av_strlcat(d->log_name, "/",               sizeof(d->log_name));
 +    av_strlcat(d->log_name, ic->iformat->name, sizeof(d->log_name));
++    av_freep(&ic->name);
++    ic->name = av_strdup(d->log_name);
 +
-+    if (io_result->scan_all_pmts_set)
-+        av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
 +    remove_avoptions(&o->g->format_opts, o->g->codec_opts);
 +
 +    ret = check_avoptions(o->g->format_opts);
@@ -450,7 +492,7 @@ index c8d8a7e044..045694ad3f 100644
  {
      Demuxer *d = allocate_array_elem(&input_files, sizeof(*d), &nb_input_files);
 diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
-index a0664e2964..056856b518 100644
+index 48e6816c19..0388f04040 100644
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
 @@ -47,6 +47,7 @@
@@ -461,7 +503,7 @@ index a0664e2964..056856b518 100644
  #include "graph/graphprint.h"
  
  HWDevice *filter_hw_device;
-@@ -1440,6 +1441,178 @@ static const OptionGroupDef groups[] = {
+@@ -1440,6 +1441,188 @@ static const OptionGroupDef groups[] = {
      [GROUP_DECODER] = { "loopback decoder", "dec", OPT_DECODER },
  };
  
@@ -556,9 +598,10 @@ index a0664e2964..056856b518 100644
 +        if (ret < 0) {
 +            av_log(NULL, AV_LOG_ERROR, "Error parsing options for input file "
 +                   "%s.\n", g->arg);
-+            /* Clean up already spawned threads */
++            /* Clean up already spawned threads and their I/O results */
 +            for (int j = 0; j < i; j++) {
 +                pthread_join(threads[j], NULL);
++                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
 +                uninit_options(&opts[j]);
 +            }
 +            uninit_options(&opts[i]);
@@ -576,9 +619,10 @@ index a0664e2964..056856b518 100644
 +            av_log(NULL, AV_LOG_ERROR, "pthread_create() failed for input %d: %s\n",
 +                   i, strerror(ret));
 +            ret = AVERROR(ret);
-+            /* Clean up already spawned threads */
++            /* Clean up already spawned threads and their I/O results */
 +            for (int j = 0; j < i; j++) {
 +                pthread_join(threads[j], NULL);
++                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
 +                uninit_options(&opts[j]);
 +            }
 +            uninit_options(&opts[i]);
@@ -593,14 +637,21 @@ index a0664e2964..056856b518 100644
 +               i, thread_args[i].ret);
 +    }
 +
-+    /* Check for I/O errors - if any thread failed, report but continue to try others */
++    /* Check for I/O errors - if any thread failed, clean up all results */
 +    for (i = 0; i < nb_inputs; i++) {
 +        if (thread_args[i].ret < 0) {
-+            av_log(NULL, AV_LOG_ERROR, "Error opening input file %s.\n",
-+                   l->groups[i].arg);
++            IfileOpenIOResult *r = (IfileOpenIOResult *)((char*)io_results + i * io_result_size);
++            const char *msg = ifile_open_io_result_error(r);
++            if (msg)
++                av_log(NULL, AV_LOG_ERROR, "Error opening input file %s: %s\n",
++                       l->groups[i].arg, msg);
++            else
++                av_log(NULL, AV_LOG_ERROR, "Error opening input file %s.\n",
++                       l->groups[i].arg);
 +            ret = thread_args[i].ret;
-+            /* Clean up all options */
++            /* Clean up all I/O results and options */
 +            for (int j = 0; j < nb_inputs; j++) {
++                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
 +                uninit_options(&opts[j]);
 +            }
 +            goto cleanup;
@@ -618,8 +669,9 @@ index a0664e2964..056856b518 100644
 +
 +        if (ret < 0) {
 +            av_log(NULL, AV_LOG_ERROR, "Error finalizing input file %s.\n", g->arg);
-+            /* Clean up remaining options */
++            /* Clean up remaining I/O results and options */
 +            for (int j = i + 1; j < nb_inputs; j++) {
++                ifile_open_io_result_cleanup((IfileOpenIOResult *)((char*)io_results + j * io_result_size));
 +                uninit_options(&opts[j]);
 +            }
 +            goto cleanup;
@@ -640,7 +692,7 @@ index a0664e2964..056856b518 100644
  static int open_files(OptionGroupList *l, const char *inout, Scheduler *sch,
                        int (*open_file)(const OptionsContext*, const char*,
                                         Scheduler*))
-@@ -1510,8 +1683,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
+@@ -1510,8 +1693,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
              goto fail;
      }
  

@@ -1,5 +1,5 @@
 diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
-index 5c0c8ca36f..5484503924 100644
+index e0eecf78f2..e1ed8b4c04 100644
 --- a/fftools/ffmpeg_mux_init.c
 +++ b/fftools/ffmpeg_mux_init.c
 @@ -1229,6 +1229,11 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
@@ -15,7 +15,7 @@ index 5c0c8ca36f..5484503924 100644
  
      ost = &ms->ost;
 diff --git a/fftools/ffmpeg_sched.c b/fftools/ffmpeg_sched.c
-index 517ff1ea85..53ce86228b 100644
+index dc5800d094..2651f1f48e 100644
 --- a/fftools/ffmpeg_sched.c
 +++ b/fftools/ffmpeg_sched.c
 @@ -198,6 +198,10 @@ typedef struct SchMuxStream {
@@ -30,16 +30,16 @@ index 517ff1ea85..53ce86228b 100644
      // The following are protected by Scheduler.schedule_lock //
  
 @@ -438,6 +442,7 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
- static int64_t trailing_dts(const Scheduler *sch, int count_finished)
+ static int64_t trailing_dts(const Scheduler *sch)
  {
      int64_t min_dts = INT64_MAX;
 +    int have_non_sparse = 0;
  
      for (unsigned i = 0; i < sch->nb_mux; i++) {
          const SchMux *mux = &sch->mux[i];
-@@ -447,6 +452,12 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
+@@ -447,6 +452,12 @@ static int64_t trailing_dts(const Scheduler *sch)
  
-             if (ms->source_finished && !count_finished)
+             if (ms->source_finished)
                  continue;
 +            // sparse streams (data, subtitle) have irregular timing and
 +            // should not contribute to trailing_dts when regular streams
@@ -50,7 +50,7 @@ index 517ff1ea85..53ce86228b 100644
              if (ms->last_dts == AV_NOPTS_VALUE)
                  return AV_NOPTS_VALUE;
  
-@@ -454,6 +465,26 @@ static int64_t trailing_dts(const Scheduler *sch, int count_finished)
+@@ -454,6 +465,26 @@ static int64_t trailing_dts(const Scheduler *sch)
          }
      }
  
@@ -64,7 +64,7 @@ index 517ff1ea85..53ce86228b 100644
 +            for (unsigned j = 0; j < mux->nb_streams; j++) {
 +                const SchMuxStream *ms = &mux->streams[j];
 +
-+                if (ms->source_finished && !count_finished)
++                if (ms->source_finished)
 +                    continue;
 +                if (ms->last_dts == AV_NOPTS_VALUE)
 +                    return AV_NOPTS_VALUE;
@@ -77,7 +77,7 @@ index 517ff1ea85..53ce86228b 100644
      return min_dts == INT64_MAX ? AV_NOPTS_VALUE : min_dts;
  }
  
-@@ -689,6 +720,21 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
+@@ -709,6 +740,21 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
      return stream_idx;
  }
  
@@ -125,10 +125,10 @@ index 2cf3034437..af3a014547 100644
   * Set the file path for the SDP.
   *
 diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
-index a9094ab55b..e18e6bad48 100644
+index 6f58e52e70..29899994da 100644
 --- a/libavformat/mpegts.c
 +++ b/libavformat/mpegts.c
-@@ -2613,10 +2613,16 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
+@@ -2697,10 +2697,16 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                      goto out;
                  st->id = pid;
                  st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
@@ -149,10 +149,10 @@ index a9094ab55b..e18e6bad48 100644
          }
  
 diff --git a/libavformat/mpegtsenc.c b/libavformat/mpegtsenc.c
-index 96cdea955e..dba74b835f 100644
+index 3578c3fd46..20958ff49f 100644
 --- a/libavformat/mpegtsenc.c
 +++ b/libavformat/mpegtsenc.c
-@@ -269,6 +269,238 @@ typedef struct MpegTSWriteStream {
+@@ -269,6 +269,255 @@ typedef struct MpegTSWriteStream {
      DVBAC3Descriptor *dvb_ac3_desc;
  } MpegTSWriteStream;
  
@@ -170,6 +170,10 @@ index 96cdea955e..dba74b835f 100644
 +    if (len < 15 || buf[0] != 0xFC) /* table_id must be 0xFC */
 +        return AV_NOPTS_VALUE;
 +
++    /* encrypted_packet flag — encrypted sections can't be parsed */
++    if (buf[4] & 0x80)
++        return AV_NOPTS_VALUE;
++
 +    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
 +    if (section_length + 3 > len)
 +        return AV_NOPTS_VALUE;
@@ -177,7 +181,31 @@ index 96cdea955e..dba74b835f 100644
 +    /* Skip to splice_command_type (offset 13) */
 +    splice_command_type = buf[13];
 +
-+    if (splice_command_type != 0x05) /* Only handle splice_insert */
++    /* time_signal (0x06): splice_time() starts directly at offset 14 */
++    if (splice_command_type == 0x06) {
++        offset = 14;
++        if (offset >= len)
++            return AV_NOPTS_VALUE;
++
++        /* splice_time() - check time_specified_flag */
++        if (!(buf[offset] & 0x80))
++            return AV_NOPTS_VALUE;
++
++        if (offset + 5 > len)
++            return AV_NOPTS_VALUE;
++
++        if (splice_time_offset)
++            *splice_time_offset = offset;
++
++        int64_t pts_time = ((int64_t)(buf[offset] & 0x01) << 32) |
++                           ((int64_t)buf[offset + 1] << 24) |
++                           ((int64_t)buf[offset + 2] << 16) |
++                           ((int64_t)buf[offset + 3] << 8) |
++                           buf[offset + 4];
++        return pts_time;
++    }
++
++    if (splice_command_type != 0x05) /* Only handle splice_insert and time_signal */
 +        return AV_NOPTS_VALUE;
 +
 +    /* Parse splice_insert - starts at offset 14 */
@@ -227,26 +255,17 @@ index 96cdea955e..dba74b835f 100644
 +    return pts_time;
 +}
 +
-+/* Adjust SCTE-35 splice_time to compensate for timestamp rebasing.
++/* Safety-net adjustment for SCTE-35 splice_time timeline mismatches.
 + *
-+ * When transcoding with -avoid_negative_ts or +genpts, output timestamps are rebased
-+ * but the splice_time inside SCTE-35 messages is not adjusted. This function detects
-+ * timeline mismatches and adjusts splice_time accordingly.
-+ *
-+ * Approach: Compare splice_time to packet PTS. If the difference (preroll) is within
-+ * a reasonable range (0-60 seconds), the timelines match and no adjustment is needed.
-+ * If preroll is outside this range, there's a timeline mismatch (e.g., input started
-+ * at 12 hours, output rebased to 0), and we set splice_time to pkt_pts + 8 seconds.
-+ *
-+ * Parameters:
-+ *   s: format context for logging
-+ *   buf: SCTE-35 section data (will be modified in place)
-+ *   len: length of section data
-+ *   pkt_pts: the packet PTS in 90kHz (already rebased by FFmpeg)
++ * Normally the demuxer rebases splice_time when it applies ts_offset or
++ * discontinuity offsets to packet DTS/PTS. This function catches any
++ * residual mismatch (preroll outside ±60s) and replaces splice_time
++ * with pkt_pts + 8s as a last resort.
 + *
 + * Returns 0 on success, negative on error.
 + */
-+static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len, int64_t pkt_pts)
++static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len,
++                             int64_t pkt_pts)
 +{
 +    int64_t splice_time, new_splice_time, preroll;
 +    int splice_time_offset;
@@ -293,26 +312,18 @@ index 96cdea955e..dba74b835f 100644
 +        return 0;
 +    }
 +
-+    /* Timeline mismatch detected: splice_time is in a different timeline
-+     * than pkt_pts (e.g., input stream started at 12 hours, output rebased to 0).
-+     *
-+     * We can't reliably recover the original preroll because we don't have
-+     * access to the input packet PTS before rebasing. Use a default preroll
-+     * that's typical for SCTE-35 (8 seconds).
-+     *
-+     * This ensures Metropolitan and other ad insertion systems can detect
-+     * the splice point at a reasonable time relative to the current video. */
++    /* Timeline mismatch: splice_time not rebased by demuxer.
++     * Fall back to default preroll (8s). This should rarely trigger
++     * since the demuxer now rebases splice_time alongside DTS/PTS. */
 +    new_splice_time = pkt_pts + DEFAULT_PREROLL;
-+
-+    /* Ensure new_splice_time fits in 33 bits */
 +    new_splice_time &= 0x1FFFFFFFFULL;
 +
-+    av_log(s, AV_LOG_VERBOSE, "SCTE-35: Timeline mismatch detected (preroll %.3fs too large). "
-+           "Adjusting splice_time %"PRId64" (%.3fs) -> %"PRId64" (%.3fs), using %.1fs preroll\n",
-+           preroll / 90000.0,
++    av_log(s, AV_LOG_WARNING, "SCTE-35: Timeline mismatch (preroll %.3fs). "
++           "Falling back to %.1fs preroll: splice_time %"PRId64" (%.3fs) -> "
++           "%"PRId64" (%.3fs)\n",
++           preroll / 90000.0, DEFAULT_PREROLL / 90000.0,
 +           splice_time, splice_time / 90000.0,
-+           new_splice_time, new_splice_time / 90000.0,
-+           DEFAULT_PREROLL / 90000.0);
++           new_splice_time, new_splice_time / 90000.0);
 +
 +    /* Write new splice_time back (33 bits at splice_time_offset) */
 +    buf[splice_time_offset] = (buf[splice_time_offset] & 0xFE) | ((new_splice_time >> 32) & 0x01);
@@ -320,6 +331,12 @@ index 96cdea955e..dba74b835f 100644
 +    buf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
 +    buf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
 +    buf[splice_time_offset + 4] = new_splice_time & 0xFF;
++
++    /* Zero pts_adjustment (bytes 4-8) so downstream consumers compute
++     * splice_time + 0 = correct splice time.  Preserve encrypted_packet
++     * and encryption_algorithm bits in byte 4 (top 7 bits). */
++    buf[4] &= 0xFE;           /* clear bit 0 of pts_adjustment (33-bit field) */
++    buf[5] = buf[6] = buf[7] = buf[8] = 0;  /* clear remaining 32 bits */
 +
 +    /* Recalculate CRC32 (last 4 bytes of section)
 +     * Use the same CRC calculation as mpegts_write_section1() */
@@ -391,7 +408,7 @@ index 96cdea955e..dba74b835f 100644
  static void mpegts_write_pat(AVFormatContext *s)
  {
      MpegTSWrite *ts = s->priv_data;
-@@ -444,6 +676,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
+@@ -444,6 +693,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
              stream_type = STREAM_TYPE_PRIVATE_DATA;
          }
          break;
@@ -401,7 +418,7 @@ index 96cdea955e..dba74b835f 100644
      default:
          av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
                      "Stream %d, codec %s, is muxed as a private data stream "
-@@ -531,6 +766,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+@@ -531,6 +783,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
          *q++ = 0xfc;        // private_data_byte
      }
  
@@ -417,7 +434,7 @@ index 96cdea955e..dba74b835f 100644
      val = 0xf000 | (q - program_info_length_ptr - 2);
      program_info_length_ptr[0] = val >> 8;
      program_info_length_ptr[1] = val;
-@@ -828,6 +1072,8 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+@@ -828,6 +1089,8 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                  putbuf(&q, tag, strlen(tag));
                  *q++ = 0;            /* metadata service ID */
                  *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
@@ -426,9 +443,9 @@ index 96cdea955e..dba74b835f 100644
              }
              break;
          }
-@@ -1888,6 +2134,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
-     if (side_data)
-         stream_id = side_data[0];
+@@ -1886,6 +2149,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+     if (stream_id_p)
+         stream_id = stream_id_p[0];
  
 +    /* SCTE-35 must be written as section data, not PES.
 +     * The splice_info_section data from the demuxer already has valid CRC.
@@ -442,7 +459,7 @@ index 96cdea955e..dba74b835f 100644
      if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
          ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
          ts->first_dts_checked = 1;
-@@ -2204,6 +2459,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+@@ -2202,6 +2474,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
          return 0;
      }
  
