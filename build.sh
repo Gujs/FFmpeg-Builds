@@ -35,6 +35,7 @@ cat <<EOF >"$BUILD_SCRIPT"
     git clone --filter=blob:none --branch='$GIT_BRANCH' '$FFMPEG_REPO' ffmpeg
     cd ffmpeg
 
+	shopt -s nullglob
     PATCHES=('/patches/$GIT_BRANCH'/*.patch)
     if [[ "\${#PATCHES[@]}" = 0 ]]; then
         echo 'No patches found for $GIT_BRANCH'
