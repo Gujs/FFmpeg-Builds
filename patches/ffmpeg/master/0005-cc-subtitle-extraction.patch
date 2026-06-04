@@ -1,5 +1,5 @@
 diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
-index c65c27aa7f..86b2c27d1f 100644
+index bd8ecba9f5..b3242ca334 100644
 --- a/fftools/ffmpeg.h
 +++ b/fftools/ffmpeg.h
 @@ -260,6 +260,8 @@ typedef struct OptionsContext {
@@ -423,10 +423,10 @@ index 5020684a28..3a6bc7ade5 100644
  {
      unsigned views_wanted = 0;
 diff --git a/fftools/ffmpeg_enc.c b/fftools/ffmpeg_enc.c
-index 5f1e6e34c1..568be900fd 100644
+index 1ce37d3b29..4c6e40087c 100644
 --- a/fftools/ffmpeg_enc.c
 +++ b/fftools/ffmpeg_enc.c
-@@ -802,8 +802,14 @@ static int frame_encode(OutputStream *ost, AVFrame *frame, AVPacket *pkt)
+@@ -794,8 +794,14 @@ static int frame_encode(OutputStream *ost, AVFrame *frame, AVPacket *pkt)
                                       (AVSubtitle*)frame->buf[0]->data : NULL;
  
          // no flushing for subtitles
@@ -444,7 +444,7 @@ index 5f1e6e34c1..568be900fd 100644
  
      if (frame) {
 diff --git a/fftools/ffmpeg_mux.c b/fftools/ffmpeg_mux.c
-index 25f66dd185..1ac875b77e 100644
+index 46e60f3462..946f7b89d4 100644
 --- a/fftools/ffmpeg_mux.c
 +++ b/fftools/ffmpeg_mux.c
 @@ -43,10 +43,7 @@ typedef struct MuxThreadContext {
@@ -459,7 +459,7 @@ index 25f66dd185..1ac875b77e 100644
  
  static int64_t filesize(AVIOContext *pb)
  {
-@@ -837,6 +834,8 @@ static void ost_free(OutputStream **post)
+@@ -848,6 +845,8 @@ static void ost_free(OutputStream **post)
  
      av_freep(&ost->attachment_filename);
  
@@ -498,10 +498,10 @@ index 4ca8ab73a4..2f9b7121a4 100644
  {
      return (MuxStream*)ost;
 diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
-index e1ed8b4c04..dc9c19dede 100644
+index 56b0901004..be01695f67 100644
 --- a/fftools/ffmpeg_mux_init.c
 +++ b/fftools/ffmpeg_mux_init.c
-@@ -2051,6 +2051,66 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
+@@ -2053,6 +2053,66 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
          }
      }
  
@@ -568,7 +568,7 @@ index e1ed8b4c04..dc9c19dede 100644
      ret = of_add_attachments(mux, o);
      if (ret < 0)
          return ret;
-@@ -3334,6 +3394,222 @@ static Muxer *mux_alloc(void)
+@@ -3345,6 +3405,222 @@ static Muxer *mux_alloc(void)
      return mux;
  }
  
@@ -788,14 +788,14 @@ index e1ed8b4c04..dc9c19dede 100644
 +    return 0;
 +}
 +
- int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
- {
-     Muxer *mux;
+ /* Bounded sparse-interleave window (microseconds) for live (non-seekable)
+  * outputs. Subtitle PIDs are sparse (multi-second gaps); since patch 0001
+  * counts them in the interleaver for correct DVB-sub ordering, cap how long a
 diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
-index 0388f04040..2880cf3c33 100644
+index 397cb0cc56..9170ad024c 100644
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
-@@ -1721,6 +1721,15 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
+@@ -1724,6 +1724,15 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
          goto fail;
      }
  
@@ -811,7 +811,7 @@ index 0388f04040..2880cf3c33 100644
      correct_input_start_times();
  
      ret = apply_sync_offsets();
-@@ -2215,6 +2224,12 @@ const OptionDef options[] = {
+@@ -2218,6 +2227,12 @@ const OptionDef options[] = {
          "set this video output stream to be a heartbeat stream for "
          "fix_sub_duration, according to which subtitles should be split at "
          "random access points" },
@@ -825,7 +825,7 @@ index 0388f04040..2880cf3c33 100644
      /* audio options */
      { "aframes",          OPT_TYPE_FUNC,    OPT_AUDIO | OPT_FUNC_ARG | OPT_PERFILE | OPT_OUTPUT | OPT_EXPERT | OPT_HAS_CANON,
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index 9f7ef689c5..16fbc37bea 100644
+index e68d2db15d..7c7fa9fc13 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
 @@ -353,6 +353,7 @@ OBJS-$(CONFIG_DSS_SP_DECODER)          += dss_sp.o
@@ -837,10 +837,10 @@ index 9f7ef689c5..16fbc37bea 100644
  OBJS-$(CONFIG_DVDSUB_ENCODER)          += dvdsubenc.o dvdsub.o
  OBJS-$(CONFIG_DVAUDIO_DECODER)         += dvaudiodec.o
 diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
-index 695214f192..26425d54c8 100644
+index 0815d46f79..1244cbc4fd 100644
 --- a/libavcodec/allcodecs.c
 +++ b/libavcodec/allcodecs.c
-@@ -732,6 +732,7 @@ extern const FFCodec ff_ass_decoder;
+@@ -734,6 +734,7 @@ extern const FFCodec ff_ass_decoder;
  extern const FFCodec ff_ccaption_decoder;
  extern const FFCodec ff_dvbsub_encoder;
  extern const FFCodec ff_dvbsub_decoder;

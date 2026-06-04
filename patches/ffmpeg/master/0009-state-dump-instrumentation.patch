@@ -1,0 +1,148 @@
+# [DEV-ONLY] Periodic per-input state-dump for gap-storm investigation
+#
+# NOT part of the production 0001-0008 patch series. Apply LAST (after 0008)
+# when investigating the cross-input gap-storm bug. See
+# analysis/gap-storm-investigation.md for the full investigation plan.
+#
+# Adds a once-per-minute [DBG-STATE] log line per input at AV_LOG_INFO that
+# dumps DISCONT-BUF state (active flag, buffered packet count, threshold,
+# timeout, jump-detected flag), per-stream state (pts_wrap_correction,
+# last_sent_dts, cumulative_ts_offset, discont_drop_until_keyframe), and
+# InputFile-level PLL state (av_offset_us, pll disturbance window remaining,
+# swr_jump_comp_ctxs count).
+#
+# Why AV_LOG_INFO and not AV_LOG_DEBUG: production runs at -loglevel info
+# because debug is too noisy from upstream FFmpeg internals. Rate-limit to
+# once per minute per input prevents log flooding; the storm signal is the
+# diff between consecutive snapshots, not the volume.
+#
+# How to apply:
+#     cd ffmpeg-src
+#     git apply ../patches/dev/0009-state-dump-instrumentation.patch
+#     # rebuild
+#
+# How to filter logs:
+#     grep '\[DBG-STATE\]' /var/log/supervisor/Grid_2x2_ffmpeg.log
+#
+# How to remove (after investigation completes):
+#     cd ffmpeg-src
+#     git checkout fftools/ffmpeg_demux.c
+#     # rebuild
+#
+# Total change: 3 hunks in fftools/ffmpeg_demux.c, ~95 net new lines,
+# no upstream behavior modified.
+
+diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
+index 966bb4303c..edcc165cd3 100644
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -246,6 +246,11 @@ typedef struct Demuxer {
+         int     eagain_count;      /* EAGAIN returns from av_read_frame */
+     } diag;
+ 
++    /* DEV-ONLY [DBG-STATE] instrumentation: wall-clock of the last state
++     * dump emitted by dbg_dump_state(). Rate-limits the dump to once per
++     * minute per input. See patches/dev/0009-state-dump-instrumentation. */
++    int64_t               dbg_state_last_us;
++
+     /* Input A/V offset tracking (for muxer PLL reference) */
+     int64_t               input_last_video_dts;  /* Last video DTS (AV_TIME_BASE units) */
+     int64_t               input_last_audio_dts;  /* Last audio DTS (AV_TIME_BASE units) */
+@@ -1815,6 +1820,86 @@ static int demux_thread_init(DemuxThreadContext *dt)
+     return 0;
+ }
+ 
++/* DEV-ONLY [DBG-STATE] instrumentation. Rate-limited per-input state dump
++ * at AV_LOG_INFO so it's visible at production log level without the noise
++ * of -loglevel debug. Called once per input_thread() iteration; the rate
++ * limit check makes the vast majority of calls a no-op. Fires once per
++ * minute per input.
++ *
++ * Field reference:
++ *   d->discont_buf.*               -- patch 0004 DiscontinuityBuffer state
++ *   ds->pts_wrap_correction        -- patch 0004 per-stream wrap accumulator
++ *   d->discont_buf.last_sent_dts[] -- patch 0004 per-stream tail tracking
++ *   d->discont_buf.cumulative_ts_offset[] -- patch 0004 per-stream offset accum
++ *   ds->discont_drop_until_keyframe -- patch 0004 video-drop flag
++ *   f->input_av_offset_us          -- patch 0007 atomic A/V offset
++ *   f->pll_disturbance_until_us    -- patch 0007 atomic PLL disturbance deadline
++ *   f->swr_jump_comp_ctxs          -- patch 0008 aresample SwrContext cache list
++ *
++ * To investigate the cross-input gap-storm bug, deploy with this patch and
++ * grep "[DBG-STATE]" from the log around storm-onset and recovery-flush
++ * boundaries — the field whose value diverges between clean and gapping
++ * inputs (and resets back to baseline on a recovery flush) is the bug
++ * fingerprint. See analysis/gap-storm-investigation.md for the full plan.
++ */
++static void dbg_dump_state(Demuxer *d)
++{
++    InputFile *f = &d->f;
++    int64_t now = av_gettime_relative();
++
++    /* First call: initialise without dumping so startup isn't noisy. */
++    if (d->dbg_state_last_us == 0) {
++        d->dbg_state_last_us = now;
++        return;
++    }
++
++    /* Rate limit: once per minute per input. */
++    if (now - d->dbg_state_last_us < 60LL * 1000000LL)
++        return;
++    d->dbg_state_last_us = now;
++
++    int64_t pll_dist_remain_us =
++        atomic_load(&f->pll_disturbance_until_us) - now;
++    int64_t av_offset_us =
++        atomic_load(&f->input_av_offset_us);
++
++    av_log(d, AV_LOG_INFO,
++           "[DBG-STATE] input=%d "
++           "discont_buf{active=%d nb_packets=%d/%d threshold=%"PRId64"us "
++           "timeout=%"PRId64"us jump_detected=%d} "
++           "pll{av_offset=%"PRId64"us disturbance_remain=%"PRId64"us "
++           "swr_ctxs=%d}\n",
++           f->index,
++           d->discont_buf.active, d->discont_buf.nb_packets,
++           d->discont_buffer_size,
++           d->discont_threshold, d->discont_timeout_us,
++           d->discont_buf.jump_detected,
++           av_offset_us, pll_dist_remain_us,
++           f->nb_swr_jump_comp_ctxs);
++
++    for (int s = 0; s < f->nb_streams; s++) {
++        InputStream *ist = f->streams[s];
++        DemuxStream *ds  = ds_from_ist(ist);
++        const char *type_str = av_get_media_type_string(ist->st->codecpar->codec_type);
++        int64_t last_sent_dts = d->discont_buf.stream_state
++            ? d->discont_buf.stream_state[s].last_sent_dts : AV_NOPTS_VALUE;
++        int64_t cumulative_ts_offset = d->discont_buf.stream_state
++            ? d->discont_buf.stream_state[s].cumulative_ts_offset : 0;
++
++        av_log(d, AV_LOG_INFO,
++               "[DBG-STATE] input=%d stream=%d type=%-5s "
++               "pts_wrap_correction=%"PRId64"us "
++               "last_sent_dts=%"PRId64"us "
++               "cumulative_ts_offset=%"PRId64"us "
++               "drop_until_kf=%d\n",
++               f->index, s, type_str ? type_str : "?",
++               ds->pts_wrap_correction,
++               last_sent_dts,
++               cumulative_ts_offset,
++               ds->discont_drop_until_keyframe);
++    }
++}
++
+ static int input_thread(void *arg)
+ {
+     Demuxer   *d = arg;
+@@ -1859,6 +1944,10 @@ static int input_thread(void *arg)
+         /* Flush diagnostics before potentially blocking in av_read_frame */
+         discont_diag_log(d);
+ 
++        /* DEV-ONLY [DBG-STATE] instrumentation. Rate-limited internally
++         * to once per minute per input. See dbg_dump_state() above. */
++        dbg_dump_state(d);
++
+         read_start = av_gettime_relative();
+         ret = av_read_frame(f->ctx, dt.pkt_demux);
+         read_elapsed = av_gettime_relative() - read_start;
