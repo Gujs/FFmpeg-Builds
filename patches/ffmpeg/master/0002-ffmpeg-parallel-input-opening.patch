@@ -492,7 +492,7 @@ index 04ee2cc2ed..621038ea84 100644
  {
      Demuxer *d = allocate_array_elem(&input_files, sizeof(*d), &nb_input_files);
 diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
-index 48e6816c19..0388f04040 100644
+index 28e6cee741..397cb0cc56 100644
 --- a/fftools/ffmpeg_opt.c
 +++ b/fftools/ffmpeg_opt.c
 @@ -47,6 +47,7 @@
@@ -503,7 +503,7 @@ index 48e6816c19..0388f04040 100644
  #include "graph/graphprint.h"
  
  HWDevice *filter_hw_device;
-@@ -1440,6 +1441,188 @@ static const OptionGroupDef groups[] = {
+@@ -1443,6 +1444,188 @@ static const OptionGroupDef groups[] = {
      [GROUP_DECODER] = { "loopback decoder", "dec", OPT_DECODER },
  };
  
@@ -692,7 +692,7 @@ index 48e6816c19..0388f04040 100644
  static int open_files(OptionGroupList *l, const char *inout, Scheduler *sch,
                        int (*open_file)(const OptionsContext*, const char*,
                                         Scheduler*))
-@@ -1510,8 +1693,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
+@@ -1513,8 +1696,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
              goto fail;
      }
  

@@ -1,8 +1,8 @@
 diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
-index 765b65d0ec..a3ded073c9 100644
+index 8ea89e2ec2..2a71f9717d 100644
 --- a/fftools/ffmpeg_filter.c
 +++ b/fftools/ffmpeg_filter.c
-@@ -36,6 +36,7 @@
+@@ -37,6 +37,7 @@
  #include "libavutil/opt.h"
  #include "libavutil/pixdesc.h"
  #include "libavutil/pixfmt.h"
@@ -10,16 +10,10 @@ index 765b65d0ec..a3ded073c9 100644
  #include "libavutil/samplefmt.h"
  #include "libavutil/time.h"
  #include "libavutil/timestamp.h"
-@@ -146,6 +147,20 @@ typedef struct InputFilterPriv {
+@@ -145,6 +146,14 @@ typedef struct InputFilterPriv {
      int                 downmixinfo_present;
      AVDownmixInfo       downmixinfo;
  
-+    // Resolution change hysteresis to filter out spurious changes from corruption
-+    // Only trigger reconfiguration after seeing N consecutive frames at new resolution
-+    int                 pending_width, pending_height;
-+    int                 resolution_stable_count;
-+#define RESOLUTION_HYSTERESIS_FRAMES 3  // Require 3 consecutive frames (~100ms at 30fps)
-+
 +    // Audio parameter change hysteresis to filter transient changes at splice boundaries
 +    // Discontinuities can cause decoder to briefly output different channel layout/format
 +    int                 pending_audio_sample_rate;
@@ -31,15 +25,15 @@ index 765b65d0ec..a3ded073c9 100644
      struct {
          AVFrame *frame;
  
-@@ -1038,6 +1053,7 @@ void fg_free(FilterGraph **pfg)
-         av_frame_free(&ifp->opts.fallback);
+@@ -1038,6 +1047,7 @@ void fg_free(FilterGraph **pfg)
  
          av_buffer_unref(&ifp->hw_frames_ctx);
+         av_channel_layout_uninit(&ifp->ch_layout);
 +        av_channel_layout_uninit(&ifp->pending_audio_ch_layout);
          av_freep(&ifilter->linklabel);
          av_freep(&ifp->opts.name);
          av_frame_side_data_free(&ifp->side_data, &ifp->nb_side_data);
-@@ -1590,6 +1606,113 @@ static int insert_trim(void *logctx, int64_t start_time, int64_t duration,
+@@ -1580,6 +1590,113 @@ static int insert_trim(void *logctx, int64_t start_time, int64_t duration,
      return 0;
  }
  
@@ -153,7 +147,7 @@ index 765b65d0ec..a3ded073c9 100644
  static int insert_filter(AVFilterContext **last_filter, int *pad_idx,
                           const char *filter_name, const char *args)
  {
-@@ -1626,6 +1749,12 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
+@@ -1616,6 +1733,12 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
      int ret;
      char name[255];
  
@@ -166,7 +160,7 @@ index 765b65d0ec..a3ded073c9 100644
      snprintf(name, sizeof(name), "out_%s", ofilter->output_name);
      ret = avfilter_graph_create_filter(&ofilter->filter,
                                         avfilter_get_by_name("buffersink"),
-@@ -1686,6 +1815,10 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
+@@ -1679,6 +1802,10 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
          AVFilterContext *filter;
          const AVDictionaryEntry *e = NULL;
  
@@ -177,7 +171,7 @@ index 765b65d0ec..a3ded073c9 100644
          snprintf(args, sizeof(args), "%d:%d",
                   ofp->width, ofp->height);
  
-@@ -1694,9 +1827,46 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
+@@ -1687,9 +1814,46 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
          }
  
          snprintf(name, sizeof(name), "scaler_out_%s", ofilter->output_name);
@@ -227,7 +221,7 @@ index 765b65d0ec..a3ded073c9 100644
          if ((ret = avfilter_link(last_filter, pad_idx, filter, 0)) < 0)
              return ret;
  
-@@ -2071,6 +2241,29 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
+@@ -2062,6 +2226,29 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
      const char *graph_desc = fg->graph_desc;
  
      cleanup_filtergraph(fg, fgt);
@@ -257,7 +251,7 @@ index 765b65d0ec..a3ded073c9 100644
      fgt->graph = avfilter_graph_alloc();
      if (!fgt->graph)
          return AVERROR(ENOMEM);
-@@ -3087,19 +3280,143 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+@@ -3078,19 +3265,120 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
      /* determine if the parameters for this input changed */
      switch (ifilter->type) {
      case AVMEDIA_TYPE_AUDIO:
@@ -320,7 +314,7 @@ index 765b65d0ec..a3ded073c9 100644
 +        } else {
 +            /* Parameters match current - reset any pending change */
 +            if (ifp->audio_stable_count) {
-+                av_log(fg, AV_LOG_INFO,
++                av_log(fg, AV_LOG_VERBOSE,
 +                       "[HW-PATCH] Transient audio change filtered out after %d frames\n",
 +                       ifp->audio_stable_count);
 +                ifp->audio_stable_count = 0;
@@ -365,49 +359,26 @@ index 765b65d0ec..a3ded073c9 100644
 +        int frame_is_corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0;
 +
 +        if (frame_is_corrupt && (ifp->width != frame->width || ifp->height != frame->height)) {
-+            /* Corrupt frame with different resolution - don't trust it, reset hysteresis */
-+            if (ifp->pending_width || ifp->pending_height) {
-+                av_log(fg, AV_LOG_WARNING,
-+                       "[HW-PATCH] Ignoring resolution from corrupt frame: %dx%d (keeping current %dx%d, "
-+                       "was pending %dx%d with %d frames)\n",
-+                       frame->width, frame->height, ifp->width, ifp->height,
-+                       ifp->pending_width, ifp->pending_height, ifp->resolution_stable_count);
-+            } else {
-+                av_log(fg, AV_LOG_DEBUG,
-+                       "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
-+                       frame->width, frame->height, ifp->width, ifp->height);
-+            }
-+            /* Reset any pending resolution change - corrupt data invalidates the sequence */
-+            ifp->pending_width = ifp->pending_height = 0;
-+            ifp->resolution_stable_count = 0;
++            /* Corrupt frame with different resolution — don't trust it.
++             * Corrupt SPS/PPS can report wrong dimensions. */
++            av_log(fg, AV_LOG_DEBUG,
++                   "[HW-PATCH] Ignoring resolution %dx%d from corrupt frame (current %dx%d)\n",
++                   frame->width, frame->height, ifp->width, ifp->height);
 +        } else if (ifp->width != frame->width || ifp->height != frame->height) {
 +            /* Reconfigure immediately on any resolution change.
-+             * Hysteresis was removed because it delays reconfig, allowing
-+             * mismatched frames into graphs with fixed-size CUDA pools →
-+             * CUDA_ERROR_INVALID_VALUE crash. The input to the graph is CPU
-+             * (sw decoder), so ifp->hw_frames_ctx is NULL even when the graph
-+             * contains hwupload_cuda internally. Checking hw_frames_ctx doesn't
-+             * work. A spurious reconfig from corrupt SPS is harmless (brief
-+             * interruption); a crash is not. */
++             * Corrupt frames are excluded above — their SPS is unreliable.
++             * A spurious reconfig from a brief resolution glitch is harmless
++             * (brief interruption); delaying reconfig lets mismatched frames
++             * into CUDA pools with fixed dimensions → CUDA_ERROR_INVALID_VALUE. */
 +            av_log(fg, AV_LOG_INFO,
 +                   "[HW-PATCH] Resolution change: %dx%d -> %dx%d (immediate reconfig)\n",
 +                   ifp->width, ifp->height, frame->width, frame->height);
 +            need_reinit |= VIDEO_CHANGED;
-+        } else {
-+            /* Resolution matches current - reset pending state */
-+            if (ifp->pending_width || ifp->pending_height) {
-+                av_log(fg, AV_LOG_WARNING,
-+                       "[HW-PATCH] Spurious resolution change filtered out: %dx%d briefly saw %dx%d (%d frames)\n",
-+                       ifp->width, ifp->height, ifp->pending_width, ifp->pending_height,
-+                       ifp->resolution_stable_count);
-+                ifp->pending_width = ifp->pending_height = 0;
-+                ifp->resolution_stable_count = 0;
-+            }
 +        }
          break;
      }
  
-@@ -3110,12 +3427,26 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+@@ -3101,12 +3389,26 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
      } else if (ifp->displaymatrix_present)
          need_reinit |= MATRIX_CHANGED;
  
@@ -438,7 +409,7 @@ index 765b65d0ec..a3ded073c9 100644
  
      if (need_reinit && fgt->graph && (ifp->opts.flags & IFILTER_FLAG_DROPCHANGED)) {
              ifp->nb_dropped++;
-@@ -3127,9 +3458,47 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
+@@ -3118,9 +3420,47 @@ static int send_frame(FilterGraph *fg, FilterGraphThread *fgt,
      if (!(ifp->opts.flags & IFILTER_FLAG_REINIT) && fgt->graph)
          need_reinit = 0;
  
@@ -474,7 +445,7 @@ index 765b65d0ec..a3ded073c9 100644
 +                   (void *)new_hwfc, av_get_pix_fmt_name(new_hwfc->sw_format),
 +                   new_hwfc->width, new_hwfc->height);
 +        } else {
-+            av_log(fg, AV_LOG_INFO,
++            av_log(fg, AV_LOG_VERBOSE,
 +                   "[HW-PATCH] hw_frames_ctx changed (%p -> %p) but parameters "
 +                   "identical (%s %dx%d) - suppressing reconfig\n",
 +                   (void *)ifp->hw_frames_ctx->data,
@@ -489,7 +460,7 @@ index 765b65d0ec..a3ded073c9 100644
      if (need_reinit) {
          ret = ifilter_parameters_from_frame(ifilter, frame);
 diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
-index 392230526d..55f6eab2e5 100644
+index e9ca6e01fd..35f17d49bd 100644
 --- a/libavcodec/nvenc.c
 +++ b/libavcodec/nvenc.c
 @@ -28,6 +28,7 @@
@@ -500,7 +471,7 @@ index 392230526d..55f6eab2e5 100644
  #include "libavutil/hwcontext_cuda.h"
  #include "libavutil/hwcontext.h"
  #include "libavutil/cuda_check.h"
-@@ -2205,6 +2206,7 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
+@@ -2219,6 +2220,7 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
                  p_nvenc->nvEncUnmapInputResource(ctx->nvencoder, ctx->registered_frames[i].in_map.mappedResource);
              if (ctx->registered_frames[i].regptr)
                  p_nvenc->nvEncUnregisterResource(ctx->nvencoder, ctx->registered_frames[i].regptr);
@@ -508,7 +479,7 @@ index 392230526d..55f6eab2e5 100644
          }
          ctx->nb_registered_frames = 0;
      }
-@@ -2286,6 +2288,13 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
+@@ -2300,6 +2302,13 @@ av_cold int ff_nvenc_encode_init(AVCodecContext *avctx)
      if (!ctx->frame)
          return AVERROR(ENOMEM);
  
@@ -522,7 +493,7 @@ index 392230526d..55f6eab2e5 100644
      if ((ret = nvenc_load_libraries(avctx)) < 0)
          return ret;
  
-@@ -2368,6 +2377,7 @@ static int nvenc_find_free_reg_resource(AVCodecContext *avctx)
+@@ -2382,6 +2391,7 @@ static int nvenc_find_free_reg_resource(AVCodecContext *avctx)
                              return nvenc_print_error(avctx, nv_status, "Failed unregistering unused input resource");
                          ctx->registered_frames[i].ptr = NULL;
                          ctx->registered_frames[i].regptr = NULL;
@@ -530,7 +501,7 @@ index 392230526d..55f6eab2e5 100644
                      }
                      return i;
                  }
-@@ -2386,16 +2396,52 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -2400,16 +2410,52 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
      NvencContext *ctx = avctx->priv_data;
      NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
      NV_ENCODE_API_FUNCTION_LIST *p_nvenc = &dl_fn->nvenc_funcs;
@@ -588,7 +559,7 @@ index 392230526d..55f6eab2e5 100644
      }
  
      idx = nvenc_find_free_reg_resource(avctx);
-@@ -2432,6 +2478,10 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -2446,6 +2492,10 @@ static int nvenc_register_frame(AVCodecContext *avctx, const AVFrame *frame)
      ctx->registered_frames[idx].ptr       = frame->data[0];
      ctx->registered_frames[idx].ptr_index = reg.subResourceIndex;
      ctx->registered_frames[idx].regptr    = reg.registeredResource;
@@ -599,28 +570,7 @@ index 392230526d..55f6eab2e5 100644
      return idx;
  }
  
-@@ -2446,6 +2496,20 @@ static int nvenc_upload_frame(AVCodecContext *avctx, const AVFrame *frame,
-     NVENCSTATUS nv_status;
- 
-     if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
-+        /* Track hw_frames_ctx changes for diagnostic purposes.
-+         * Log when the frame pool changes (e.g., after filter graph reconfiguration).
-+         * Also store parameters for the pool change comparison in ff_nvenc_encode_frame. */
-+        if (frame->hw_frames_ctx && frame->hw_frames_ctx->data != ctx->last_hw_frames_ctx) {
-+            AVHWFramesContext *hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-+            av_log(avctx, AV_LOG_DEBUG,
-+                   "[HW-PATCH] Frame pool changed: %p -> %p (PTS=%"PRId64" pict_type=%d)\n",
-+                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data, frame->pts, frame->pict_type);
-+            ctx->last_hw_frames_ctx = frame->hw_frames_ctx->data;
-+            ctx->last_hw_sw_format  = hwfc->sw_format;
-+            ctx->last_hw_width      = hwfc->width;
-+            ctx->last_hw_height     = hwfc->height;
-+        }
-+
-         int reg_idx = nvenc_register_frame(avctx, frame);
-         if (reg_idx < 0) {
-             av_log(avctx, AV_LOG_ERROR, "Could not register an input HW frame\n");
-@@ -2637,6 +2701,14 @@ static int nvenc_set_timestamp(AVCodecContext *avctx,
+@@ -2651,6 +2701,14 @@ static int nvenc_set_timestamp(AVCodecContext *avctx,
  #endif
      if (ctx->output_frame_num >= delay) {
          pkt->dts = timestamp_queue_dequeue(ctx->timestamp_list);
@@ -635,7 +585,7 @@ index 392230526d..55f6eab2e5 100644
          ctx->output_frame_num++;
          return 0;
      }
-@@ -2971,6 +3043,28 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
+@@ -2986,6 +3044,28 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
          reconfig_dar = 1;
      }
  
@@ -664,11 +614,12 @@ index 392230526d..55f6eab2e5 100644
      if (ctx->rc != NV_ENC_PARAMS_RC_CONSTQP && ctx->support_dyn_bitrate) {
          if (avctx->bit_rate > 0 && params.reInitEncodeParams.encodeConfig->rcParams.averageBitRate != avctx->bit_rate) {
              av_log(avctx, AV_LOG_VERBOSE,
-@@ -3011,11 +3105,19 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
+@@ -3026,11 +3106,20 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
          }
      }
  
-+    /* Pool changes are now handled by nvenc_rebuild_session() (fix v5).
++    /* Pool changes are handled by nvenc_pool_change() — lightweight flush +
++     * clean registrations + force IDR, no session destroy/recreate.
 +     * The resetEncoder=1 path is no longer used for pool changes. */
 +
      if (!needs_encode_config)
@@ -684,7 +635,7 @@ index 392230526d..55f6eab2e5 100644
          if (ret != NV_ENC_SUCCESS) {
              nvenc_print_error(avctx, ret, "failed to reconfigure nvenc");
          } else {
-@@ -3029,9 +3131,246 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
+@@ -3044,9 +3133,159 @@ static void reconfig_encoder(AVCodecContext *avctx, const AVFrame *frame)
                  ctx->encode_config.rcParams.maxBitRate = params.reInitEncodeParams.encodeConfig->rcParams.maxBitRate;
                  ctx->encode_config.rcParams.vbvBufferSize = params.reInitEncodeParams.encodeConfig->rcParams.vbvBufferSize;
              }
@@ -708,7 +659,18 @@ index 392230526d..55f6eab2e5 100644
 + *
 + * Must be called inside a CUDA context (nvenc_push_context already done).
 + */
-+static int nvenc_rebuild_session(AVCodecContext *avctx)
++/* Lightweight pool change: flush pipeline, clean registrations, force IDR.
++ * Does NOT destroy/recreate the NVENC session — preserves the encoder's
++ * internal DPB (Decoded Picture Buffer) and all session state.
++ *
++ * Full session rebuild (nvEncDestroyEncoder + nvEncOpenEncodeSessionEx)
++ * permanently corrupts B-frame DPB references when multiple NVENC sessions
++ * share the same GPU. The force-IDR resets the DPB cleanly within the
++ * existing session, and new frames are registered from the new pool.
++ *
++ * Must be called inside a CUDA context (nvenc_push_context already done).
++ */
++static int nvenc_pool_change(AVCodecContext *avctx)
 +{
 +    NvencContext *ctx = avctx->priv_data;
 +    NvencDynLoadFunctions *dl_fn = &ctx->nvenc_dload_funcs;
@@ -717,10 +679,10 @@ index 392230526d..55f6eab2e5 100644
 +    int i;
 +
 +    av_log(avctx, AV_LOG_INFO,
-+           "[HW-PATCH] NVENC session rebuild starting (output_frame_num=%"PRIu64")\n",
++           "[HW-PATCH] NVENC pool change starting (output_frame_num=%"PRIu64")\n",
 +           ctx->output_frame_num);
 +
-+    /* Phase 2: EOS flush + drain pending output */
++    /* Step 1: EOS flush — drain NVENC's internal B-frame reorder pipeline */
 +    {
 +        NV_ENC_PIC_PARAMS eos_params = { 0 };
 +        eos_params.version = NV_ENC_PIC_PARAMS_VER;
@@ -739,7 +701,7 @@ index 392230526d..55f6eab2e5 100644
 +            av_fifo_write(ctx->output_surface_ready_queue, &tmp_surf, 1);
 +    }
 +
-+    /* Drain all ready surfaces: lock/unlock bitstream, unmap, unref */
++    /* Step 2: Drain all ready surfaces — lock/unlock bitstream, unmap, unref */
 +    {
 +        NvencSurface *tmp_surf;
 +        int drained = 0;
@@ -753,7 +715,6 @@ index 392230526d..55f6eab2e5 100644
 +            if (nv_status == NV_ENC_SUCCESS)
 +                p_nvenc->nvEncUnlockBitstream(ctx->nvencoder, tmp_surf->output_surface);
 +
-+            /* Unmap and unref the input resource */
 +            if ((avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) &&
 +                tmp_surf->reg_idx >= 0 && tmp_surf->reg_idx < ctx->nb_registered_frames) {
 +                if (ctx->registered_frames[tmp_surf->reg_idx].mapped > 0) {
@@ -765,17 +726,16 @@ index 392230526d..55f6eab2e5 100644
 +                av_frame_unref(tmp_surf->in_ref);
 +                tmp_surf->input_surface = NULL;
 +            }
-+
-+            /* Dequeue the corresponding timestamp */
+ 
 +            timestamp_queue_dequeue(ctx->timestamp_list);
 +            drained++;
-+        }
+         }
 +        if (drained)
 +            av_log(avctx, AV_LOG_VERBOSE,
-+                   "[HW-PATCH] Drained %d pending surfaces during rebuild\n", drained);
++                   "[HW-PATCH] Drained %d pending surfaces\n", drained);
 +    }
 +
-+    /* Phase 3: Force-clean ALL registered frames */
++    /* Step 3: Clean ALL registered frames — old pool surfaces are stale */
 +    if (avctx->pix_fmt == AV_PIX_FMT_CUDA || avctx->pix_fmt == AV_PIX_FMT_D3D11) {
 +        int cleaned = 0;
 +        for (i = 0; i < ctx->nb_registered_frames; i++) {
@@ -796,142 +756,46 @@ index 392230526d..55f6eab2e5 100644
 +        ctx->nb_registered_frames = 0;
 +        if (cleaned)
 +            av_log(avctx, AV_LOG_VERBOSE,
-+                   "[HW-PATCH] Cleaned %d registered frames during rebuild\n", cleaned);
++                   "[HW-PATCH] Cleaned %d registered frames\n", cleaned);
 +    }
 +
-+    /* Phase 4: Destroy output bitstream buffers + encoder session */
++    /* Step 4: Reset surface queues — bitstream buffers are reused (no destroy/create) */
 +    for (i = 0; i < ctx->nb_surfaces; i++) {
-+        if (avctx->pix_fmt != AV_PIX_FMT_CUDA && avctx->pix_fmt != AV_PIX_FMT_D3D11)
-+            p_nvenc->nvEncDestroyInputBuffer(ctx->nvencoder, ctx->surfaces[i].input_surface);
-+        p_nvenc->nvEncDestroyBitstreamBuffer(ctx->nvencoder, ctx->surfaces[i].output_surface);
-+        ctx->surfaces[i].output_surface = NULL;
-+        ctx->surfaces[i].input_surface = NULL;
-+    }
-+
-+    p_nvenc->nvEncDestroyEncoder(ctx->nvencoder);
-+    ctx->nvencoder = NULL;
-+
-+    av_log(avctx, AV_LOG_VERBOSE,
-+           "[HW-PATCH] Old NVENC session destroyed\n");
- 
-+    /* Phase 5: Create new session + reinitialize encoder */
-+    {
-+        int ret = nvenc_open_session(avctx);
-+        if (ret < 0) {
-+            av_log(avctx, AV_LOG_ERROR,
-+                   "[HW-PATCH] Failed to open new NVENC session: %d\n", ret);
-+            return ret;
-+        }
-+    }
-+
-+    nv_status = p_nvenc->nvEncInitializeEncoder(ctx->nvencoder, &ctx->init_encode_params);
-+    if (nv_status != NV_ENC_SUCCESS) {
-+        av_log(avctx, AV_LOG_ERROR,
-+               "[HW-PATCH] nvEncInitializeEncoder failed during rebuild\n");
-+        return nvenc_print_error(avctx, nv_status, "InitializeEncoder failed in rebuild");
-+    }
-+
-+#ifdef NVENC_HAVE_CUSTREAM_PTR
-+    if (ctx->cu_stream) {
-+        nv_status = p_nvenc->nvEncSetIOCudaStreams(ctx->nvencoder,
-+                                                    &ctx->cu_stream, &ctx->cu_stream);
-+        if (nv_status != NV_ENC_SUCCESS)
-+            av_log(avctx, AV_LOG_WARNING,
-+                   "[HW-PATCH] nvEncSetIOCudaStreams failed during rebuild (non-fatal)\n");
-+    }
-+#endif
-+
-+    av_log(avctx, AV_LOG_VERBOSE,
-+           "[HW-PATCH] New NVENC session created and initialized\n");
-+
-+    /* Phase 6: Allocate new bitstream buffers + reset queues */
-+    for (i = 0; i < ctx->nb_surfaces; i++) {
-+        NV_ENC_CREATE_BITSTREAM_BUFFER allocOut = { 0 };
-+        allocOut.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-+        NvencSurface *tmp_surface = &ctx->surfaces[i];
-+
-+        if (avctx->pix_fmt != AV_PIX_FMT_CUDA && avctx->pix_fmt != AV_PIX_FMT_D3D11) {
-+            NV_ENC_CREATE_INPUT_BUFFER allocSurf = { 0 };
-+            allocSurf.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-+            allocSurf.width = avctx->width;
-+            allocSurf.height = avctx->height;
-+            allocSurf.bufferFmt = ctx->surfaces[i].format;
-+
-+            nv_status = p_nvenc->nvEncCreateInputBuffer(ctx->nvencoder, &allocSurf);
-+            if (nv_status != NV_ENC_SUCCESS)
-+                return nvenc_print_error(avctx, nv_status,
-+                    "CreateInputBuffer failed in rebuild");
-+            ctx->surfaces[i].input_surface = allocSurf.inputBuffer;
-         }
-+
-+        nv_status = p_nvenc->nvEncCreateBitstreamBuffer(ctx->nvencoder, &allocOut);
-+        if (nv_status != NV_ENC_SUCCESS)
-+            return nvenc_print_error(avctx, nv_status,
-+                "CreateBitstreamBuffer failed in rebuild");
-+        ctx->surfaces[i].output_surface = allocOut.bitstreamBuffer;
-+
-+        /* Clear any leftover in_ref from drained surfaces */
 +        av_frame_unref(ctx->surfaces[i].in_ref);
++        ctx->surfaces[i].input_surface = NULL;
 +        ctx->surfaces[i].reg_idx = -1;
-+
-+        av_fifo_write(ctx->unused_surface_queue, &tmp_surface, 1);
 +    }
-+
-+    /* Reset all FIFOs — unused_surface_queue already populated above,
-+     * but the other three must be empty */
 +    av_fifo_reset2(ctx->output_surface_queue);
 +    av_fifo_reset2(ctx->output_surface_ready_queue);
 +    av_fifo_reset2(ctx->timestamp_list);
-+
-+    /* Note: unused_surface_queue was written to above; we need to reset it
-+     * first and re-populate because it may have had leftover entries */
 +    av_fifo_reset2(ctx->unused_surface_queue);
 +    for (i = 0; i < ctx->nb_surfaces; i++) {
 +        NvencSurface *tmp_surface = &ctx->surfaces[i];
 +        av_fifo_write(ctx->unused_surface_queue, &tmp_surface, 1);
      }
 +
-+    /* Clean frame_data_array opaque refs */
++    /* Step 5: Reset frame data + DTS tracking for B-frame ramp-up */
 +    for (i = 0; i < ctx->frame_data_array_nb; i++)
 +        av_buffer_unref(&ctx->frame_data_array[i].frame_opaque_ref);
 +    ctx->frame_data_array_pos = 0;
-+
-+    /* Phase 7: Restore saved state + reset DTS tracking.
-+     * output_frame_num=0 and initial_delay_time=0 trigger the DTS ramp-up
-+     * in nvenc_set_timestamp() — this rebuilds the timestamp delay buffer
-+     * for B-frame reordering (delay = frameIntervalP - 1).
-+     * last_dts_out/last_pts_out reset because DTS sequence restarts. */
 +    ctx->output_frame_num = 0;
 +    ctx->initial_delay_time = 0;
 +    ctx->last_dts_out = AV_NOPTS_VALUE;
 +    ctx->last_pts_out = AV_NOPTS_VALUE;
-+    /* Reset frame_idx_counter to 0 for a clean start.
-+     * A fresh NVENC session receiving large frameIdx values (carried over from
-+     * pre-rebuild) may confuse internal reference picture management, causing
-+     * periodic single-frame displacement in B-frame GOPs. */
 +    ctx->frame_idx_counter = 0;
 +
-+    /* Refresh extradata (SPS/PPS) from the new session.
-+     * The new NVENC session may generate different SPS/PPS than the original
-+     * (e.g., if pool dimensions changed due to FFALIGN differences).
-+     * With repeatSPSPPS=1, the in-band headers will be correct, but some
-+     * muxer code paths use avctx->extradata — keep it in sync. */
-+    {
-+        int ed_ret = nvenc_setup_extradata(avctx);
-+        if (ed_ret < 0)
-+            av_log(avctx, AV_LOG_WARNING,
-+                   "[HW-PATCH] Failed to refresh extradata after rebuild: %d\n", ed_ret);
-+    }
++    /* No extradata refresh needed — session and SPS/PPS are unchanged. */
 +
 +    av_log(avctx, AV_LOG_INFO,
-+           "[HW-PATCH] NVENC session rebuilt (DTS ramp-up will run for %d frames)\n",
++           "[HW-PATCH] NVENC pool change complete, session preserved "
++           "(DTS ramp-up will run for %d frames)\n",
 +           FFMAX(ctx->encode_config.frameIntervalP - 1, 0));
 +
 +    return 0;
  }
  
  #ifdef NVENC_HAVE_HEVC_AND_AV1_MASTERING_METADATA
-@@ -3128,10 +3467,56 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -3143,10 +3382,62 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
      NV_ENC_PIC_PARAMS pic_params = { 0 };
      pic_params.version = NV_ENC_PIC_PARAMS_VER;
  
@@ -965,13 +829,19 @@ index 392230526d..55f6eab2e5 100644
 +             * creates new CUDA surface pools. NVENC's registered input resources
 +             * reference the old pool's surfaces and must be cleaned up.
 +             * Full rebuild: EOS flush → drain → clean registrations → destroy →
-+             * recreate session → reallocate bitstream buffers. */
++             * recreate session → reallocate bitstream buffers.
++             *
++             * The NVENC session is NOT destroyed/recreated — only registrations
++             * are cleaned and the next frame gets FORCEIDR to reset the DPB.
++             * This preserves the session's B-frame DPB integrity. The session
++             * stays on its original CUDA context; NVENC can access surfaces
++             * from any context on the same GPU via CUDA's UVA model. */
 +            ctx->pool_change_rebuild = 1;
 +            ctx->pool_change_force_idr = 1;
 +
 +            av_log(avctx, AV_LOG_INFO,
 +                   "[HW-PATCH] Frame pool change detected "
-+                   "(old=%p new=%p, %dx%d %s -> %dx%d %s) - rebuild + IDR\n",
++                   "(old=%p new=%p, %dx%d %s -> %dx%d %s) - clean regs + IDR\n",
 +                   ctx->last_hw_frames_ctx, frame->hw_frames_ctx->data,
 +                   ctx->last_hw_width, ctx->last_hw_height,
 +                   av_get_pix_fmt_name(ctx->last_hw_sw_format),
@@ -988,26 +858,27 @@ index 392230526d..55f6eab2e5 100644
          in_surf = get_free_frame(ctx);
          if (!in_surf)
              return AVERROR(EAGAIN);
-@@ -3140,6 +3525,29 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -3155,6 +3446,30 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
          if (res < 0)
              return res;
  
-+        /* Full session rebuild on pool change — return the surface get_free_frame()
-+         * already popped, rebuild destroys all surfaces and recreates them,
-+         * then re-pop a surface with new bitstream buffers. */
++        /* Lightweight pool change: flush pipeline, clean registrations, force IDR.
++         * Session stays alive — no destroy/recreate — preserving NVENC's DPB.
++         * Bitstream buffers are reused (same session), so the surface from
++         * get_free_frame() above is still valid. */
 +        if (ctx->pool_change_rebuild) {
 +            av_fifo_write(ctx->unused_surface_queue, &in_surf, 1);
 +
-+            int rebuild_ret = nvenc_rebuild_session(avctx);
-+            if (rebuild_ret < 0) {
++            int ret2 = nvenc_pool_change(avctx);
++            if (ret2 < 0) {
 +                av_log(avctx, AV_LOG_ERROR,
-+                       "[HW-PATCH] NVENC session rebuild failed: %d\n", rebuild_ret);
++                       "[HW-PATCH] NVENC pool change failed: %d\n", ret2);
 +                nvenc_pop_context(avctx);
-+                return rebuild_ret;
++                return ret2;
 +            }
 +            ctx->pool_change_rebuild = 0;
 +
-+            /* Re-pop surface — has new bitstream buffer now */
++            /* Re-pop surface — same bitstream buffer, queue was reset */
 +            in_surf = get_free_frame(ctx);
 +            if (!in_surf) {
 +                nvenc_pop_context(avctx);
@@ -1018,14 +889,14 @@ index 392230526d..55f6eab2e5 100644
          reconfig_encoder(avctx, frame);
  
          res = nvenc_upload_frame(avctx, frame, in_surf);
-@@ -3167,7 +3575,13 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -3182,7 +3497,13 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
              pic_params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
          }
  
 -        if (ctx->forced_idr >= 0 && frame->pict_type == AV_PICTURE_TYPE_I) {
 +        if (ctx->pool_change_force_idr) {
 +            pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
-+            av_log(avctx, AV_LOG_INFO,
++            av_log(avctx, AV_LOG_VERBOSE,
 +                   "[HW-PATCH] Pool change at PTS=%"PRId64" -> FORCEIDR (DPB reset)\n",
 +                   frame->pts);
 +            ctx->pool_change_force_idr = 0;
@@ -1033,7 +904,7 @@ index 392230526d..55f6eab2e5 100644
              pic_params.encodePicFlags =
                  ctx->forced_idr ? NV_ENC_PIC_FLAG_FORCEIDR : NV_ENC_PIC_FLAG_FORCEINTRA;
          } else {
-@@ -3252,6 +3666,12 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
+@@ -3267,6 +3588,12 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
  
      nv_status = p_nvenc->nvEncEncodePicture(ctx->nvencoder, &pic_params);
  
@@ -1047,7 +918,7 @@ index 392230526d..55f6eab2e5 100644
          av_freep(&(ctx->sei_data[i].payload));
  
 diff --git a/libavcodec/nvenc.h b/libavcodec/nvenc.h
-index 069ba82bc9..ee83c6aa31 100644
+index 069ba82bc9..ca590de329 100644
 --- a/libavcodec/nvenc.h
 +++ b/libavcodec/nvenc.h
 @@ -248,6 +248,7 @@ typedef struct NvencContext
@@ -1058,7 +929,7 @@ index 069ba82bc9..ee83c6aa31 100644
      } registered_frames[MAX_REGISTERED_FRAMES];
      int nb_registered_frames;
  
-@@ -321,6 +322,32 @@ typedef struct NvencContext
+@@ -321,6 +322,33 @@ typedef struct NvencContext
      int cbr_padding;
      int multiview, multiview_supported;
      int display_sei_sent;
@@ -1082,7 +953,8 @@ index 069ba82bc9..ee83c6aa31 100644
 +    // Force FORCEIDR on next frame after pool change
 +    int pool_change_force_idr;
 +
-+    // Full NVENC session teardown/rebuild on pool change
++    // Lightweight pool change: flush + clean registrations + force IDR
++    // (no session destroy/recreate — preserves NVENC's B-frame DPB)
 +    int pool_change_rebuild;
 +
 +    // Track last DTS/PTS for detecting non-monotonic timestamps
@@ -1226,10 +1098,10 @@ index ad81d91bbc..4c6dcd704a 100644
                                                     conv_opts[k], NULL, graph);
                  if (ret < 0)
 diff --git a/libavfilter/buffersrc.c b/libavfilter/buffersrc.c
-index b18d3f24dd..21f57480c6 100644
+index 16efa6e6c8..02b753f428 100644
 --- a/libavfilter/buffersrc.c
 +++ b/libavfilter/buffersrc.c
-@@ -58,10 +58,10 @@ typedef struct BufferSourceContext {
+@@ -59,10 +59,10 @@ typedef struct BufferSourceContext {
      AVBufferRef *hw_frames_ctx;
  
      /* audio only */
@@ -1244,7 +1116,7 @@ index b18d3f24dd..21f57480c6 100644
      AVFrameSideData **side_data;
      int nb_side_data;
  
-@@ -95,13 +95,24 @@ typedef struct BufferSourceContext {
+@@ -96,13 +96,24 @@ typedef struct BufferSourceContext {
      }
  
  #define CHECK_AUDIO_PARAM_CHANGE(s, c, srate, layout, format, pts)\
@@ -1274,21 +1146,23 @@ index b18d3f24dd..21f57480c6 100644
      }
  
  AVBufferSrcParameters *av_buffersrc_parameters_alloc(void)
-@@ -439,6 +450,13 @@ static av_cold int init_audio(AVFilterContext *ctx)
+@@ -457,6 +468,15 @@ static av_cold int init_audio(AVFilterContext *ctx)
      if (!s->time_base.num)
          s->time_base = (AVRational){1, s->sample_rate};
  
 +    s->prev_sample_rate = s->sample_rate;
 +    s->prev_sample_fmt  = s->sample_fmt;
 +    s->prev_channels    = s->channels;
-+    ret = av_channel_layout_copy(&s->prev_ch_layout, &s->ch_layout);
-+    if (ret < 0)
-+        return ret;
++    {
++        int ret = av_channel_layout_copy(&s->prev_ch_layout, &s->ch_layout);
++        if (ret < 0)
++            return ret;
++    }
 +
      av_log(ctx, AV_LOG_VERBOSE,
             "tb:%d/%d samplefmt:%s samplerate:%d chlayout:%s\n",
             s->time_base.num, s->time_base.den, av_get_sample_fmt_name(s->sample_fmt),
-@@ -452,6 +470,7 @@ static av_cold void uninit(AVFilterContext *ctx)
+@@ -470,6 +490,7 @@ static av_cold void uninit(AVFilterContext *ctx)
      BufferSourceContext *s = ctx->priv;
      av_buffer_unref(&s->hw_frames_ctx);
      av_channel_layout_uninit(&s->ch_layout);
@@ -1297,10 +1171,10 @@ index b18d3f24dd..21f57480c6 100644
  }
  
 diff --git a/libavfilter/formats.c b/libavfilter/formats.c
-index 3315922cc7..2f54798b34 100644
+index fac2e4a393..1d136bdf25 100644
 --- a/libavfilter/formats.c
 +++ b/libavfilter/formats.c
-@@ -1320,3 +1320,43 @@ int ff_formats_check_channel_layouts(void *log, const AVFilterChannelLayouts *fm
+@@ -1321,3 +1321,43 @@ int ff_formats_check_channel_layouts(void *log, const AVFilterChannelLayouts *fm
      }
      return 0;
  }
@@ -1365,45 +1239,11 @@ index 45864a32db..dd5201fb76 100644
 +const char *ff_get_video_conversion_filter(enum AVPixelFormat fmt);
 +
  #endif /* AVFILTER_FORMATS_H */
-diff --git a/libavfilter/split.c b/libavfilter/split.c
-index d0bd0c3b2a..5ab6c5f3bd 100644
---- a/libavfilter/split.c
-+++ b/libavfilter/split.c
-@@ -90,6 +90,29 @@ static int activate(AVFilterContext *ctx)
-                 break;
-             }
- 
-+            /* For HW frames, make each output a private copy.
-+             * av_frame_clone shares the same GPU buffer across all outputs.
-+             * After filter graph reconfiguration, shared GPU surfaces cause
-+             * frame displacement in downstream CUDA filters (scale_cuda).
-+             * For SW frames or sole references, this is a no-op. */
-+            if (buf_out->hw_frames_ctx) {
-+                int was_writable = av_frame_is_writable(buf_out);
-+                ret = av_frame_make_writable(buf_out);
-+                if (ret < 0) {
-+                    av_frame_free(&buf_out);
-+                    break;
-+                }
-+                /* Log if a HW frame was NOT copied (already writable).
-+                 * This should not happen with split — all clones share
-+                 * the same buffer (refcount > 1). If it does, the frame
-+                 * is processed on shared GPU memory. */
-+                if (was_writable)
-+                    av_log(ctx, AV_LOG_WARNING,
-+                           "[HW-PATCH] split output %d: HW frame already writable "
-+                           "(refcount=1, NO copy) PTS=%"PRId64"\n",
-+                           i, buf_out->pts);
-+            }
-+
-             ret = ff_filter_frame(ctx->outputs[i], buf_out);
-             if (ret < 0)
-                 break;
 diff --git a/libavfilter/vf_colorspace_cuda.c b/libavfilter/vf_colorspace_cuda.c
-index c38f277a5f..1465800819 100644
+index a4811af6eb..176a27f4c0 100644
 --- a/libavfilter/vf_colorspace_cuda.c
 +++ b/libavfilter/vf_colorspace_cuda.c
-@@ -91,6 +91,7 @@ static av_cold void cudacolorspace_uninit(AVFilterContext* ctx)
+@@ -92,6 +92,7 @@ static av_cold void cudacolorspace_uninit(AVFilterContext* ctx)
          CUcontext dummy;
  
          CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
@@ -1412,7 +1252,7 @@ index c38f277a5f..1465800819 100644
          s->cu_module = NULL;
          CHECK_CU(cu->cuCtxPopCurrent(&dummy));
 diff --git a/libavfilter/vf_scale_cuda.c b/libavfilter/vf_scale_cuda.c
-index 5fd757161b..59e7082ac5 100644
+index 01cac53348..0058e81ce6 100644
 --- a/libavfilter/vf_scale_cuda.c
 +++ b/libavfilter/vf_scale_cuda.c
 @@ -147,6 +147,12 @@ static av_cold void cudascale_uninit(AVFilterContext *ctx)
@@ -1428,13 +1268,13 @@ index 5fd757161b..59e7082ac5 100644
          CHECK_CU(cu->cuModuleUnload(s->cu_module));
          s->cu_module = NULL;
          CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-@@ -428,6 +434,18 @@ static av_cold int cudascale_config_props(AVFilterLink *outlink)
+@@ -431,6 +437,18 @@ static av_cold int cudascale_config_props(AVFilterLink *outlink)
      if (ret < 0)
          return ret;
  
 +    if (!s->passthrough) {
 +        AVHWFramesContext *out_hwfc = (AVHWFramesContext *)s->frames_ctx->data;
-+        av_log(ctx, AV_LOG_INFO,
++        av_log(ctx, AV_LOG_VERBOSE,
 +               "[HW-PATCH] scale_cuda configured: %dx%d -> %dx%d, "
 +               "pool=%p (%dx%d %s), stream=%p\n",
 +               inlink->w, inlink->h, outlink->w, outlink->h,
@@ -1447,7 +1287,7 @@ index 5fd757161b..59e7082ac5 100644
      return 0;
  
  fail:
-@@ -560,7 +578,7 @@ static int cudascale_scale(AVFilterContext *ctx, AVFrame *out, AVFrame *in)
+@@ -563,7 +581,7 @@ static int cudascale_scale(AVFilterContext *ctx, AVFrame *out, AVFrame *in)
          return ret;
  
      src = s->frame;
@@ -1456,3 +1296,18 @@ index 5fd757161b..59e7082ac5 100644
      if (ret < 0)
          return ret;
  
+@@ -610,10 +628,12 @@ static int cudascale_filter_frame(AVFilterLink *link, AVFrame *in)
+         goto fail;
+ 
+     ret = cudascale_scale(ctx, out, in);
++    if (ret < 0) {
++        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
++        goto fail;
++    }
+ 
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+-    if (ret < 0)
+-        goto fail;
+ 
+     if (s->reset_sar) {
+         out->sample_aspect_ratio = (AVRational){1, 1};

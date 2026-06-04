@@ -1,5 +1,241 @@
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 1fba70ac3e..7e35550eef 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -565,6 +565,21 @@ typedef struct InputFile {
+      * by demuxer events that make the EMA unreliable: large vid_error in
+      * DISCONT-BUF, INPUT-GAP close, and at process startup. */
+     atomic_int_least64_t pll_disturbance_until_us;
++
++    /* Cached pointers to libswresample SwrContext instances belonging to
++     * any aresample filter in this input file's filter graphs. Populated
++     * once at filter-graph finalisation by fg_register_aresample_swr() in
++     * ffmpeg_filter.c. The muxer thread polls
++     * input_file_jump_comp_total() (also in ffmpeg_filter.c) to detect
++     * libswresample silence-injection events so it can arm the PLL
++     * disturbance window. NULL when no aresample is present (e.g.
++     * audio copy-only configurations).
++     *
++     * NOTE: void* because <swresample.h> is not included by ffmpeg.h —
++     * keeping ffmpeg.h independent of libswresample types. The
++     * stored values are SwrContext*; cast at the use site. */
++    void           **swr_jump_comp_ctxs;
++    int              nb_swr_jump_comp_ctxs;
+ } InputFile;
+ 
+ enum forced_keyframes_const {
+@@ -839,6 +854,25 @@ int fg_create_simple(FilterGraph **pfg,
+                      const OutputFilterOptions *opts);
+ int fg_finalise_bindings(void);
+ 
++/**
++ * Sum the libswresample jump_comp event counts across all aresample
++ * filters cached on this input file. The muxer thread polls this once
++ * per audio packet — when the cumulative total advances since the
++ * previous poll, libswresample has just hard-corrected an audio
++ * timestamp delta (silence injection or sample drop). The muxer arms
++ * the PLL disturbance window in response.
++ *
++ * Returns 0 if @p f is NULL or has no aresample filters cached
++ * (e.g., audio copy-only configurations).
++ */
++uint64_t input_file_jump_comp_total(const InputFile *f);
++
++/**
++ * Free the cached aresample SwrContext pointer array on @p f. Called
++ * from ifile_close() during shutdown. Safe to call repeatedly.
++ */
++void input_file_clear_swr_cache(InputFile *f);
++
+ /**
+  * Get our axiliary frame data attached to the frame, allocating it
+  * if needed.
+diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
+index b2fb9ef5f4..966bb4303c 100644
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -2424,6 +2424,9 @@ void ifile_close(InputFile **pf)
+         istg_free(&f->stream_groups[i]);
+     av_freep(&f->stream_groups);
+ 
++    /* free cached aresample SwrContext pointer array (jump_comp polling). */
++    input_file_clear_swr_cache(f);
++
+     avformat_close_input(&f->ctx);
+ 
+     av_packet_free(&d->pkt_heartbeat);
+diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
+index 2a71f9717d..bb61f11085 100644
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -42,6 +42,12 @@
+ #include "libavutil/time.h"
+ #include "libavutil/timestamp.h"
+ 
++#include "libswresample/swresample.h"
++
++/* Forward declarations for jump_comp event detection helpers; the
++ * definitions live at the bottom of this file. */
++static void fg_register_aresample_swr(FilterGraph *fg, AVFilterGraph *graph);
++
+ typedef struct FilterGraphPriv {
+     FilterGraph      fg;
+ 
+@@ -2322,6 +2328,14 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
+ 
+     fgp->is_meta = graph_is_meta(fgt->graph);
+ 
++    /* Cache aresample filters' SwrContext pointers on the parent
++     * InputFile. The muxer thread polls these to detect libswresample
++     * jump_comp silence-injection events and arm the PLL disturbance
++     * window. Safe across reconfig: the helper drops stale entries
++     * for this graph before registering fresh ones. Helper defined
++     * at the bottom of this file. */
++    fg_register_aresample_swr(fg, fgt->graph);
++
+     /* limit the lists of allowed formats to the ones selected, to
+      * make sure they stay the same if the filtergraph is reconfigured later */
+     for (int i = 0; i < fg->nb_outputs; i++) {
+@@ -3785,3 +3799,137 @@ void fg_send_command(FilterGraph *fg, double time, const char *target,
+ 
+     sch_filter_command(fgp->sch, fgp->sch_idx, fgp->frame);
+ }
++
++/* =====================================================================
++ *  libswresample jump_comp event detection
++ * =====================================================================
++ *
++ * After a filter graph is configured, walk it for aresample filters and
++ * cache pointers to their underlying SwrContext on the parent InputFile.
++ * The muxer thread polls input_file_jump_comp_total() once per audio
++ * packet — when the cumulative event count advances, libswresample has
++ * just hard-corrected an audio timestamp delta (silence injection or
++ * sample drop), and the muxer arms the PLL disturbance window.
++ *
++ * Detection is structurally false-positive-free: it only fires when
++ * libswresample actually injected silence. The muxer-side cadence-noise
++ * problem that broke Fix F (Session 99) does not apply here. */
++
++/* Find the InputFile that owns a given InputFilter by walking input
++ * streams' filter lists. Returns NULL if not found (e.g., InputFilter
++ * bound to a complex filtergraph output). */
++static InputFile *fg_input_file_from_ifilter(const InputFilter *ifilter)
++{
++    for (int fi = 0; fi < nb_input_files; fi++) {
++        InputFile *f = input_files[fi];
++        for (int si = 0; si < f->nb_streams; si++) {
++            InputStream *ist = f->streams[si];
++            for (int fil = 0; fil < ist->nb_filters; fil++) {
++                if (ist->filters[fil] == ifilter)
++                    return f;
++            }
++        }
++    }
++    return NULL;
++}
++
++/* Append swr to f->swr_jump_comp_ctxs[] if not already present. */
++static int input_file_add_swr(InputFile *f, void *swr)
++{
++    if (!f || !swr)
++        return 0;
++    for (int i = 0; i < f->nb_swr_jump_comp_ctxs; i++)
++        if (f->swr_jump_comp_ctxs[i] == swr)
++            return 0;
++    return av_dynarray_add_nofree(&f->swr_jump_comp_ctxs,
++                                  &f->nb_swr_jump_comp_ctxs, swr);
++}
++
++/* Remove all SwrContext pointers from f->swr_jump_comp_ctxs[] that are
++ * present in the given AVFilterGraph (used before re-configuring a graph
++ * to drop now-stale pointers). */
++static void input_file_drop_swr_from_graph(InputFile *f, AVFilterGraph *graph)
++{
++    if (!f || !graph)
++        return;
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *fctx = graph->filters[i];
++        if (!fctx || !fctx->filter || !fctx->filter->name ||
++            strcmp(fctx->filter->name, "aresample") != 0)
++            continue;
++        void *swr = av_opt_child_next(fctx->priv, NULL);
++        if (!swr)
++            continue;
++        for (int k = 0; k < f->nb_swr_jump_comp_ctxs; k++) {
++            if (f->swr_jump_comp_ctxs[k] == swr) {
++                /* shift remaining entries down */
++                for (int j = k + 1; j < f->nb_swr_jump_comp_ctxs; j++)
++                    f->swr_jump_comp_ctxs[j - 1] = f->swr_jump_comp_ctxs[j];
++                f->nb_swr_jump_comp_ctxs--;
++                break;
++            }
++        }
++    }
++}
++
++/* Walk the configured AVFilterGraph for aresample filters; for each,
++ * obtain its SwrContext via the AResampleContext child_next mechanism
++ * (af_aresample.c registers swr_get_class() as a child class) and
++ * register the SwrContext on the parent InputFile's cache.
++ *
++ * Called once per successful configure_filtergraph() invocation. Safe
++ * across reconfigurations: stale pointers are dropped first. */
++static void fg_register_aresample_swr(FilterGraph *fg, AVFilterGraph *graph)
++{
++    InputFile *f = NULL;
++
++    /* Find the InputFile via the first audio input bound to this fg. */
++    for (int i = 0; i < fg->nb_inputs; i++) {
++        if (fg->inputs[i]->type == AVMEDIA_TYPE_AUDIO) {
++            f = fg_input_file_from_ifilter(fg->inputs[i]);
++            if (f)
++                break;
++        }
++    }
++    if (!f || !graph)
++        return;
++
++    /* Drop any now-stale entries this graph may have contributed in a
++     * previous configuration pass. */
++    input_file_drop_swr_from_graph(f, graph);
++
++    /* Register fresh pointers. */
++    for (unsigned i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *fctx = graph->filters[i];
++        if (!fctx || !fctx->filter || !fctx->filter->name ||
++            strcmp(fctx->filter->name, "aresample") != 0)
++            continue;
++        void *swr = av_opt_child_next(fctx->priv, NULL);
++        if (!swr)
++            continue;
++        if (input_file_add_swr(f, swr) < 0) {
++            av_log(NULL, AV_LOG_WARNING,
++                   "[AV-SYNC-PLL] failed to cache aresample SwrContext for "
++                   "input file #%d (jump_comp detection disabled for this "
++                   "filter)\n", f->index);
++        }
++    }
++}
++
++uint64_t input_file_jump_comp_total(const InputFile *f)
++{
++    uint64_t total = 0;
++    if (!f)
++        return 0;
++    for (int i = 0; i < f->nb_swr_jump_comp_ctxs; i++)
++        total += swr_get_jump_comp_event_count(f->swr_jump_comp_ctxs[i]);
++    return total;
++}
++
++void input_file_clear_swr_cache(InputFile *f)
++{
++    if (!f)
++        return;
++    av_freep(&f->swr_jump_comp_ctxs);
++    f->nb_swr_jump_comp_ctxs = 0;
++}
 diff --git a/libswresample/options.c b/libswresample/options.c
-index 11b2884e3c..88c315e5ee 100644
+index 11b2884e3c..310639ebb7 100644
 --- a/libswresample/options.c
 +++ b/libswresample/options.c
 @@ -107,6 +107,8 @@ static const AVOption options[]={
@@ -11,8 +247,16 @@ index 11b2884e3c..88c315e5ee 100644
  {"first_pts"            , "Assume the first pts should be this value (in samples)."
                                                          , OFFSET(firstpts_in_samples), AV_OPT_TYPE_INT64 ,{.i64=AV_NOPTS_VALUE    }, INT64_MIN,INT64_MAX, PARAM },
  
+@@ -151,6 +153,7 @@ av_cold struct SwrContext *swr_alloc(void){
+         s->av_class= &av_class;
+         av_opt_set_defaults(s);
+         s->firstpts = AV_NOPTS_VALUE;
++        atomic_init(&s->jump_comp_event_count, 0);
+     }
+     return s;
+ }
 diff --git a/libswresample/swresample.c b/libswresample/swresample.c
-index d777efd802..e1422ca801 100644
+index d777efd802..e39cefb56b 100644
 --- a/libswresample/swresample.c
 +++ b/libswresample/swresample.c
 @@ -275,6 +275,18 @@ av_cold int swr_init(struct SwrContext *s){
@@ -34,7 +278,22 @@ index d777efd802..e1422ca801 100644
      if (s->async) {
          if (s->min_compensation >= FLT_MAX/2)
              s->min_compensation = 0.001;
-@@ -930,11 +942,42 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
+@@ -884,6 +896,14 @@ int64_t swr_get_delay(struct SwrContext *s, int64_t base){
+     }
+ }
+ 
++uint64_t swr_get_jump_comp_event_count(struct SwrContext *s)
++{
++    if (!s)
++        return 0;
++    return atomic_load_explicit(&s->jump_comp_event_count,
++                                memory_order_relaxed);
++}
++
+ int swr_get_out_samples(struct SwrContext *s, int in_samples)
+ {
+     int64_t out_samples;
+@@ -930,11 +950,50 @@ int64_t swr_next_pts(struct SwrContext *s, int64_t pts){
      if(pts == INT64_MIN)
          return s->outpts;
  
@@ -71,6 +330,14 @@ index d777efd802..e1422ca801 100644
 +                                     - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
 +                double fpost = post_delta / (double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
 +                av_log(s, AV_LOG_INFO, "jump_comp: corrected %.3fs -> residual=%.6fs\n", fdelta, fpost);
++                /* Bump the externally-observable counter so the muxer-side PLL
++                 * can detect the silence-injection event and arm its
++                 * disturbance window. NOT incremented on the filter-rebuild
++                 * branch above (line ~948) — those events do not advance
++                 * audio_dts spuriously and are already covered by Fix B's
++                 * INPUT-GAP / DISCONT-BUF disturbance arming. */
++                atomic_fetch_add_explicit(&s->jump_comp_event_count, 1,
++                                          memory_order_relaxed);
 +            }
 +        }
 +
@@ -78,15 +345,56 @@ index d777efd802..e1422ca801 100644
      } else {
          int64_t delta = pts - swr_get_delay(s, s->in_sample_rate * (int64_t)s->out_sample_rate) - s->outpts + s->drop_output*(int64_t)s->in_sample_rate;
          double fdelta = delta /(double)(s->in_sample_rate * (int64_t)s->out_sample_rate);
+diff --git a/libswresample/swresample.h b/libswresample/swresample.h
+index 052089acca..1922ccf4e3 100644
+--- a/libswresample/swresample.h
++++ b/libswresample/swresample.h
+@@ -488,6 +488,26 @@ int64_t swr_get_delay(struct SwrContext *s, int64_t base);
+  */
+ int swr_get_out_samples(struct SwrContext *s, int in_samples);
+ 
++/**
++ * Get the cumulative count of jump_comp silence-injection / sample-drop events.
++ *
++ * This counter increments once per successful hard correction performed by
++ * the jump_comp safety net inside swr_next_pts(), i.e. each time the absolute
++ * delta between expected and actual outpts exceeds min_hard_compensation and
++ * the resulting silence injection / output drop completes successfully.
++ *
++ * Filter-rebuild "outpts reset" events do NOT increment this counter — they
++ * are benign re-anchorings, not stream-clock shifts.
++ *
++ * The counter is updated with relaxed atomic semantics, so it is safe to read
++ * from any thread without additional synchronisation. Reading is sufficient
++ * for "did the count advance since I last looked?" detection.
++ *
++ * @param s   Swr context (may be NULL — returns 0)
++ * @return    cumulative event count, or 0 if @p s is NULL
++ */
++uint64_t swr_get_jump_comp_event_count(struct SwrContext *s);
++
+ /**
+  * @}
+  *
 diff --git a/libswresample/swresample_internal.h b/libswresample/swresample_internal.h
-index ca2e0d7534..ac6858867b 100644
+index ca2e0d7534..af08f7bb50 100644
 --- a/libswresample/swresample_internal.h
 +++ b/libswresample/swresample_internal.h
-@@ -137,6 +137,7 @@ struct SwrContext {
+@@ -21,6 +21,8 @@
+ #ifndef SWRESAMPLE_SWRESAMPLE_INTERNAL_H
+ #define SWRESAMPLE_SWRESAMPLE_INTERNAL_H
+ 
++#include <stdatomic.h>
++
+ #include "swresample.h"
+ #include "libavutil/channel_layout.h"
+ #include "config.h"
+@@ -137,6 +139,8 @@ struct SwrContext {
      float soft_compensation_duration;               ///< swr duration over which soft compensation is applied
      float max_soft_compensation;                    ///< swr maximum soft compensation in seconds over soft_compensation_duration
      float async;                                    ///< swr simple 1 parameter async, similar to ffmpegs -async
 +    float jump_comp;                                ///< jump compensation: enables safety-net hard correction (0=disabled)
++    atomic_uint_least64_t jump_comp_event_count;    ///< cumulative count of successful jump_comp hard corrections (silence-injected/sample-dropped). Atomic so the muxer thread can poll from any context.
      int64_t firstpts_in_samples;                    ///< swr first pts in samples
  
      int resample_first;                             ///< 1 if resampling must come first, 0 if rematrixing

@@ -1,5 +1,29 @@
+diff --git a/fftools/ffmpeg_mux.c b/fftools/ffmpeg_mux.c
+index 25f66dd185..46e60f3462 100644
+--- a/fftools/ffmpeg_mux.c
++++ b/fftools/ffmpeg_mux.c
+@@ -174,7 +174,18 @@ static int mux_fixup_ts(Muxer *mux, MuxStream *ms, AVPacket *pkt)
+                      - FFMIN3(pkt->pts, pkt->dts, ms->last_mux_dts + 1)
+                      - FFMAX3(pkt->pts, pkt->dts, ms->last_mux_dts + 1);
+         }
+-        if ((ost->type == AVMEDIA_TYPE_AUDIO || ost->type == AVMEDIA_TYPE_VIDEO || ost->type == AVMEDIA_TYPE_SUBTITLE) &&
++        /* MPEG-TS DATA and SUBTITLE streams live in 33-bit modular space —
++         * source PCR wraps every ~26.5h are routine, not bugs. Skip the
++         * monotonic-DTS check for these on mpegts output; the demuxer-side
++         * modular comparison in fftools/ffmpeg_demux.c is responsible. Other
++         * containers (MOV, Matroska, etc.) keep their strict check. */
++        int is_mpegts_modular_stream =
++            (mux->fc->oformat && !strcmp(mux->fc->oformat->name, "mpegts") &&
++             (ost->type == AVMEDIA_TYPE_DATA ||
++              ost->type == AVMEDIA_TYPE_SUBTITLE));
++
++        if (!is_mpegts_modular_stream &&
++            (ost->type == AVMEDIA_TYPE_AUDIO || ost->type == AVMEDIA_TYPE_VIDEO || ost->type == AVMEDIA_TYPE_SUBTITLE) &&
+             pkt->dts != AV_NOPTS_VALUE &&
+             ms->last_mux_dts != AV_NOPTS_VALUE) {
+             int64_t max = ms->last_mux_dts + !(mux->fc->oformat->flags & AVFMT_TS_NONSTRICT);
 diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
-index e0eecf78f2..e1ed8b4c04 100644
+index ef71a7bb54..56b0901004 100644
 --- a/fftools/ffmpeg_mux_init.c
 +++ b/fftools/ffmpeg_mux_init.c
 @@ -1229,6 +1229,11 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
@@ -14,11 +38,56 @@ index e0eecf78f2..e1ed8b4c04 100644
      }
  
      ost = &ms->ost;
+@@ -3340,6 +3345,33 @@ static Muxer *mux_alloc(void)
+     return mux;
+ }
+ 
++/* Bounded sparse-interleave window (microseconds) for live (non-seekable)
++ * outputs. Subtitle PIDs are sparse (multi-second gaps); since patch 0001
++ * counts them in the interleaver for correct DVB-sub ordering, cap how long a
++ * missing subtitle may hold back audio/video on a live wire. File outputs keep
++ * 0 (fall back to max_interleave_delta -> exact ordering, identical to
++ * upstream). 150 ms is negligible vs the multi-second SRT/UDP path latency;
++ * tune at runtime via -max_sparse_interleave_delta. */
++#define LIVE_SPARSE_INTERLEAVE_DELTA_US 150000
++
++static void mux_set_sparse_interleave_delta(Muxer *mux, AVFormatContext *oc)
++{
++    int is_live;
++
++    /* An explicit user -max_sparse_interleave_delta wins (it is still in
++     * mux->opts here and gets applied later by avformat_write_header());
++     * only auto-tune when the user did not set it. */
++    if (av_dict_get(mux->opts, "max_sparse_interleave_delta", NULL, 0))
++        return;
++
++    is_live = !oc->pb || !(oc->pb->seekable & AVIO_SEEKABLE_NORMAL);
++    if (is_live)
++        oc->max_sparse_interleave_delta = LIVE_SPARSE_INTERLEAVE_DELTA_US;
++
++    av_log(mux, AV_LOG_VERBOSE, "sparse-interleave delay: %s output -> %"PRId64" us\n",
++           is_live ? "live" : "file", oc->max_sparse_interleave_delta);
++}
++
+ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
+ {
+     Muxer *mux;
+@@ -3457,6 +3489,10 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
+     }
+     oc->max_delay = (int)(o->mux_max_delay * AV_TIME_BASE);
+ 
++    /* Auto-tune the sparse-stream (subtitle) interleave window by output type
++     * now that oc->pb is open; respects an explicit user override. */
++    mux_set_sparse_interleave_delta(mux, oc);
++
+     /* copy metadata and chapters from input files */
+     err = copy_meta(mux, o);
+     if (err < 0)
 diff --git a/fftools/ffmpeg_sched.c b/fftools/ffmpeg_sched.c
-index dc5800d094..2651f1f48e 100644
+index 8ec3bdaf80..ffd367bff6 100644
 --- a/fftools/ffmpeg_sched.c
 +++ b/fftools/ffmpeg_sched.c
-@@ -198,6 +198,10 @@ typedef struct SchMuxStream {
+@@ -203,6 +203,10 @@ typedef struct SchMuxStream {
      // an EOF was generated while flushing the pre-mux queue
      int                 init_eof;
  
@@ -29,7 +98,7 @@ index dc5800d094..2651f1f48e 100644
      ////////////////////////////////////////////////////////////
      // The following are protected by Scheduler.schedule_lock //
  
-@@ -438,6 +442,7 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
+@@ -443,6 +447,7 @@ static void task_init(Scheduler *sch, SchTask *task, enum SchedulerNodeType type
  static int64_t trailing_dts(const Scheduler *sch)
  {
      int64_t min_dts = INT64_MAX;
@@ -37,7 +106,7 @@ index dc5800d094..2651f1f48e 100644
  
      for (unsigned i = 0; i < sch->nb_mux; i++) {
          const SchMux *mux = &sch->mux[i];
-@@ -447,6 +452,12 @@ static int64_t trailing_dts(const Scheduler *sch)
+@@ -452,6 +457,12 @@ static int64_t trailing_dts(const Scheduler *sch)
  
              if (ms->source_finished)
                  continue;
@@ -50,7 +119,7 @@ index dc5800d094..2651f1f48e 100644
              if (ms->last_dts == AV_NOPTS_VALUE)
                  return AV_NOPTS_VALUE;
  
-@@ -454,6 +465,26 @@ static int64_t trailing_dts(const Scheduler *sch)
+@@ -459,6 +470,26 @@ static int64_t trailing_dts(const Scheduler *sch)
          }
      }
  
@@ -77,7 +146,7 @@ index dc5800d094..2651f1f48e 100644
      return min_dts == INT64_MAX ? AV_NOPTS_VALUE : min_dts;
  }
  
-@@ -709,6 +740,21 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
+@@ -717,6 +748,21 @@ int sch_add_mux_stream(Scheduler *sch, unsigned mux_idx)
      return stream_idx;
  }
  
@@ -124,11 +193,43 @@ index 2cf3034437..af3a014547 100644
  /**
   * Set the file path for the SDP.
   *
+diff --git a/libavformat/avformat.h b/libavformat/avformat.h
+index 1efe383b25..645e6da8f3 100644
+--- a/libavformat/avformat.h
++++ b/libavformat/avformat.h
+@@ -1639,6 +1639,18 @@ typedef struct AVFormatContext {
+      */
+     int64_t max_interleave_delta;
+ 
++    /**
++     * Maximum buffering duration (in microseconds) for interleaving of sparse
++     * streams (e.g. subtitles), applied only when no audio/video stream is the
++     * one missing from the muxing queue. This bounds how long a sparse stream
++     * with large inter-packet gaps may hold back audio/video without forcing
++     * the full max_interleave_delta. A value of 0 means "use
++     * max_interleave_delta" (i.e. no separate sparse window).
++     *
++     * Muxing only, set by the caller before avformat_write_header().
++     */
++    int64_t max_sparse_interleave_delta;
++
+     /**
+      * Maximum number of packets to read while waiting for the first timestamp.
+      * Decoding only.
 diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
-index 6f58e52e70..29899994da 100644
+index 486b4a2176..8187d96fe8 100644
 --- a/libavformat/mpegts.c
 +++ b/libavformat/mpegts.c
-@@ -2697,10 +2697,16 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
+@@ -1856,7 +1856,7 @@ static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
+     if (prg && prg->pcr_pid != -1 && prg->discard != AVDISCARD_ALL) {
+         MpegTSFilter *f = ts->pids[prg->pcr_pid];
+         if (f && f->last_pcr != -1)
+-            ts->pkt->pts = ts->pkt->dts = f->last_pcr/SYSTEM_CLOCK_FREQUENCY_DIVISOR;
++            ts->pkt->pts = ts->pkt->dts = f->last_pcr / SYSTEM_CLOCK_FREQUENCY_DIVISOR;
+     }
+     ts->stop_parse = 1;
+ 
+@@ -2886,10 +2886,16 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                      goto out;
                  st->id = pid;
                  st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
@@ -149,230 +250,28 @@ index 6f58e52e70..29899994da 100644
          }
  
 diff --git a/libavformat/mpegtsenc.c b/libavformat/mpegtsenc.c
-index 3578c3fd46..20958ff49f 100644
+index 7f76883531..3826764cfd 100644
 --- a/libavformat/mpegtsenc.c
 +++ b/libavformat/mpegtsenc.c
-@@ -269,6 +269,255 @@ typedef struct MpegTSWriteStream {
+@@ -269,6 +269,53 @@ typedef struct MpegTSWriteStream {
      DVBAC3Descriptor *dvb_ac3_desc;
  } MpegTSWriteStream;
  
-+/* Parse SCTE-35 splice_info_section to find splice_time location and value.
-+ * Returns the splice_time in 90kHz ticks, or AV_NOPTS_VALUE if not found.
-+ * If splice_time_offset is not NULL, stores the byte offset of splice_time. */
-+static int64_t scte35_get_splice_time(const uint8_t *buf, int len, int *splice_time_offset)
-+{
-+    int section_length, splice_command_type;
-+    int offset;
-+
-+    if (splice_time_offset)
-+        *splice_time_offset = -1;
-+
-+    if (len < 15 || buf[0] != 0xFC) /* table_id must be 0xFC */
-+        return AV_NOPTS_VALUE;
-+
-+    /* encrypted_packet flag — encrypted sections can't be parsed */
-+    if (buf[4] & 0x80)
-+        return AV_NOPTS_VALUE;
-+
-+    section_length = ((buf[1] & 0x0F) << 8) | buf[2];
-+    if (section_length + 3 > len)
-+        return AV_NOPTS_VALUE;
-+
-+    /* Skip to splice_command_type (offset 13) */
-+    splice_command_type = buf[13];
-+
-+    /* time_signal (0x06): splice_time() starts directly at offset 14 */
-+    if (splice_command_type == 0x06) {
-+        offset = 14;
-+        if (offset >= len)
-+            return AV_NOPTS_VALUE;
-+
-+        /* splice_time() - check time_specified_flag */
-+        if (!(buf[offset] & 0x80))
-+            return AV_NOPTS_VALUE;
-+
-+        if (offset + 5 > len)
-+            return AV_NOPTS_VALUE;
-+
-+        if (splice_time_offset)
-+            *splice_time_offset = offset;
-+
-+        int64_t pts_time = ((int64_t)(buf[offset] & 0x01) << 32) |
-+                           ((int64_t)buf[offset + 1] << 24) |
-+                           ((int64_t)buf[offset + 2] << 16) |
-+                           ((int64_t)buf[offset + 3] << 8) |
-+                           buf[offset + 4];
-+        return pts_time;
-+    }
-+
-+    if (splice_command_type != 0x05) /* Only handle splice_insert and time_signal */
-+        return AV_NOPTS_VALUE;
-+
-+    /* Parse splice_insert - starts at offset 14 */
-+    offset = 14;
-+    if (offset + 5 > len)
-+        return AV_NOPTS_VALUE;
-+
-+    /* Skip splice_event_id (4 bytes) */
-+    offset += 4;
-+
-+    /* splice_event_cancel_indicator */
-+    if (buf[offset] & 0x80)
-+        return AV_NOPTS_VALUE; /* Cancelled, no splice_time */
-+
-+    offset++;
-+    if (offset >= len)
-+        return AV_NOPTS_VALUE;
-+
-+    /* Check flags: out_of_network(1), program_splice_flag(1), duration_flag(1), splice_immediate_flag(1) */
-+    int program_splice_flag = (buf[offset] >> 6) & 1;
-+    int splice_immediate_flag = (buf[offset] >> 4) & 1;
-+
-+    if (!program_splice_flag || splice_immediate_flag)
-+        return AV_NOPTS_VALUE; /* No splice_time in these cases */
-+
-+    offset++;
-+    if (offset >= len)
-+        return AV_NOPTS_VALUE;
-+
-+    /* splice_time() - check time_specified_flag */
-+    if (!(buf[offset] & 0x80))
-+        return AV_NOPTS_VALUE; /* time_specified_flag = 0 */
-+
-+    /* Extract 33-bit pts_time */
-+    if (offset + 5 > len)
-+        return AV_NOPTS_VALUE;
-+
-+    if (splice_time_offset)
-+        *splice_time_offset = offset;
-+
-+    int64_t pts_time = ((int64_t)(buf[offset] & 0x01) << 32) |
-+                       ((int64_t)buf[offset + 1] << 24) |
-+                       ((int64_t)buf[offset + 2] << 16) |
-+                       ((int64_t)buf[offset + 3] << 8) |
-+                       buf[offset + 4];
-+
-+    return pts_time;
-+}
-+
-+/* Safety-net adjustment for SCTE-35 splice_time timeline mismatches.
-+ *
-+ * Normally the demuxer rebases splice_time when it applies ts_offset or
-+ * discontinuity offsets to packet DTS/PTS. This function catches any
-+ * residual mismatch (preroll outside ±60s) and replaces splice_time
-+ * with pkt_pts + 8s as a last resort.
-+ *
-+ * Returns 0 on success, negative on error.
-+ */
-+static int scte35_adjust_pts(AVFormatContext *s, uint8_t *buf, int len,
-+                             int64_t pkt_pts)
-+{
-+    int64_t splice_time, new_splice_time, preroll;
-+    int splice_time_offset;
-+    uint32_t crc;
-+
-+    /* Maximum reasonable preroll is 60 seconds (typical is 5-30 seconds) */
-+    const int64_t MAX_PREROLL = 60 * 90000;
-+    /* Default preroll when we can't determine the original (8 seconds is common) */
-+    const int64_t DEFAULT_PREROLL = 8 * 90000;
-+    /* 33-bit PTS max value */
-+    const int64_t PTS_33BIT_MAX = 0x1FFFFFFFFLL;
-+
-+    if (len < 17) /* Minimum section with splice_time and CRC */
-+        return 0;
-+
-+    if (pkt_pts == AV_NOPTS_VALUE)
-+        return 0; /* Need packet PTS to calculate correct timing */
-+
-+    /* Get splice_time and its offset in the section */
-+    splice_time = scte35_get_splice_time(buf, len, &splice_time_offset);
-+    if (splice_time == AV_NOPTS_VALUE || splice_time_offset < 0)
-+        return 0; /* No splice_time to adjust */
-+
-+    /* Verify we can safely write back to the buffer */
-+    if (splice_time_offset + 5 > len)
-+        return -1;
-+
-+    /* Calculate observed preroll (may be huge if timelines don't match) */
-+    preroll = splice_time - pkt_pts;
-+
-+    /* Handle 33-bit PTS wraparound and negative preroll:
-+     * - Small negative preroll (-60s to 0): valid "return from ad" scenario
-+     * - Large negative preroll (< -60s): likely 33-bit wraparound, add 2^33
-+     * - Positive preroll (0 to 60s): normal case
-+     * - Large positive preroll (> 60s): timeline mismatch */
-+    if (preroll < -MAX_PREROLL) {
-+        /* Large negative value - likely 33-bit wraparound */
-+        preroll += PTS_33BIT_MAX + 1;
-+    }
-+
-+    /* Check if preroll is reasonable (-60 to +60 seconds) */
-+    if (preroll >= -MAX_PREROLL && preroll <= MAX_PREROLL) {
-+        /* Timeline matches, no adjustment needed */
-+        return 0;
-+    }
-+
-+    /* Timeline mismatch: splice_time not rebased by demuxer.
-+     * Fall back to default preroll (8s). This should rarely trigger
-+     * since the demuxer now rebases splice_time alongside DTS/PTS. */
-+    new_splice_time = pkt_pts + DEFAULT_PREROLL;
-+    new_splice_time &= 0x1FFFFFFFFULL;
-+
-+    av_log(s, AV_LOG_WARNING, "SCTE-35: Timeline mismatch (preroll %.3fs). "
-+           "Falling back to %.1fs preroll: splice_time %"PRId64" (%.3fs) -> "
-+           "%"PRId64" (%.3fs)\n",
-+           preroll / 90000.0, DEFAULT_PREROLL / 90000.0,
-+           splice_time, splice_time / 90000.0,
-+           new_splice_time, new_splice_time / 90000.0);
-+
-+    /* Write new splice_time back (33 bits at splice_time_offset) */
-+    buf[splice_time_offset] = (buf[splice_time_offset] & 0xFE) | ((new_splice_time >> 32) & 0x01);
-+    buf[splice_time_offset + 1] = (new_splice_time >> 24) & 0xFF;
-+    buf[splice_time_offset + 2] = (new_splice_time >> 16) & 0xFF;
-+    buf[splice_time_offset + 3] = (new_splice_time >> 8) & 0xFF;
-+    buf[splice_time_offset + 4] = new_splice_time & 0xFF;
-+
-+    /* Zero pts_adjustment (bytes 4-8) so downstream consumers compute
-+     * splice_time + 0 = correct splice time.  Preserve encrypted_packet
-+     * and encryption_algorithm bits in byte 4 (top 7 bits). */
-+    buf[4] &= 0xFE;           /* clear bit 0 of pts_adjustment (33-bit field) */
-+    buf[5] = buf[6] = buf[7] = buf[8] = 0;  /* clear remaining 32 bits */
-+
-+    /* Recalculate CRC32 (last 4 bytes of section)
-+     * Use the same CRC calculation as mpegts_write_section1() */
-+    crc = av_bswap32(av_crc(av_crc_get_table(AV_CRC_32_IEEE), -1, buf, len - 4));
-+    buf[len - 4] = (crc >> 24) & 0xff;
-+    buf[len - 3] = (crc >> 16) & 0xff;
-+    buf[len - 2] = (crc >>  8) & 0xff;
-+    buf[len - 1] = (crc      ) & 0xff;
-+
-+    return 0;
-+}
-+
-+/* Write SCTE-35 section data as TS packets.
-+ * If pkt_pts is provided and timestamp rebasing is detected, the pts_adjustment
-+ * field is updated to maintain correct splice timing relative to video. */
++/* Write SCTE-35 section data as TS packets. The section passes through
++ * unchanged: the demuxer-side rebase (scte35_rebase_pts_adjustment in
++ * patch 0004) shifts pts_adjustment by f->ts_offset and the discontinuity
++ * buffer's applied_offset, so the wire effective_splice_time =
++ * (splice_time + pts_adjustment) mod 2^33 already lands on the muxer's
++ * output timeline. */
 +static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
-+                                        const uint8_t *buf, int len, int64_t pkt_pts)
++                                        const uint8_t *buf, int len)
 +{
 +    MpegTSWriteStream *ts_st = st->priv_data;
 +    MpegTSWrite *ts = s->priv_data;
 +    uint8_t packet[TS_PACKET_SIZE];
-+    uint8_t section_buf[SECTION_LENGTH + 3]; /* Max section size */
-+    const uint8_t *write_buf;
 +    uint8_t *q;
 +    int first = 1;
 +    int len1, left;
-+
-+    /* Make a copy of the section data so we can modify splice_time if needed */
-+    if (len <= (int)sizeof(section_buf)) {
-+        memcpy(section_buf, buf, len);
-+        scte35_adjust_pts(s, section_buf, len, pkt_pts);
-+        write_buf = section_buf;
-+    } else {
-+        av_log(s, AV_LOG_WARNING, "SCTE-35: Section too large (%d bytes) for timing adjustment\n", len);
-+        write_buf = buf;
-+    }
 +
 +    while (len > 0) {
 +        q = packet;
@@ -388,7 +287,7 @@ index 3578c3fd46..20958ff49f 100644
 +        len1 = TS_PACKET_SIZE - (q - packet);
 +        if (len1 > len)
 +            len1 = len;
-+        memcpy(q, write_buf, len1);
++        memcpy(q, buf, len1);
 +        q += len1;
 +
 +        /* Pad with stuffing bytes */
@@ -399,7 +298,7 @@ index 3578c3fd46..20958ff49f 100644
 +        avio_write(s->pb, packet, TS_PACKET_SIZE);
 +        ts->total_size += TS_PACKET_SIZE;
 +
-+        write_buf += len1;
++        buf += len1;
 +        len -= len1;
 +        first = 0;
 +    }
@@ -408,7 +307,7 @@ index 3578c3fd46..20958ff49f 100644
  static void mpegts_write_pat(AVFormatContext *s)
  {
      MpegTSWrite *ts = s->priv_data;
-@@ -444,6 +693,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
+@@ -444,6 +491,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
              stream_type = STREAM_TYPE_PRIVATE_DATA;
          }
          break;
@@ -418,7 +317,7 @@ index 3578c3fd46..20958ff49f 100644
      default:
          av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
                      "Stream %d, codec %s, is muxed as a private data stream "
-@@ -531,6 +783,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+@@ -531,6 +581,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
          *q++ = 0xfc;        // private_data_byte
      }
  
@@ -434,32 +333,37 @@ index 3578c3fd46..20958ff49f 100644
      val = 0xf000 | (q - program_info_length_ptr - 2);
      program_info_length_ptr[0] = val >> 8;
      program_info_length_ptr[1] = val;
-@@ -828,6 +1089,8 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+@@ -828,6 +887,13 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
                  putbuf(&q, tag, strlen(tag));
                  *q++ = 0;            /* metadata service ID */
                  *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
 +            } else if (codec_id == AV_CODEC_ID_SCTE_35) {
 +                put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
++                /* Cue Identifier Descriptor (SCTE 35 §8.2) lets receivers
++                 * discover the SCTE-35 PID without scanning all PIDs. */
++                *q++ = 0x8a; /* descriptor_tag */
++                *q++ = 0x01; /* descriptor_length */
++                *q++ = 0x01; /* cue_stream_type: splice_insert / time_signal */
              }
              break;
          }
-@@ -1886,6 +2149,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+@@ -1886,6 +1952,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
      if (stream_id_p)
          stream_id = stream_id_p[0];
  
 +    /* SCTE-35 must be written as section data, not PES.
-+     * The splice_info_section data from the demuxer already has valid CRC.
-+     * Pass packet PTS to allow adjusting pts_adjustment when timestamps are rebased. */
++     * The splice_info_section data from the demuxer already has valid CRC
++     * and pts_adjustment rebased to our output timeline. */
 +    if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
 +        if (size > 0)
-+            mpegts_write_scte35_section(s, st, buf, size, pts);
++            mpegts_write_scte35_section(s, st, buf, size);
 +        return 0;
 +    }
 +
      if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
          ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
          ts->first_dts_checked = 1;
-@@ -2202,6 +2474,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+@@ -2202,6 +2277,31 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
          return 0;
      }
  
@@ -492,24 +396,142 @@ index 3578c3fd46..20958ff49f 100644
          (dts != AV_NOPTS_VALUE && ts_st->payload_dts != AV_NOPTS_VALUE &&
           dts - ts_st->payload_dts >= max_audio_delay) ||
 diff --git a/libavformat/mux.c b/libavformat/mux.c
-index db3b6c2bfe..f6241660ad 100644
+index 363e5e1a57..1f5f01cbe5 100644
 --- a/libavformat/mux.c
 +++ b/libavformat/mux.c
-@@ -325,6 +325,8 @@ static int init_muxer(AVFormatContext *s, AVDictionary **options)
+@@ -324,7 +324,16 @@ static int init_muxer(AVFormatContext *s, AVDictionary **options)
+                 par->codec_tag = av_codec_get_tag(of->p.codec_tag, par->codec_id);
          }
  
++        /* Count subtitles as interleaved so their packets stay DTS-ordered
++         * with audio/video (patch 0001 fix for displaced/out-of-order DVB
++         * subs). 0001->0004 COUPLING: this is wrap-safe only because patch
++         * 0004 keeps SUBTITLE timestamps in extended-time (commit 01de453bcc,
++         * coherent with A/V); if subtitle DTS ever reverts to modular 33-bit,
++         * subtitles would be misordered across PTS wraps here. DATA and
++         * SMPTE-2038 stay excluded: they are modular-DTS sparse metadata
++         * (e.g. SCTE-35) that must never gate A/V interleaving. */
          if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
 +            par->codec_type != AVMEDIA_TYPE_DATA &&
-+            par->codec_type != AVMEDIA_TYPE_SUBTITLE &&
              par->codec_id != AV_CODEC_ID_SMPTE_2038)
              fci->nb_interleaved_streams++;
      }
-@@ -957,6 +959,8 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+@@ -554,7 +563,21 @@ static int compute_muxer_pkt_fields(AVFormatContext *s, AVStream *st, AVPacket *
+         pkt->dts = sti->pts_buffer[0];
+     }
+ 
++    /* MPEG-TS DATA/SUBTITLE streams use 33-bit modular timestamps that
++     * wrap every 26.5h. The internal extended-time pkt->dts can briefly
++     * regress at re-sync boundaries (e.g. SCTE-35 sections rebased
++     * through ts_offset and applied_offset). For these streams in mpegts
++     * output, accept non-monotonic DTS — the muxer masks to 33-bit at
++     * wire emission, so receivers see correct modular wraps. Strict
++     * monotonic checks remain in force for video/audio and for other
++     * containers (MOV, Matroska) that genuinely require it. */
++    int is_mpegts_modular_stream =
++        s->oformat && s->oformat->name && !strcmp(s->oformat->name, "mpegts") &&
++        (st->codecpar->codec_type == AVMEDIA_TYPE_DATA ||
++         st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE);
++
+     if (sti->cur_dts && sti->cur_dts != AV_NOPTS_VALUE &&
++        !is_mpegts_modular_stream &&
+         ((!(s->oformat->flags & AVFMT_TS_NONSTRICT) &&
+           st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE &&
+           st->codecpar->codec_type != AVMEDIA_TYPE_DATA &&
+@@ -942,7 +965,9 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+     FormatContextInternal *const fci = ff_fc_internal(s);
+     FFFormatContext *const si = &fci->fc;
+     int stream_count = 0;
+-    int noninterleaved_count = 0;
++    int missing_sparse = 0;
++    int missing_nonsparse = 0;
++    int64_t limit;
+     int ret;
+ 
+     if (has_packet) {
+@@ -957,21 +982,38 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
          if (sti->last_in_packet_buffer) {
              ++stream_count;
          } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
+-                   par->codec_id != AV_CODEC_ID_VP8 &&
+-                   par->codec_id != AV_CODEC_ID_VP9 &&
 +                   par->codec_type != AVMEDIA_TYPE_DATA &&
-+                   par->codec_type != AVMEDIA_TYPE_SUBTITLE &&
-                    par->codec_id != AV_CODEC_ID_VP8 &&
-                    par->codec_id != AV_CODEC_ID_VP9 &&
                     par->codec_id != AV_CODEC_ID_SMPTE_2038) {
+-            ++noninterleaved_count;
++            /* Split missing interleaved streams: a missing subtitle (sparse)
++             * holds the head only for the short max_sparse_interleave_delta,
++             * a missing audio/video stream for the full max_interleave_delta. */
++            if (par->codec_type == AVMEDIA_TYPE_SUBTITLE)
++                ++missing_sparse;
++            else if (par->codec_id != AV_CODEC_ID_VP8 &&
++                     par->codec_id != AV_CODEC_ID_VP9)
++                ++missing_nonsparse;
+         }
+     }
+ 
+     if (fci->nb_interleaved_streams == stream_count)
+         flush = 1;
+ 
+-    if (s->max_interleave_delta > 0 &&
++    /* Dual-timeout valve. If a non-sparse (audio/video) stream is the one
++     * missing, wait the full max_interleave_delta. If ONLY sparse (subtitle)
++     * streams are missing, wait the shorter max_sparse_interleave_delta so a
++     * subtitle PID with multi-second gaps cannot stall A/V on live output
++     * (rcombs, ffmpeg-devel #512). A max_sparse_interleave_delta of 0 falls
++     * back to max_interleave_delta; with both 0 the valve is disabled and
++     * interleaving is pure-DTS. */
++    limit = missing_nonsparse ? s->max_interleave_delta
++          : s->max_sparse_interleave_delta ? s->max_sparse_interleave_delta
++                                           : s->max_interleave_delta;
++
++    if (limit > 0 &&
+         si->packet_buffer.head &&
+         si->packet_buffer.head->pkt.dts != AV_NOPTS_VALUE &&
+         !flush &&
+-        fci->nb_interleaved_streams == stream_count+noninterleaved_count
++        fci->nb_interleaved_streams == stream_count + missing_sparse + missing_nonsparse
+     ) {
+         AVPacket *const top_pkt = &si->packet_buffer.head->pkt;
+         int64_t delta_dts = INT64_MIN;
+@@ -985,7 +1027,14 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+             const PacketListEntry *const last = sti->last_in_packet_buffer;
+             int64_t last_dts;
+ 
+-            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
++            /* Exclude sparse/modular-DTS streams from the delay metric:
++             * subtitles (upstream) plus DATA and SMPTE-2038, whose modular
++             * 33-bit DTS must not perturb the extended-time delta (this
++             * protects SCTE-35 splice timing). */
++            if (!last ||
++                st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
++                st->codecpar->codec_type == AVMEDIA_TYPE_DATA ||
++                st->codecpar->codec_id   == AV_CODEC_ID_SMPTE_2038)
+                 continue;
+ 
+             last_dts = av_rescale_q(last->pkt.dts,
+@@ -994,11 +1043,11 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+             delta_dts = FFMAX(delta_dts, last_dts - top_dts);
+         }
+ 
+-        if (delta_dts > s->max_interleave_delta) {
++        if (delta_dts > limit) {
+             av_log(s, AV_LOG_DEBUG,
+                    "Delay between the first packet and last packet in the "
+                    "muxing queue is %"PRId64" > %"PRId64": forcing output\n",
+-                   delta_dts, s->max_interleave_delta);
++                   delta_dts, limit);
+             flush = 1;
+         }
+     }
+diff --git a/libavformat/options_table.h b/libavformat/options_table.h
+index bedec2a8a9..2112014739 100644
+--- a/libavformat/options_table.h
++++ b/libavformat/options_table.h
+@@ -85,6 +85,7 @@ static const AVOption avformat_options[] = {
+ {"metadata_header_padding", "set number of bytes to be written as padding in a metadata header", OFFSET(metadata_header_padding), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, E},
+ {"output_ts_offset", "set output timestamp offset", OFFSET(output_ts_offset), AV_OPT_TYPE_DURATION, {.i64 = 0}, INT64_MIN, (double)INT64_MAX, E},
+ {"max_interleave_delta", "maximum buffering duration for interleaving", OFFSET(max_interleave_delta), AV_OPT_TYPE_INT64, { .i64 = 10000000 }, 0, (double)INT64_MAX, E },
++{"max_sparse_interleave_delta", "maximum buffering duration for interleaving of sparse streams (e.g. subtitles); 0 = use max_interleave_delta", OFFSET(max_sparse_interleave_delta), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, (double)INT64_MAX, E },
+ {"f_strict", "how strictly to follow the standards (deprecated; use strict, save via avconv)", OFFSET(strict_std_compliance), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX, D|E, .unit = "strict"},
+ {"strict", "how strictly to follow the standards", OFFSET(strict_std_compliance), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX, D|E, .unit = "strict"},
+ {"very", "strictly conform to a older more strict version of the spec or reference software", 0, AV_OPT_TYPE_CONST, {.i64 = FF_COMPLIANCE_VERY_STRICT }, INT_MIN, INT_MAX, D|E, .unit = "strict"},
