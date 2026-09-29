@@ -1,0 +1,183 @@
+diff --git a/libavformat/mpegts.c b/libavformat/mpegts.c
+index 076020509d..9a7d7bbd57 100644
+--- a/libavformat/mpegts.c
++++ b/libavformat/mpegts.c
+@@ -2896,10 +2896,16 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
+                     goto out;
+                 st->id = pid;
+                 st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+-                if (stream_type == STREAM_TYPE_SCTE_DATA_SCTE_35 && prog_reg_desc == AV_RL32("CUEI")) {
+-                    mpegts_find_stream_type(st, stream_type, SCTE_types);
++            }
++            /* SCTE-35 section filter must be opened even if stream already exists,
++             * e.g. from a previous PMT parse or format probing. Close any existing
++             * non-section filter first. */
++            if (stream_type == STREAM_TYPE_SCTE_DATA_SCTE_35 && prog_reg_desc == AV_RL32("CUEI")) {
++                mpegts_find_stream_type(st, stream_type, SCTE_types);
++                if (ts->pids[pid] && ts->pids[pid]->type != MPEGTS_SECTION)
++                    mpegts_close_filter(ts, ts->pids[pid]);
++                if (!ts->pids[pid])
+                     mpegts_open_section_filter(ts, pid, scte_data_cb, ts, 1);
+-                }
+             }
+         }
+ 
+diff --git a/libavformat/mpegtsenc.c b/libavformat/mpegtsenc.c
+index 7f76883531..2c3afd17ff 100644
+--- a/libavformat/mpegtsenc.c
++++ b/libavformat/mpegtsenc.c
+@@ -269,6 +269,51 @@ typedef struct MpegTSWriteStream {
+     DVBAC3Descriptor *dvb_ac3_desc;
+ } MpegTSWriteStream;
+ 
++/* Write a SCTE-35 splice_info_section as TS section packets (not PES). The
++ * section bytes pass through unchanged; the caller is responsible for having
++ * rebased pts_adjustment onto the output timeline, so the wire
++ * effective_splice_time = (splice_time + pts_adjustment) mod 2^33 is correct. */
++static void mpegts_write_scte35_section(AVFormatContext *s, AVStream *st,
++                                        const uint8_t *buf, int len)
++{
++    MpegTSWriteStream *ts_st = st->priv_data;
++    MpegTSWrite *ts = s->priv_data;
++    uint8_t packet[TS_PACKET_SIZE];
++    uint8_t *q;
++    int first = 1;
++    int len1, left;
++
++    while (len > 0) {
++        q = packet;
++        *q++ = SYNC_BYTE;
++        *q++ = (ts_st->pid >> 8) | (first ? 0x40 : 0x00);
++        *q++ = ts_st->pid;
++        ts_st->cc = (ts_st->cc + 1) & 0xf;
++        *q++ = 0x10 | ts_st->cc;
++
++        if (first)
++            *q++ = 0; /* pointer_field: section starts immediately */
++
++        len1 = TS_PACKET_SIZE - (q - packet);
++        if (len1 > len)
++            len1 = len;
++        memcpy(q, buf, len1);
++        q += len1;
++
++        /* Pad with stuffing bytes */
++        left = TS_PACKET_SIZE - (q - packet);
++        if (left > 0)
++            memset(q, STUFFING_BYTE, left);
++
++        avio_write(s->pb, packet, TS_PACKET_SIZE);
++        ts->total_size += TS_PACKET_SIZE;
++
++        buf += len1;
++        len -= len1;
++        first = 0;
++    }
++}
++
+ static void mpegts_write_pat(AVFormatContext *s)
+ {
+     MpegTSWrite *ts = s->priv_data;
+@@ -444,6 +489,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
+             stream_type = STREAM_TYPE_PRIVATE_DATA;
+         }
+         break;
++    case AV_CODEC_ID_SCTE_35:
++        stream_type = STREAM_TYPE_SCTE_DATA_SCTE_35;
++        break;
+     default:
+         av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
+                     "Stream %d, codec %s, is muxed as a private data stream "
+@@ -531,6 +579,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+         *q++ = 0xfc;        // private_data_byte
+     }
+ 
++    /* Add CUEI registration descriptor if any stream is SCTE-35 */
++    for (i = 0; i < s->nb_streams; i++) {
++        AVStream *st = s->streams[i];
++        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
++            break;
++        }
++    }
++
+     val = 0xf000 | (q - program_info_length_ptr - 2);
+     program_info_length_ptr[0] = val >> 8;
+     program_info_length_ptr[1] = val;
+@@ -828,6 +885,13 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+                 putbuf(&q, tag, strlen(tag));
+                 *q++ = 0;            /* metadata service ID */
+                 *q++ = 0xF;          /* metadata_locator_record_flag|MPEG_carriage_flags|reserved */
++            } else if (codec_id == AV_CODEC_ID_SCTE_35) {
++                put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
++                /* Cue Identifier Descriptor (SCTE 35 §8.2) lets receivers
++                 * discover the SCTE-35 PID without scanning all PIDs. */
++                *q++ = 0x8a; /* descriptor_tag */
++                *q++ = 0x01; /* descriptor_length */
++                *q++ = 0x01; /* cue_stream_type: splice_insert / time_signal */
+             }
+             break;
+         }
+@@ -1886,6 +1950,15 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
+     if (stream_id_p)
+         stream_id = stream_id_p[0];
+ 
++    /* SCTE-35 must be written as section data, not PES.
++     * The splice_info_section data from the demuxer already has valid CRC
++     * and pts_adjustment rebased to our output timeline. */
++    if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
++        if (size > 0)
++            mpegts_write_scte35_section(s, st, buf, size);
++        return 0;
++    }
++
+     if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
+         ts->first_pcr += dts * SYSTEM_CLOCK_FREQUENCY_DIVISOR;
+         ts->first_dts_checked = 1;
+diff --git a/libavformat/mux.c b/libavformat/mux.c
+index ea9838e380..8413dfb7c0 100644
+--- a/libavformat/mux.c
++++ b/libavformat/mux.c
+@@ -324,7 +324,10 @@ static int init_muxer(AVFormatContext *s, AVDictionary **options)
+                 par->codec_tag = av_codec_get_tag(of->p.codec_tag, par->codec_id);
+         }
+ 
++        /* DATA streams (e.g. SCTE-35) carry sparse, modular-DTS metadata and
++         * must never gate A/V interleaving; exclude them like SMPTE-2038. */
+         if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
++            par->codec_type != AVMEDIA_TYPE_DATA &&
+             par->codec_id != AV_CODEC_ID_SMPTE_2038)
+             fci->nb_interleaved_streams++;
+     }
+@@ -955,8 +958,18 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+         const FFStream *const sti = cffstream(st);
+         const AVCodecParameters *const par = st->codecpar;
+         if (sti->last_in_packet_buffer) {
+-            ++stream_count;
++            /* A QUEUED DATA packet must not count as an interleaved stream either:
++             * nb_interleaved_streams excludes DATA, so counting it here breaks the
++             * stream_count + noninterleaved_count equality that arms the
++             * max_interleave_delta flush. With a 1 Hz SCTE-35 heartbeat the 200 ms
++             * bound was off almost permanently and the sparsest subtitle stream
++             * gated every rung (measured: 2.8 s wire gaps -> 45 s+ holds -> udp fifo
++             * overflow on the release burst). Same treatment for SMPTE-2038. */
++            if (par->codec_type != AVMEDIA_TYPE_DATA &&
++                par->codec_id != AV_CODEC_ID_SMPTE_2038)
++                ++stream_count;
+         } else if (par->codec_type != AVMEDIA_TYPE_ATTACHMENT &&
++                   par->codec_type != AVMEDIA_TYPE_DATA &&
+                    par->codec_id != AV_CODEC_ID_VP8 &&
+                    par->codec_id != AV_CODEC_ID_VP9 &&
+                    par->codec_id != AV_CODEC_ID_SMPTE_2038) {
+@@ -985,7 +998,10 @@ int ff_interleave_packet_per_dts(AVFormatContext *s, AVPacket *pkt,
+             const PacketListEntry *const last = sti->last_in_packet_buffer;
+             int64_t last_dts;
+ 
+-            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
++            /* Exclude sparse modular-DTS DATA (e.g. SCTE-35) from the delay
++             * metric: its 33-bit DTS must not perturb the extended-time delta. */
++            if (!last || st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ||
++                st->codecpar->codec_type == AVMEDIA_TYPE_DATA)
+                 continue;
+ 
+             last_dts = av_rescale_q(last->pkt.dts,

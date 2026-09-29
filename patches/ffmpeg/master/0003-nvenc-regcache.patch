@@ -1,0 +1,55 @@
+diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
+index 1c931d43af..dd74672acb 100644
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -22,6 +22,8 @@
+ #include "config.h"
+ #include "config_components.h"
+ 
++#include <stdlib.h>
++
+ #include "nvenc.h"
+ #include "hevc/sei.h"
+ #if CONFIG_AV1_NVENC_ENCODER
+@@ -2195,7 +2197,18 @@ static int nvenc_find_free_reg_resource(AVCodecContext *avctx)
+ 
+     int i, first_round;
+ 
+-    if (ctx->nb_registered_frames == FF_ARRAY_ELEMS(ctx->registered_frames)) {
++    /* ptvencoder scale fix: logical cache cap, runtime-clamped. PTV_NVENC_REG_CAP=64 restores
++     * the byte-identical upstream eviction behavior for A/B; default = the full (enlarged)
++     * array. See MAX_REGISTERED_FRAMES in nvenc.h for the measured RM-lock failure mode. */
++    static int reg_cap;
++    if (!reg_cap) {
++        const char *e = getenv("PTV_NVENC_REG_CAP");
++        int v = e ? atoi(e) : 0;
++        reg_cap = (v >= 64 && v <= (int)FF_ARRAY_ELEMS(ctx->registered_frames))
++                  ? v : (int)FF_ARRAY_ELEMS(ctx->registered_frames);
++    }
++
++    if (ctx->nb_registered_frames == reg_cap) {
+         for (first_round = 1; first_round >= 0; first_round--) {
+             for (i = 0; i < ctx->nb_registered_frames; i++) {
+                 if (!ctx->registered_frames[i].mapped) {
+diff --git a/libavcodec/nvenc.h b/libavcodec/nvenc.h
+index ad6ddaa434..95b531fc3d 100644
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -38,7 +38,16 @@ typedef void ID3D11Device;
+ 
+ #include "avcodec.h"
+ 
+-#define MAX_REGISTERED_FRAMES 64
++/* ptvencoder scale fix (2026-07-06): 64 -> 512. A deep decode->output cushion (frame_q up to
++ * 160 frames + in-flight) cycles more distinct CUDA buffers through the encoder than a
++ * 64-entry cache holds, so every frame evicted + re-registered a resource = 2 Resource-
++ * Manager WRITE-lock ioctls per frame per rung; at fleet scale (56ch x 6 rungs) the driver
++ * rwlock collapsed into osq_lock spinning = 32% of box CPU (perf + /proc kernel stacks,
++ * 2026-07-06). 512 covers the largest cushion (PTV_FRAMEQ cap 160 + in-flight + margin) so
++ * steady state re-registers nothing. Entries are small per-encoder records; registrations
++ * map ALREADY-allocated pool VRAM. PTV_NVENC_REG_CAP clamps the logical cap at runtime
++ * (64 = byte-identical upstream behavior, for A/B). */
++#define MAX_REGISTERED_FRAMES 512
+ 
+ #define NVENCAPI_CHECK_VERSION(major, minor) \
+     ((major) < NVENCAPI_MAJOR_VERSION || ((major) == NVENCAPI_MAJOR_VERSION && (minor) <= NVENCAPI_MINOR_VERSION))
