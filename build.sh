@@ -78,6 +78,12 @@ cat <<EOF >"$BUILD_SCRIPT"
 	shopt -s nullglob
     PATCHES=()
     [[ -n '$PTV_DIR' ]] && PATCHES=('/patches/$PTV_DIR'/*.patch)
+    # the host checked the set; if the container cannot see it (mount failure, SELinux label, rootless
+    # path mapping) refuse - never package an unpatched build under a -ptv name
+    if [[ -n '$PTV_DIR' && "\${#PATCHES[@]}" = 0 ]]; then
+        echo 'PTV build but no patches visible at /patches/$PTV_DIR inside the container - refusing'
+        exit 1
+    fi
     if [[ "\${#PATCHES[@]}" = 0 ]]; then
         echo 'Vanilla build: no patches applied'
     fi
