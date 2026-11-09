@@ -1,11 +1,13 @@
 #!/bin/bash
 
 SCRIPT_REPO="https://code.videolan.org/videolan/libplacebo.git"
-SCRIPT_COMMIT="e2972fdd09adacd383656738d7d280f0cd84a761"
+SCRIPT_COMMIT="275f7dea27924cdd34ab2e6c20e448b6bc4fab65"
 
 ffbuild_depends() {
     echo base
     echo vulkan
+    echo lcms2
+    echo xxhash
 }
 
 ffbuild_enabled() {
@@ -30,6 +32,8 @@ ffbuild_dockerbuild() {
         -Dvulkan-registry="$FFBUILD_PREFIX"/share/vulkan/registry/vk.xml
         -Dshaderc=enabled
         -Dglslang=disabled
+        -Dlcms=enabled
+        -Dxxhash=enabled
         -Ddemos=false
         -Dtests=false
         -Dbench=false
