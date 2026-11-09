@@ -24,6 +24,41 @@ FFMPEG_REPO="${FFMPEG_REPO_OVERRIDE:-$FFMPEG_REPO}"
 GIT_BRANCH="${GIT_BRANCH:-master}"
 GIT_BRANCH="${GIT_BRANCH_OVERRIDE:-$GIT_BRANCH}"
 
+# ptv fork: which ptvencoder patch set to build. Default PTV=none = vanilla, upstream FFmpeg as-is,
+# named exactly like an upstream build.
+#   PTV=dev | PTV=stable   the version named in patches/ffmpeg/ptv/dev or .../stable
+#   PTV=<version>          an exact published version, e.g. PTV=2.2.0-rc3
+# The sets in patches/ffmpeg/ptv/<version>/<branch>/ are published by ffmpeg-enhancements (patches/ptv/)
+# and synced here - never edited by hand. A ptv build applies <version>/<GIT_BRANCH>/*.patch in order,
+# checked against that folder's SHA256SUMS, and is named ...-ptv<version>. A version without a set for
+# GIT_BRANCH (e.g. a 9.0 build) fails here: it never comes out as an unmarked vanilla build.
+# PTV is an env var, not an addin, so ptv and vanilla builds share one image (IMAGE includes the addins).
+PTV="${PTV:-none}"
+PTV_DIR=""
+BUILD_TAG=""
+if [[ "$PTV" != none ]]; then
+    PTV_ROOT="patches/ffmpeg/ptv"
+    PTV_VERSION="$PTV"
+    if [[ "$PTV" == dev || "$PTV" == stable ]]; then
+        [[ -f "$PTV_ROOT/$PTV" ]] || { echo "PTV=$PTV: no $PTV_ROOT/$PTV pointer - sync the patch sets first" >&2; exit 1; }
+        PTV_VERSION="$(tr -d '[:space:]' < "$PTV_ROOT/$PTV")"
+    fi
+    if ! [[ "$PTV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(pre|rc)[0-9]+)?$ ]]; then
+        echo "PTV=$PTV: '$PTV_VERSION' is not a version (X.Y.Z, X.Y.Z-preN or X.Y.Z-rcN)" >&2; exit 1
+    fi
+    PTV_DIR="ptv/$PTV_VERSION/$GIT_BRANCH"
+    if ! [[ -f "patches/ffmpeg/$PTV_DIR/SHA256SUMS" ]]; then
+        echo "PTV=$PTV: ptvencoder $PTV_VERSION has no patch set for FFmpeg branch '$GIT_BRANCH' (patches/ffmpeg/$PTV_DIR)" >&2; exit 1
+    fi
+    # every patch in the folder must be listed and must verify - nothing extra, nothing changed
+    if ! ( cd "patches/ffmpeg/$PTV_DIR" && sha256sum --quiet -c SHA256SUMS \
+           && [[ "$(ls -1 *.patch 2>/dev/null)" == "$(awk '{sub(/^\*/, "", $2); print $2}' SHA256SUMS | sort)" ]] \
+           && [[ -n "$(ls -1 *.patch 2>/dev/null)" ]] ); then
+        echo "PTV=$PTV: patches/ffmpeg/$PTV_DIR does not match its SHA256SUMS - re-sync it" >&2; exit 1
+    fi
+    BUILD_TAG="-ptv$PTV_VERSION"
+fi
+
 BUILD_SCRIPT="$(mktemp)"
 trap "rm -f -- '$BUILD_SCRIPT'" EXIT
 
@@ -41,9 +76,10 @@ cat <<EOF >"$BUILD_SCRIPT"
     cd ffmpeg
 
 	shopt -s nullglob
-    PATCHES=('/patches/$GIT_BRANCH'/*.patch)
+    PATCHES=()
+    [[ -n '$PTV_DIR' ]] && PATCHES=('/patches/$PTV_DIR'/*.patch)
     if [[ "\${#PATCHES[@]}" = 0 ]]; then
-        echo 'No patches found for $GIT_BRANCH'
+        echo 'Vanilla build: no patches applied'
     fi
     for patch in "\${PATCHES[@]}"; do
         echo "Applying \$patch"
@@ -73,7 +109,7 @@ fi
 
 mkdir -p artifacts
 ARTIFACTS_PATH="$PWD/artifacts"
-BUILD_NAME="ffmpeg-$(./ffbuild/ffmpeg/ffbuild/version.sh ffbuild/ffmpeg)-${TARGET}-${VARIANT}${ADDINS_STR:+-}${ADDINS_STR}"
+BUILD_NAME="ffmpeg-$(./ffbuild/ffmpeg/ffbuild/version.sh ffbuild/ffmpeg)-${TARGET}-${VARIANT}${ADDINS_STR:+-}${ADDINS_STR}${BUILD_TAG}"
 
 mkdir -p "ffbuild/pkgroot/$BUILD_NAME"
 package_variant ffbuild/prefix "ffbuild/pkgroot/$BUILD_NAME"
@@ -94,5 +130,5 @@ rm -rf ffbuild
 
 if [[ -n "$GITHUB_ACTIONS" ]]; then
     echo "build_name=${BUILD_NAME}" >> "$GITHUB_OUTPUT"
-    echo "${OUTPUT_FNAME}" > "${ARTIFACTS_PATH}/${TARGET}-${VARIANT}${ADDINS_STR:+-}${ADDINS_STR}.txt"
+    echo "${OUTPUT_FNAME}" > "${ARTIFACTS_PATH}/${TARGET}-${VARIANT}${ADDINS_STR:+-}${ADDINS_STR}${BUILD_TAG}.txt"
 fi

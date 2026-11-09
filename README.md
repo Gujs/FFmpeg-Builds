@@ -1,5 +1,18 @@
 # FFmpeg Static Auto-Builds
 
+> **ptv fork (branch `ptv`).** Upstream BtbN FFmpeg-Builds plus one feature: optional ptvencoder patch
+> sets. A plain build is vanilla and named exactly like upstream. A ptv build is chosen with an env var
+> and tagged in its name (same image, so no extra images to build):
+>
+>     ./build.sh linux64 nonfree [debug]                   # vanilla   ffmpeg-N-...-linux64-nonfree[-debug]
+>     PTV=dev    ./build.sh linux64 nonfree [debug]        # ptv dev   ffmpeg-N-...-linux64-nonfree[-debug]-ptv2.2.0-rc3
+>     PTV=stable ./build.sh linux64 nonfree                # ptv release
+>     PTV=2.2.0-rc2 ./build.sh linux64 nonfree             # an exact published version
+>
+> Patch sets live in `patches/ffmpeg/ptv/` (see its README), synced from ffmpeg-enhancements; they are
+> never edited here. Workflow: change this repo on the Mac -> push to GitHub -> pull on the build box.
+> After pulling upstream changes, rebuild the images (`./makeimage.sh linux64 nonfree [debug|9.0]`).
+
 Static Windows (x86_64) and Linux (x86_64) Builds of ffmpeg master and latest release branch.
 
 Windows builds are targetting Windows 7 and newer, provided UCRT is installed.
