@@ -105,16 +105,46 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..ae5d6fa974
+index 0000000000..51d2452324
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6116 @@
+@@ -0,0 +1,6146 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.0 — release: 2.2.0-rc5 unchanged, version only
++
++**Same code as 2.2.0-rc5** (adaptive-2.2 87cdf65cc5); only `PTVENCODER_VERSION` changes. What makes it the release:
++- **Overnight soak of rc5** (2026-11-11 20:20 → 11-12 07:33 CET) on the new soak tier live-transcoder (8) +
++  tmtg-cow-transcoder-1 (64) + tmtg-cow-transcoder-2 (29) = 101 channels, with the same channels on cor-1/2 (2.0.2-pre4) as
++  the control: 0 restarts, 0 cores, RSS max +3.4 MB/h (median 0.1), SCTE-35 in = out on every single-input channel, large
++  source time jumps handled (TruBLU step backs to −2698 s, Weather_nation +9047 s forward); mosaic lip sync flat
++  (RAV mosaic cell measured on air: rc5 +3 ms, pre4 on cor-2 wanders ±120 ms).
++- **rc5 gate** (vs rc4, kit 5d72d5b, media-v11): 267 runs, 0 regressions, 0 INVALID; T-453 forward key `vt-t453f`
++  rc4 FAIL / rc5 PASS; smoke 35/1/0 with the one mosaic cross-slot blip re-run 3/3 PASS.
++- rc4 canary (live-transcoder + cor-3, 2026-11-10/11) fixed T-453's step-back case on air (GYF SCTE-35 back).
++
++## 2.2.0-rc5 — 2.2.0-rc4 + SCTE-35 survives a large forward jump; a cue can no longer block the cue stream (T-453)
++
++**SCTE-35 keeps flowing after the source returns far ahead in time (T-453).** cor-3, 2026-11-10 19:23 / 19:34 CST (rc4):
++FaithNFreedom_TV and Biohackingville_TV came back from a ~170 s outage with their clock ~46000 s ahead; the timeline erased
++the jump correctly, but from then on the output carried no SCTE-35 (the rc3 Growing_Your_Faith failure, mirrored). A cue of
++the NEW content, 0.7 s ahead of its picture and read just before the jump's window opened, kept the old offset: its time lay
++before the new content's start, so it was taken for old content — although the old content had ended 45820 s earlier. It
++waited for a picture that never came, every later cue waited behind it, and after the queue filled they went out chained
++behind its label. Now:
++- a copy (cue, subtitle) whose time lies past the old content's end and within 10 s before the new content's start is new
++  content and moves with the jump;
++- backstop: a SCTE-35 cue labelled more than 10 s past the newest video read (a cue's time is the PCR it was read at, never
++  ahead of the video) takes the video read's time and waits on it (`[PTV-VMAP] a SCTE-35 cue labelled ... relabelled`); a cue
++  not shown within 60 s goes out with the video's offset (the T-335 path). A mislabelled cue costs at most that cue's timing,
++  never every later cue until a restart.
++Local repros (GYF source capture): forward jump +45821 / +46243 s after a 177 s outage — rc4 0 cues after the jump, rc5 all
++1305 (the backstop alone also carries all 1305); the rc3 step back -41479 s — all 1305.
 +
 +## 2.2.0-rc4 — 2.2.0-rc3 + SCTE-35 survives a large erased step back (T-453)
 +
@@ -6227,7 +6257,7 @@ index 0000000000..ae5d6fa974
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..969cba9a53
+index 0000000000..4683863df0
 --- /dev/null
 +++ b/fftools/ptvencoder.c
 @@ -0,0 +1,7754 @@
@@ -6280,7 +6310,7 @@ index 0000000000..969cba9a53
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.0-rc4"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.0"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -22417,10 +22447,10 @@ index 0000000000..9809b604e2
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..604177b0c9
+index 0000000000..e413120fae
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3151 @@
+@@ -0,0 +1,3172 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -22864,6 +22894,23 @@ index 0000000000..604177b0c9
 +                    continue;
 +                }
 +            }
++            if (r == 0 && scte && !force && d->vread_set &&
++                av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q) > d->vread_us + 10000000) {
++                /* 2.2.0-rc5 T-453: a cue labelled far past the newest video read waits for content that will never be
++                 * shown — mislabelled at a timeline event (rc3: moved by a -41523 s step; rc4: a new-content cue left on
++                 * the old offset at a +45643 s jump). It headed the queue for good, every later cue waited behind it, and
++                 * a full queue chained them all behind its label: no SCTE-35 on air until a restart. A cue's own time is
++                 * the PCR it was read at, never ahead of the video read: it takes the newest video read and waits on it */
++                int64_t lbl = av_rescale_q(ts, ps->in_tb, AV_TIME_BASE_Q);
++                av_log(NULL, AV_LOG_WARNING, "[PTV-VMAP] a SCTE-35 cue labelled %.1f s past the newest video read — "
++                       "relabelled to the video read\n", (lbl - d->vread_us) / 1e6);
++                p->pts = p->dts = av_rescale_q(d->vread_us, AV_TIME_BASE_Q, ps->in_tb);
++                ps->vwait_po[k] = d->prog_off;
++                continue;                       /* evaluated again with the new label */
++            }
++            if (r == 0 && scte && !force && now - ps->vwait_wc[k] >= 60000000)
++                r = -1;                         /* 2.2.0-rc5 T-453: not shown in 60 s (a burst leads by < 30 s): placed
++                                                 * with the video's offset (T-335 below), never left heading the queue */
 +            if (r == 0 && !force && !(ps->gated && now - ps->vwait_wc[k] >= 1500000))
 +                break;                          /* its content is not on the output yet */
 +            if (ps->gated && r != 1) {
@@ -23241,9 +23288,13 @@ index 0000000000..604177b0c9
 +             * overlap is the whole old timeline, and a cue of the OLD content read in the lag (GYF: 0.77 s before the old
 +             * end, 33 ms before a -41523 s step's window) was moved by k — it then headed the queue unshown for good, every
 +             * cue waited behind it and went out chained behind a label k ahead: no SCTE-35 on air until a restart */
-+            if (src < from_us || (src < old_end_us && ps->vwait_wc[k] < open_wc &&
-+                                  !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)) &&
-+                                    src - from_us <= 10000000)))
++            /* 2.2.0-rc5 T-453: a forward jump leaves a gap (old_end, from): a copy there lies past the old content's end —
++             * the new content's lead (GYF/FNF: a cue 0.7 s ahead of its picture, read 10 us before the window opened,
++             * kept the old offset and was labelled 45643 s ahead of the video) — it is new when near the new start */
++            if ((src < from_us && !(src >= old_end_us && from_us - src <= 10000000)) ||
++                (src < old_end_us && ps->vwait_wc[k] < open_wc &&
++                 !(ps->vwait_vn[k] >= open_vn - 2 && (p->pos < 0 || (open_pos >= 0 && p->pos > open_pos)) &&
++                   src - from_us <= 10000000)))
 +                continue;
 +            if (p->pts != AV_NOPTS_VALUE) p->pts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);
 +            if (p->dts != AV_NOPTS_VALUE) p->dts += av_rescale_q(dpo, (AVRational){ 1, 90000 }, ps->in_tb);

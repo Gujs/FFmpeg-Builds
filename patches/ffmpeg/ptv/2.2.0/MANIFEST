@@ -1,0 +1,8 @@
+version=2.2.0
+channel=stable
+tag=ptv-2.2.0
+source_commit=e603e9d97249316810a896a5aef0785a7536dd41
+branches=master
+verified_master=23c454005319dee4a5bcae5c370f75fdeb325230
+verified_date=2026-11-12
+supersedes=2.2.0-rc5
