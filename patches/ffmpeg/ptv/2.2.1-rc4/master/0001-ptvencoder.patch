@@ -105,16 +105,64 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..f759878d99
+index 0000000000..6cd55521e3
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6187 @@
+@@ -0,0 +1,6235 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.1-rc4 — rc3 + an ABR size switch survived (T-469), a source without audio carries silence (T-470), the PES tail after bars (T-474), the rc2 regression after outages (T-475)
++
++**After an outage the T-463 rules stay out (T-475, a regression since rc2).** After an input silence of the stall class
++(>= 3 s, ended <= 3 s before the event's window) or while the input holds, the video-decides-alone rule, the await and an
++audio's "clock of its own" no longer apply: the source returns or restarts and the rules up to rc1 decide. rc2/rc3
++repaired a 12 s hole's audio return as a clock of its own (lip sync −11.9 s for good, audio dark 11.5 s; 2.2.0 and rc1
++were right) and a source restart after a stall (cow-1 Adrenaline+ under rc2: lip sync +65 s until the next restart).
++**A picture-size switch is survived (T-469).** An adaptive-bitrate origin (glo-3 Stingray: 256x144 … 1920x1080) switching
++renditions then stalling restarted the channel (exit 4, ~40 a day): the hold repeated the last decoded picture before it
++was fitted to the graph's size, and production's CUDA hwupload rejected it. The freeze picture is now the fitted one; the
++first two pictures of a new size (dropped until three in a row confirm it) keep their place with a repeat of the last
++picture shown — no 0.12 s video gap at every switch — never while holding, keeping the damage mark, without captions.
++**A planned audio track that never decodes carries silence (T-470, owner).** A source sending no audio (glo-4
++Black_Headline_News for hours) gave a video-only output and a watchdog restart every 7.5 min. When a planned track has
++decoded nothing while the video flowed 3 s (PTV_BORN_SILENT_MS, 0 = off) it is born silent on the house axis; real audio
++joins on its content time in lip sync. Single input; mosaic slots follow.
++**After bars, no old picture flashes back (T-474).** The pre-gap PES tail lavf hands out with the first post-gap packet
++ended the hold and showed the old frozen picture between the bars and the returning content; it now keeps its time and
++carries the hold picture. Residual: a return in a new rendition keeps one such picture.
++Test parity: -init_hw_device videotoolbox gives a hwupload graph its device (macOS stand-in of the CUDA path).
++Kit: production-scan keys (cap-zenlife, cap-bhn, size switches with holes / stalls / loss / captions, holes, born-silent
++join, outage restarts), judges graphsize / stalecheck / ccdup / hscheck, --abs-baseline-ms.
++
++## 2.2.1-rc3 — rc2 + the await follows the content (T-464) + a small forward step of the video alone (T-466) + damage at a step judged at its open (T-467)
++
++**The awaited audio is judged against where its paths are now, not where they were (T-464).** Found by a code review of rc2,
++each case reproduced by a gate key first. rc2 compared a returning packet with the path ends frozen at its last packet:
++after a 3 s step back an audio silent 2 s returned on the new clock, read as old content, went out on the old offset and was
++repaired as a clock of its own after 5 s — lip sync −3 s for good (vt-apause); forward, an audio on its own clock that paused
++4.2 s on an 8 s step read as crossed (vt-ap-ownp, −8 s). Both paths now move on by the video's content progress since the
++audio's last old packet (never more than its own silence + 0.5 s; not the wall — a burst or stall moves the wall, not the
++labels); a packet on its own old cadence without a silence of its own is old (a video stall, a coarse interleave), after one
++it is judged by the content (vt-apause3: silent exactly the step, landing on the old cadence). A second program event inside
++the 5 s await (a second restart) re-awaited the audio with only its own step on its awaited path (vt-v2: 3 flashes without
++sound): an awaited audio now takes every later event — its awaited step and reference move by the step without its kept part,
++its old offset by the event's move; the await ends only on a near-exact return (< 150 ms).
++**A forward clock step of the video alone shorter than the window's wait + 2 s (T-466).** Rule C's veto "the audio flowed into
++the span the step skipped = the video's own hole" read the audio's old-path end after the window had waited for it (1.94 s):
++a 3 s step of the video with the audio on its own clock went out "labels as sent", lip sync −3 s for good (vt-ap-own). The
++veto now uses the audio's path end when the window opened (a real video hole: it had flowed up to the new labels already).
++**Damage at a big step is judged where the event began (T-467, pre-existing since 2.2).** The window of a big step waits up
++to 3 s for its partner; the damage test counted from its close, so the corrupt datagram at the step aged out in a long window
++and its lost picture was erased with the step — an audio on its own clock +40 ms late for good (vt-ap-ownp: the audio silent
++inside the window; its control with a shorter window kept the picture). The damage flag and the keep floor's "audio
++undamaged" test now count from the window's open, as the damage span already did.
++Kit: 7 keys (vt-ap-ctl / vt-ap-own8 controls, vt-apause, vt-apause3, vt-ap-ownp, vt-v2, vt-ap-own; media-v23) — rc2 FAILs
++the 5 repro keys, rc3 passes all; T-465 (kit only): id3check no longer counts an item at the judged window's edge as extra.
 +
 +## 2.2.1-rc2 — rc1 + a source clock step taken by one stream at a time (T-463) + copied AC-3 after a clock step
 +
@@ -6298,10 +6346,10 @@ index 0000000000..f759878d99
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..66669759ab
+index 0000000000..7c0084d1ac
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,7754 @@
+@@ -0,0 +1,7823 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6351,7 +6399,7 @@ index 0000000000..66669759ab
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.1-rc2"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.1-rc4"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -7045,6 +7093,8 @@ index 0000000000..66669759ab
 +int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 +int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 +int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
++int64_t g_born_silent_us = 3000000;            /* 2.2.1 T-470: a planned track never decoded after this much video flow is
++                                                * born silent (PTV_BORN_SILENT_MS, 0 = off) */
 +_Atomic int64_t g_acorrupt;
 +_Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
 +_Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
@@ -9200,6 +9250,30 @@ index 0000000000..66669759ab
 +        av_frame_unref(frame);
 +        return;
 +    }
++    /* 2.2.1 T-474: a picture that CONTINUES the last real pre-hold picture (within two picture steps) while the hold already
++     * shows bars / black is the pre-gap PES tail lavf hands out with the first post-gap packet (T-074): it ends the hold
++     * (the state machine needs it) but its PICTURE was the old frozen one flashed back on air after the bars (1 picture on
++     * a plain 12 s hole; 9 when the return came in a new rendition: the tail + its dups + the T-469 repeats of it). It
++     * keeps its time and its place; it carries the hold's picture. (Dropping it instead broke the rejoin: rc4-dev4.) */
++    /* only while still holding: after a STOP/CONT the returning content CONTINUES the pre-gap timeline (delayed, not
++     * lost) — carrying the hold picture on every continuing frame put bars on air for good (rc4-dev9: sync_stop_10 /
++     * kill_return_20 live share 0.01). Residual: a return in a new rendition keeps one stale picture (vt-vsw-bars) */
++    if (g_hold_render && d->hr_real_set && d->hr_dur > 0 && ptv_src_holding() && ptv_hold_bars_pic(d, frame)) {
++        int64_t dt = frame->best_effort_timestamp - d->hr_real_pts;
++        if (frame->best_effort_timestamp != AV_NOPTS_VALUE && dt > 0 && dt <= 2 * d->hr_dur) {
++            AVFrame *bp = ptv_hold_bars_pic(d, frame);
++            AVFrame *rp = bp ? av_frame_clone(bp) : NULL;
++            if (rp && av_frame_copy_props(rp, frame) >= 0) {
++                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 a pre-gap picture (+%.0f ms after the last one shown) after "
++                       "the bars carries the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
++                av_frame_side_data_free(&rp->side_data, &rp->nb_side_data);
++                rp->opaque = NULL;
++                av_frame_unref(frame);
++                av_frame_move_ref(frame, rp);
++            }
++            av_frame_free(&rp);
++        }
++    }
 +    rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
 +    {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
 +         * content gap in front of it (frames lost); in front of any other frame a gap is the old leap (a backlog drain,
@@ -9209,7 +9283,8 @@ index 0000000000..66669759ab
 +        if (dw && av_gettime_relative() - dw < 5000000)
 +            av_dict_set(&frame->metadata, "ptv_dmg", "1", 0);
 +    }
-+    ptv_hold_note_frame(d, frame);       /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
++    if (!d->filtering)                   /* (with a graph: the FITTED picture, below — T-469) */
++        ptv_hold_note_frame(d, frame);   /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
 +    if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
 +        if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
 +            frame->pts = frame->best_effort_timestamp;
@@ -9319,6 +9394,32 @@ index 0000000000..66669759ab
 +                    fflush(NULL);
 +                    _exit(4);
 +                }
++                /* 2.2.1 T-469: the dropped picture keeps its place on the timeline — the last picture the graph took,
++                 * stamped with this one's time (a drop left a 0.12 s video PTS hole + a PCR gap at every rendition
++                 * switch, vt-vsw: the first two pictures of each new size). A lone damaged picture is still never shown */
++                /* not while the source holds (bars / black after -freeze_max: a return in another rendition must not
++                 * show the pre-outage picture again); the repeat keeps the dropped picture's damage mark (the output
++                 * clock fills a gap in front of damage, leaps in front of anything else) and carries no captions (A/53
++                 * side data of the old picture would be sent twice) — Fable 5.2 review of T-469 */
++                if (d->hr_last && d->hr_last->width == in->w && d->hr_last->height == in->h &&
++                    d->hr_last->format == in->format && !ptv_src_holding()) {
++                    AVFrame *rp = av_frame_clone(d->hr_last);
++                    if (rp) {
++                        int64_t bet = frame->best_effort_timestamp, dur = frame->duration;
++                        int dmg = av_dict_get(frame->metadata, "ptv_dmg", NULL, 0) != NULL;
++                        av_frame_move_ref(frame, rp);
++                        av_frame_free(&rp);
++                        frame->best_effort_timestamp = bet;
++                        frame->pkt_dts = AV_NOPTS_VALUE;
++                        if (dur > 0)
++                            frame->duration = dur;
++                        frame->flags &= ~AV_FRAME_FLAG_KEY;
++                        frame->opaque = NULL;
++                        av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
++                        av_dict_set(&frame->metadata, "ptv_dmg", dmg ? "1" : NULL, 0);
++                        goto feed;
++                    }
++                }
 +                return;
 +            }
 +        } else
@@ -9339,6 +9440,12 @@ index 0000000000..66669759ab
 +            _exit(4);
 +        }
 +    }
++feed:
++    /* 2.2.1 T-469: the freeze picture is the one the graph takes — FITTED to its input size. Noted before the fit, a hold
++     * right after a rendition switch pushed a picture of another size into the graph: CUDA's hwupload failed ("Frame size
++     * or format changed without filter graph reinitialization"), [PTV-VGRAPH] exit 4 (glo-3 Stingray ~40 restarts/day;
++     * a VideoToolbox / software graph re-sized itself instead: vt-vsw-hole GRAPHSIZE FAIL) */
++    ptv_hold_note_frame(d, frame);
 +    frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
 +    if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
 +        return;
@@ -12008,6 +12115,15 @@ index 0000000000..66669759ab
 +        av_log(NULL, AV_LOG_INFO,
 +               "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it; created in %.1f s%s)\n",
 +               *ordbuf ? ordbuf : "0", dus / 1e6, g_cudadev.started ? " while the inputs opened" : "");
++    } else if (fcomplex && strstr(fcomplex, "hwupload") && hwdev && strstr(hwdev, "videotoolbox")) {
++        /* 2.2.1 T-469: -init_hw_device videotoolbox + a graph that uploads (hwupload, scale_vt) — the macOS stand-in of
++         * production's GPU path (hwupload + scale_cuda), so a test sees hwupload's real behaviour on a new picture size
++         * (a software scale re-configures by itself). Without a device hwupload cannot init at all */
++        if ((ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0)) < 0) {
++            av_log(NULL, AV_LOG_ERROR, "cannot create the VideoToolbox device: %s\n", av_err2str(ret));
++            goto end;
++        }
++        av_log(NULL, AV_LOG_INFO, "ptvencoder: VideoToolbox device for the filter graph (hwupload)\n");
 +    }
 +
 +    /* shared filter graph: -filter_complex (N video inputs -> split/mosaic ->
@@ -13844,6 +13960,7 @@ index 0000000000..66669759ab
 +    if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
 +    { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
 +    { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
++    { const char *s = getenv("PTV_BORN_SILENT_MS");    if (s && atoi(s) >= 0) g_born_silent_us = (int64_t)atoi(s) * 1000; }  /* T-470 */
 +    /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
 +     * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall
 +     * time. NEVER set in production — the 5min/3min/80ms/2ms/s defaults are the owner-approved
@@ -14058,10 +14175,10 @@ index 0000000000..66669759ab
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..c63278ae77
+index 0000000000..acce02a260
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2209 @@
+@@ -0,0 +1,2213 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -14852,6 +14969,8 @@ index 0000000000..c63278ae77
 +    /* 2.0.0-pre9 (T-078/T-079): hold pictures rendered through the graph while input 0 holds */
 +    AVFrame         *hr_last;                 /* ref of the last decoded frame (single input; shape + freeze picture) */
 +    int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
++    int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
++    int              hr_real_set;
 +    int64_t          hr_next;                 /* wall us of the next render */
 +    struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
 +    /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -15961,6 +16080,7 @@ index 0000000000..c63278ae77
 +extern const char      ptv_hold_tag;     /* &ptv_hold_tag in AVFrame.opaque marks a rendered hold picture */
 +int  ptv_hold_slate_load(const char *path);
 +void ptv_hold_render(DecodeCtx *d);      /* decode thread, video_q empty: render one picture when due */
++AVFrame *ptv_hold_bars_pic(DecodeCtx *d, const AVFrame *frame);   /* 2.2.1 T-474 */
 +void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame);   /* emit_video: a real decoded frame */
 +void ptv_hold_route(AVFrame *out, int rung);   /* a rendered picture leaving the graph → the rung's slot */
 +AVFrame *ptv_hold_cell_pic(void **state, const AVFrame *ref, int64_t elapsed_us);   /* 2.0.0: a dead mosaic cell's
@@ -16134,6 +16254,7 @@ index 0000000000..c63278ae77
 +extern int     g_copy_gapfill;           /* 2.0.0-pre9.4 (T-083): copied AC-3 stays continuous while video flows
 +                                          * (PTV_NO_COPY_GAPFILL=1 off) */
 +extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
++extern int64_t g_born_silent_us;         /* 2.2.1 T-470: born-silent threshold (0 = off) */
 +extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
 +extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
 +extern _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO];      /* 2.0.1 T-087: per global track, the edit the demux posted with its
@@ -16273,10 +16394,10 @@ index 0000000000..c63278ae77
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..e9786f2bb3
+index 0000000000..73e3df9d53
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,3815 @@
+@@ -0,0 +1,3838 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -18875,7 +18996,10 @@ index 0000000000..e9786f2bb3
 +
 +    if (!a->slot_deferred || a->pts_set)
 +        return 0;
-+    target = av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000);
++    /* 2.2.1 T-470: single input — the master's output position, 200 ms behind (the margin T-409 keeps) */
++    target = a->multiview ? av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000)
++                          : av_rescale(FFMAX(0, atomic_load_explicit(&g_house_out_us, memory_order_relaxed) - 200000),
++                                       a->out_rate, 1000000);
 +    lim    = a->pump_next + 2 * a->out_rate;
 +    while (ret >= 0 && a->pump_next + a->frame_size <= FFMIN(target, lim)) {
 +        AVFrame *f = av_frame_alloc();
@@ -18954,6 +19078,14 @@ index 0000000000..e9786f2bb3
 +            /* 2.0.2 T-386: a joining slot — the silence covered house 0 .. pump_next; real audio continues from there:
 +             * a frame before it is dropped, a gap after it is filled (from the silence's end, not from house 0) */
 +            int64_t pump_us = av_rescale(a->pump_next, 1000000, a->out_rate);
++            if (!a->multiview) {
++                /* 2.2.1 T-470 (born silent, single input): the audio door places a frame at content - h0 + house_skew,
++                 * not at its label — the join compares on that axis; while the door is in its vmap mode (holding /
++                 * within 30 s of a program event) the join waits, the pump keeps the silence going */
++                if (vm_mode(a)) { a->anchor_drop_pre++; return 0; }
++                if (g_avlock && a->house_skew)
++                    house_us += *a->house_skew;
++            }
 +            if (house_us < pump_us) { a->anchor_drop_pre++; return 0; }
 +            a->slot_deferred = 0;
 +            if (house_us > pump_us && frame->sample_rate > 0 && frame->nb_samples > 0) {
@@ -19898,6 +20030,18 @@ index 0000000000..e9786f2bb3
 +        }
 +        if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_FILL)) {   /* 2.0.2 T-386: a deferred slot's silence, not a packet */
 +            av_packet_free(&pkt);
++            if (!a->multiview && !a->slot_deferred && !a->pts_set && !a->aq_npending && !a->apark_n) {
++                /* 2.2.1 T-470: born silent — the demux saw this planned track never decode while the video flowed */
++                int64_t h0;
++                pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
++                if (h0 != AV_NOPTS_VALUE) {
++                    a->slot_deferred = 1;
++                    a->pump_next     = 0;
++                    av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) born silent: no audio decoded while the video "
++                           "flowed %.0f s — silence on the house axis until real audio joins (PTV_BORN_SILENT_MS=0 off)\n",
++                           a->dbg_k, a->dbg_in, g_born_silent_us / 1e6);
++                }
++            }
 +            if ((ret = slot_pump(a)) < 0)
 +                break;
 +            continue;
@@ -22514,10 +22658,10 @@ index 0000000000..92b857aa5c
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..39a22bba1d
+index 0000000000..6098fb01e7
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3178 @@
+@@ -0,0 +1,3197 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -25425,6 +25569,25 @@ index 0000000000..39a22bba1d
 +                                 atomic_load_explicit(&g_adamage_wc[d->aglobal[k]], memory_order_relaxed) : 0;
 +                    if (d->single)
 +                        dw = FFMAX(dw, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
++                    /* 2.2.1 T-470 (owner 2026-11-13: fill silence): a planned track that has NEVER decoded a frame while
++                     * the video flowed g_born_silent_us (3 s) — the source sends no audio (glo-4 Black_Headline_News, for
++                     * hours): the track is born silent on the house axis (the T-386 deferred-slot pump: encoder-only, no
++                     * graph) so the output carries audio from the start; real audio joins on its content time. Keyed on
++                     * "never decoded", not "no packets": a source whose audio arrives but never decodes is the same */
++                    if (d->single && g_born_silent_us > 0 && d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO &&
++                        !atomic_load_explicit(&g_adec_frame_wc[d->aglobal[k]], memory_order_relaxed) &&
++                        nw - d->v_flow_since_us >= g_born_silent_us) {
++                        if (nw - d->nbs_last_fill_us[k] >= g_nbs_quantum_us) {
++                            d->nbs_last_fill_us[k] = nw;
++                            if ((fs = av_packet_alloc())) {
++                                fs->stream_index = d->astream[k];
++                                fs->flags |= PTV_PKT_FLAG_SLOT_FILL;
++                                if (av_thread_message_queue_send(d->audio_q[k], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
++                                    av_packet_free(&fs);
++                            }
++                        }
++                        continue;
++                    }
 +                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
 +                                           (dw && nw - dw < 5000000 ? 1000000 : 2000000) ||
 +                        nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)
@@ -26831,10 +26994,10 @@ index 0000000000..5c9acdc9f5
 +
 diff --git a/fftools/ptvencoder_hold.c b/fftools/ptvencoder_hold.c
 new file mode 100644
-index 0000000000..19c992a98f
+index 0000000000..3d8bf6d11d
 --- /dev/null
 +++ b/fftools/ptvencoder_hold.c
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,348 @@
 +/*
 + * ptvencoder — hold pictures (2.0.0-pre9, T-078 + T-079).
 + *
@@ -27122,6 +27285,22 @@ index 0000000000..19c992a98f
 +    }
 +}
 +
++/* 2.2.1 T-474: the hold's bars / black / slate picture when the hold has gone past -freeze_max (or -hold black) and the
++ * picture was built in this frame's shape; NULL otherwise (still frozen, nothing built, another shape) */
++AVFrame *ptv_hold_bars_pic(DecodeCtx *d, const AVFrame *frame)
++{
++    HoldPic *hp = d->hr_pic;
++    int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
++    int64_t el  = hs0 ? av_gettime_relative() - hs0 : 0;
++    if (!hp || !hp->pic || hp->fmt < 0 || hs0 != hp->hold_id)
++        return NULL;
++    if (!(g_hold_mode == PTV_HOLD_BLACK || (g_freeze_max_us && el >= g_freeze_max_us)))
++        return NULL;
++    if (hp->pic->width != frame->width || hp->pic->height != frame->height || hp->pic->format != frame->format)
++        return NULL;
++    return hp->pic;
++}
++
 +/* emit_video: a real decoded frame (before the graph). Keeps the freeze picture and the render timeline, and closes
 + * the account of a finished hold. */
 +void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame)
@@ -27135,8 +27314,11 @@ index 0000000000..19c992a98f
 +        return;
 +    if (frame->duration > 0)
 +        d->hr_dur = frame->duration;
-+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-+        d->hr_pts = frame->best_effort_timestamp + d->hr_dur;
++    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
++        d->hr_pts      = frame->best_effort_timestamp + d->hr_dur;
++        d->hr_real_pts = frame->best_effort_timestamp;   /* T-474 */
++        d->hr_real_set = 1;
++    }
 +    /* No picture while real frames flow: at a rejoin the hold lasts until the master shows a fresh frame, and a
 +     * render pushed between real frames would carry the real frame a temporal filter (bwdif) delays by one out
 +     * into the hold slot — no real frame ever reached frame_q and the hold never ended (local, bwdif + two
@@ -30013,10 +30195,10 @@ index 0000000000..996ff6b986
 +}
 diff --git a/fftools/ptvencoder_timeline.c b/fftools/ptvencoder_timeline.c
 new file mode 100644
-index 0000000000..f4ef9e2274
+index 0000000000..37a3f49b7f
 --- /dev/null
 +++ b/fftools/ptvencoder_timeline.c
-@@ -0,0 +1,1087 @@
+@@ -0,0 +1,1165 @@
 +/*
 + * ptvencoder — 2.1 T-409: the program timeline, source stage (M_in).
 + *
@@ -30089,7 +30271,12 @@ index 0000000000..f4ef9e2274
 +                                               * cadence: a lone PES tail handed over after an outage carries the outage) */
 +    int64_t sil_us, sil_wc;                   /* T-463: its last arrival gap >= g_gap_min_us and when it ended (a tail of
 +                                               * several frames arrives back to back after the outage) */
-+    int64_t aw_dk;                            /* T-463: the awaiting event's offset move (its old offset = k - aw_dk) */
++    int64_t aw_dk;                            /* T-463: the awaiting events' offset move (its old offset = k - aw_dk) */
++    int64_t aw_vref;                          /* T-464: the video's path end when the awaited audio's paths were last set
++                                               * (its old and new path move on with the video's content, not the wall) */
++    int     await_more;                       /* T-464: a later program event in this window moved its awaited path */
++    int64_t open_us;                          /* T-466: its path end when the window opened (old_end_us grows with the
++                                               * old-path packets the window holds) */
 +} TlStream;
 +
 +struct PtvTimeline {
@@ -30213,8 +30400,6 @@ index 0000000000..f4ef9e2274
 +    s->ok      = 1;
 +}
 +
-+/* T-463: the stream's own wall silence around its crossing in this window — the largest arrival gap from its last two
-+ * path packets up to its first packet on the new run (a forward step this explains is loss, not a clock of its own) */
 +/* T-463: the stream stepped first, alone, and was repaired as a clock of its own — the video now steps the same: it is on
 + * the new path already; undo its big repair after the release (its held packets are new content: path 3) */
 +static void undo_big_repair(PtvTimeline *t, TlStream *s, int si)
@@ -30232,12 +30417,14 @@ index 0000000000..f4ef9e2274
 +        }
 +}
 +
++/* T-463: the stream's own wall silence around its crossing in this window — the largest arrival gap from its last two
++ * path packets up to its first packet on the new run (a forward step this explains is loss, not a clock of its own) */
 +static int64_t stream_silence(const PtvTimeline *t, const TlStream *s, int si)
 +{
 +    int64_t prev = s->last_wc, w = s->gap1_wc;
++    int i;
 +    if (s->sil_wc && t->open_wc - s->sil_wc <= 1000000)
 +        w = FFMAX(w, s->sil_us);
-+    int i;
 +    for (i = 0; i < t->nheld; i++) {
 +        const TlPkt *h = &t->held[i];
 +        if (h->si != si || h->s_us == AV_NOPTS_VALUE || h->path == 2)
@@ -30374,6 +30561,16 @@ index 0000000000..f4ef9e2274
 +
 +/* a stream was flowing if it delivered within 2 s of the input's last activity before the event (before the silence
 + * the window opened behind, if any) */
++/* 2.2.1 T-475: the event comes out of a real OUTAGE — an input-wide silence of the stall class (>= 3 s) that ended <= 3 s
++ * before this window, or the input still holds. The T-463 rules (the video decides alone, the await, an audio's clock of
++ * its own) assume the pictures were running: after an outage the source restarts / returns and the rules up to rc1
++ * decide (rc2/rc3: a 12 s hole's audio return repaired +11.9 s; cow-1 Adrenaline+ restart after a stall: lip sync +65 s).
++ * PWHT's restart (a 1.1 s input blip) is not an outage */
++static int after_outage(const PtvTimeline *t)
++{
++    return (t->gap_end_wc && t->gap_us >= 3000000 && t->open_wc - t->gap_end_wc <= 3000000) || ptv_src_holding();
++}
++
 +static int flowing(const PtvTimeline *t, const TlStream *s)
 +{
 +    int64_t ref = t->gap_end_wc && t->open_wc - t->gap_end_wc <= 1000000 ? t->gap_end_wc - t->gap_us : t->open_wc;
@@ -30556,7 +30753,7 @@ index 0000000000..f4ef9e2274
 +{
 +    int si, vs = d->vstream, n_aud_cross = 0, n_aud_flow = 0, prog_event = 0, dmg = 0;
 +    int64_t k_old = t->k_us, k_new = t->k_us, J = 0, W = 0, keep = 0, erase = 0, fd = 0, dspan = 0;
-+    int64_t va = AV_NOPTS_VALUE, vb = AV_NOPTS_VALUE, first_new_wc = INT64_MAX, nw = av_gettime_relative();
++    int64_t va = AV_NOPTS_VALUE, vb = AV_NOPTS_VALUE, first_new_wc = INT64_MAX, nw = av_gettime_relative(), vref = 0;
 +    const char *cls = "outlier";
 +    /* T-431: a partner silent through the whole TL_WIN_SIL_US window no longer flows — no partner to wait for (a video
 +     * that crossed alone is then a program event, as with no audio flowing); its next packet re-seeds its path */
@@ -30587,13 +30784,13 @@ index 0000000000..f4ef9e2274
 +            first_new_wc = t->held[si].wc;
 +    /* 2.2.1 T-463: the video opened this window with a big step (win_big: back, or forward beyond its own silence) — the
 +     * video decides the program event alone. A flowing audio that has not crossed with it (yet) is old content after the
-+     * cut: its held packets go out on the old offset (the sound after the last old picture is dropped) and it is awaited
++     * cut: its held packets go out on the old offset and it is awaited
 +     * on its new path (below). Waited for, a partner's own small run decided the window: PATRIOT-World_Harvest_Television
 +     * cow-2 2026-11-12 23:00 CST — the video -41789 s, the audio a +0.12 s hiccup, its crossing 0.5 s later: the video went
 +     * out "labels as sent", hs +8.6 h, ~12 dups/s. Not when an audio flowed into the span a forward step skipped: that is
 +     * the video's own hole (sync_vnull: its PES tail reads its silence ~0, the step "big"). The awaited audio's old-path
 +     * sound goes on on the old offset (release, ingest): the source's audio clock lags its restart, the sound does not */
-+    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !n_aud_cross && n_aud_flow) {
++    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !n_aud_cross && n_aud_flow && !after_outage(t)) {
 +        const TlStream *v = &t->st[vs];
 +        int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
 +        int nowall = atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000;
@@ -30609,8 +30806,12 @@ index 0000000000..f4ef9e2274
 +                vdec = 1;
 +        for (si = 0; si < t->nst && vdec; si++) {
 +            const TlStream *s = &t->st[si];
++            /* T-466: where the audio was when the window OPENED — in the video's hole it had flowed up to the new labels
++             * already (sync_vnull); held packets of a window that waited for it advance old_end_us by the wait (a 3 s
++             * clock step forward of the video alone, the audio on its own clock, read as a hole after a 1.94 s window:
++             * labels as sent, lip sync -3 s for good — vt-ap-own) */
 +            if (s->dense && si != vs && d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-+                jv > 0 && s->ok && s->old_end_us > v->new_first_us - TL_BIG_US)
++                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US)
 +                vdec = 0;
 +        }
 +        for (si = 0; si < t->nst && vdec; si++) {
@@ -30658,9 +30859,12 @@ index 0000000000..f4ef9e2274
 +        W  = (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) ? 0 :
 +             FFMAX(input_wall_gap(t, first_new_wc),
 +                   vlw && first_new_wc != INT64_MAX && first_new_wc - vlw >= g_gap_min_us ? first_new_wc - vlw : 0);
++        /* T-467: damage near the EVENT (the window's open), not its close — a big step's window waits up to 3 s for its
++         * partner; counted from the close, the corrupt datagram at the step aged out and its lost picture was erased with
++         * the step (an own-clock audio 40 ms late for good: vt-ap-ownp, the audio silent inside the window) */
 +        for (si = 0; si < t->nst; si++)
 +            if (t->st[si].res == 1 && d->ts_outl && si < d->nb_streams_open &&
-+                d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < W + 3000000)
++                d->ts_outl[si].dmg_wc && t->open_wc - d->ts_outl[si].dmg_wc < W + 3000000)
 +                dmg = 1;
 +        if (J > 0) {
 +            /* damage hides lost content from the wall evidence (packets keep coming, pictures do not), but no more than
@@ -30678,7 +30882,8 @@ index 0000000000..f4ef9e2274
 +                    const TlStream *s = &t->st[si];
 +                    if (s->dense && si != vs && s->res != 1 &&
 +                        d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && flowing(t, s) && !sil_out &&
-+                        !(d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)) {
++                        !(d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc &&
++                          t->open_wc - d->ts_outl[si].dmg_wc < 3000000)) {
 +                        keep = FFMIN(J, FFMAX((W + fd / 2) / fd * fd, dspan / fd * fd));
 +                        break;
 +                    }
@@ -30739,7 +30944,15 @@ index 0000000000..f4ef9e2274
 +                int64_t slack   = 0;
 +                if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)
 +                    slack = FFMAX(atomic_load_explicit(&g_bank_us, memory_order_relaxed), (int64_t)g_preroll_ms * 1000);
-+                big = vrun && (ret_leg || js < -TL_BIG_US ||
++                /* 2.2.1 T-475: no clock of its own right after the INPUT was silent (an input-wide gap ended <= 3 s before
++                 * this window) or while the input holds — the pictures were not running: a restart / return after an
++                 * outage is the other rules' business (as up to rc1). After an outage the audio's pre-gap PES tail is
++                 * taken as a crossing at the return, its last path packet looks recent and its own silence reads ~0: rc2/
++                 * rc3 repaired a 12 s hole's audio return as a clock of its own (+11.9 s, lip sync -11925 ms for good:
++                 * std sync_gap_12; 2.2.0/rc1: loss), and cow-1 Adrenaline+ (rc2, 2026-11-13 14:45) a source restart
++                 * after a stall (-18.0 / +51.4 / -5.5 s audio-only steps): lip sync +65 s until the next restart */
++                int quiet_in = after_outage(t);
++                big = !quiet_in && vrun && (ret_leg || js < -TL_BIG_US ||
 +                               (js > TL_BIG_US && js - stream_silence(t, s, si) - slack > TL_BIG_US));
 +            }
 +            if (!big && d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)
@@ -30788,12 +31001,27 @@ index 0000000000..f4ef9e2274
 +    /* 2.2.1 T-463: a program event that moved the offset by a clock step: a flowing audio that did not cross with the video
 +     * (yet) is awaited on its new path, the video's step ahead of its old one (ingest) — taken on its old path with the new
 +     * offset, its later crossing went out a second time as a single-stream step */
-+    if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
++    /* T-464: an audio still awaited from an earlier step takes this program event too. It is not classified here (its
++     * packets go out before the window branch, the window's old_end_us is its AWAITED path): its old path stays where
++     * it is, its awaited path moves by the video's step, its old offset by this event's move (close below). Re-awaited
++     * from scratch it kept only this step and an old path = the awaited one (second restart inside the 5 s await) */
++    if (prog_event && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
++        const TlStream *v = &t->st[vs];
++        int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
++        for (si = 0; si < t->nst; si++)
++            if (si != vs && t->st[si].await_j && t->st[si].res != 1) {
++                t->st[si].await_j   += jv - keep;     /* the kept part is content both paths lost, not a clock step */
++                if (t->st[si].aw_vref)            /* the video's reference stays continuous: progress so far kept */
++                    t->st[si].aw_vref += jv - keep;
++                t->st[si].await_more = 1;
++            }
++    }
++    if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !after_outage(t)) {
 +        const TlStream *v = &t->st[vs];
 +        int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
 +        for (si = 0; si < t->nst; si++) {
 +            TlStream *s = &t->st[si];
-+            if (!s->dense || si == vs || s->res == 1 || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
++            if (!s->dense || si == vs || s->res == 1 || s->await_more || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
 +                !((flowing(t, s) && !sil_out) || has_held(t, si)))
 +                continue;
 +            if (s->rep_big && llabs(s->rep_big + jv) < TL_SAME_US) {
@@ -30831,7 +31059,12 @@ index 0000000000..f4ef9e2274
 +            t->ev_wc = nw;
 +        }
 +    }
++    for (si = 0; si < t->nheld; si++)         /* T-464: an awaited audio's own last arrival (the bound on e) */
++        if (t->st[t->held[si].si].await_new && t->held[si].wc > t->st[t->held[si].si].last_wc)
++            t->st[t->held[si].si].last_wc = t->held[si].wc;
 +    ret = release(d, t, k_old, k_new, prog_event, va, vb);
++    if (vs >= 0 && vs < t->nst)               /* T-464: the video's path end now (an awaited audio's paths follow it) */
++        vref = t->st[vs].new_last_us;
 +    /* the paths go on where each stream ended */
 +    for (si = 0; si < t->nst; si++) {
 +        TlStream *s = &t->st[si];
@@ -30843,14 +31076,26 @@ index 0000000000..f4ef9e2274
 +            s->new_last_us += s->rep_new;
 +            s->rep_new = 0;
 +        }
-+        if (s->await_new) {                   /* T-463: awaited on the video's new path, J ahead of its old one */
++        if (s->await_more) {                  /* T-464: still awaited, now J + this step ahead; its old offset moved too */
++            s->await_more = 0;
++            s->aw_dk     += k_new - k_old;
++            if (llabs(s->await_j) < 150000 && llabs(s->aw_dk) < 150000) {
++                s->await_j = s->strag_until_wc = 0;   /* this step brought the program back to its path (near exact) */
++                s->last_us = s->strag_last_us;
++                s->aw_dk   = 0;
++            } else {
++                s->last_us        = s->strag_last_us + s->await_j;
++                s->strag_until_wc = nw + TL_AWAIT_US;
++            }
++            s->ok = 1;                        /* last_wc stays its own last arrival (the bound on e, flowing()) */
++        } else if (s->await_new) {            /* T-463: awaited on the video's new path, J ahead of its old one */
 +            s->await_new      = 0;
-+            s->aw_dk          = t->ev_dk;
++            s->aw_dk          = k_new - k_old;
 +            s->ok             = 1;
 +            s->strag_last_us  = s->old_end_us;
 +            s->strag_until_wc = nw + TL_AWAIT_US;
 +            s->last_us        = s->old_end_us + s->await_j;
-+            s->last_wc        = nw;
++            s->aw_vref        = vref;         /* last_wc: its own last arrival (above), not the close */
 +        } else if (s->res == 1) {
 +            s->await_j = 0;
 +            if (prog_event) {
@@ -30916,16 +31161,31 @@ index 0000000000..f4ef9e2274
 +    s->dense = is_dense(d, si);
 +
 +    /* 2.2.1 T-463: an audio a clock-step program event left behind (await_j = the video's step). A packet nearer its old
-+     * path than the path it is awaited on is old content: under pictures already shown (before the event's last old
-+     * picture end) it goes out on the old offset, after them it is dropped; the awaited path follows it, J ahead. The first
++     * path than the path it is awaited on is old content: it goes out on the old offset (the source's audio clock lags
++     * its restart, the sound does not); the awaited path follows it, J ahead. The first
 +     * packet nearer the new path has crossed: taken as it comes on the new offset (its own A/V offset kept, not judged
 +     * against the video's step). Before the window branch: a window opened meanwhile must not hold old content as new */
 +    if (s->await_j && s->dense && s_us != AV_NOPTS_VALUE) {
-+        int near_old = llabs(s_us - s->strag_last_us) < llabs(s_us - s->last_us);
++        /* T-464: both paths have moved on with the content since they were set — by the video's progress on its path
++         * (not the wall: a delivery stall or burst moves the wall, not the labels). Frozen path ends read an audio
++         * silent for more than half the step as being on the wrong path (3 s back + 2 s silence: its new-path return
++         * went out on the old offset and was "repaired" for good; mirror forward: an own-clock return read as crossed) */
++        const TlStream *v = d->vstream >= 0 && d->vstream < t->nst ? &t->st[d->vstream] : NULL;
++        /* a packet going on at its own cadence on the old path is old whatever the video did (a video stall, a coarse
++         * interleave or a burst moves the video's path between two of its packets — its own arrival gaps stay short);
++         * after its own silence (half the step or more: a new-path return may land on the old cadence by chance, 3 s
++         * silent on a 3 s step back) the paths have moved on by the video's progress, never more than the wall time it
++         * was silent (+0.5 s) */
++        int on_old = s->step_us && s->last_wc && nw - s->last_wc < llabs(s->await_j) / 2 &&
++                     llabs(s_us - (s->strag_last_us + s->step_us)) <= tol_us(s);
++        int64_t e = !on_old && v && v->ok && s->aw_vref && s->last_wc ?
++                    av_clip64(v->last_us - s->aw_vref, 0, nw - s->last_wc + 500000) : 0;
++        int near_old = on_old || llabs(s_us - (s->strag_last_us + e)) < llabs(s_us - (s->last_us + e));
 +        if (near_old && nw < s->strag_until_wc) {
 +            s->strag_last_us = s_us;
 +            s->last_us       = s_us + s->await_j;
 +            s->last_wc       = nw;
++            s->aw_vref       = v && v->ok ? v->last_us : 0;
 +            relabel(d, pkt, 0, -s->aw_dk);    /* the old offset: its sound runs on where it was */
 +            return ptv_demux_dispatch(d, pkt);
 +        }
@@ -30948,7 +31208,7 @@ index 0000000000..f4ef9e2274
 +            return ptv_demux_dispatch(d, pkt);
 +        }
 +        av_log(NULL, AV_LOG_INFO, "[PTV-TL] stream %d: crossed after the video's step %+.3f s (%+.3f s off it)\n",
-+               si, s->await_j / 1e6, (s_us - (s->last_us + s->step_us)) / 1e6);
++               si, s->await_j / 1e6, (s_us - (s->last_us + e + s->step_us)) / 1e6);
 +        s->ok = 0;                            /* crossed: re-seeded on its new path by this packet, labels as they come */
 +        path_take(s, s_us, nw);
 +        s->await_j = s->strag_until_wc = 0;
@@ -31068,7 +31328,7 @@ index 0000000000..f4ef9e2274
 +        t->win_big   = 0;
 +        h->pkt = pkt; h->s_us = s_us; h->k_at = t->k_us; h->wc = nw; h->si = si; h->path = 0;
 +        for (int i = 0; i < t->nst; i++) {     /* a stream the window never classifies keeps its path */
-+            t->st[i].old_end_us = t->st[i].last_us;
++            t->st[i].old_end_us = t->st[i].open_us = t->st[i].last_us;
 +            t->st[i].win_passed = 0;
 +            t->st[i].pass_wc    = 0;
 +        }
