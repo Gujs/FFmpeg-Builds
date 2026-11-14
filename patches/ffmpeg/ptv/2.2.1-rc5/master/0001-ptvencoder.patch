@@ -105,16 +105,65 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..77e6134a3b
+index 0000000000..d7dc9dab0b
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6212 @@
+@@ -0,0 +1,6261 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.1-rc5 — rc4 + audio off the program clock is muted (T-480), the sync check (observe), lipsync= after an adopted offset, a clock step right after an outage (T-481), GPU memory bounded (T-482), the rejoin park (T-472)
++
++**Golden rule (owner 2026-11-14): A/V sync perfect again as soon as possible after any interruption.**
++**An audio whose clock leaves the program clock while pictures run is muted (T-480).** Like a frame synchronizer: silence
++until it is back on the program clock; still off steadily after 10 s (or when the await ends) its offset is adopted —
++at most 10 s of silence, never a silent channel. The rule that repaired a single-stream step on the stream ("a clock of
++its own", rule B) is deleted: measured over 2-3 days on the sandbox it fired 19 times, never on a real own-clock audio
++(TruBLU joint splices, Adrenaline+ = T-475, RAV = T-479). TruBLU-type splices: no silence. PTV_TL_NO_MUTE=1 reverts.
++**lipsync= no longer reads an adopted offset as desync.** It read +10313001 ms for 50 s while in sync on air, which would
++have made sync_check restart a channel that was right.
++**Sync check after an event (observe only).** Once the source is clean after an event, [PTV-SYNCCHK] logs the offset a
++bounded correction would step out; nothing is changed yet (step 5 arms it). PTV_NO_SYNCCHK=1 off.
++**A clock step right after an outage is one program event (T-481).** Input silent ~3 s, then video + PCR +3 s and the
++audio's +3 s a moment later: the audio had kept the outage's hole alone first and the video's step went out "labels as
++sent" — a 4.6 s video PTS hole (2.2.0, rc4). The audio's own kept hole now counts as the partner: kept 3.0 s, erased 3.0 s.
++**GPU memory bounded (T-482, owner).** The frame queues hold GPU pictures (after hwupload / scale), one per rung, and the
++CUDA pools never shrink: fleet VRAM = 315 MB + 12.2 MB x the deepest the queue has been (194 channels, r = 0.99); a stall
++with a catch-up burst parked 160 pictures there for good (cor-1 after 600 h: median 2.2 GB a channel, 0.9 GB after 6 h).
++The decoder now waits while the master queue holds the setpoint + 8 ticks: a backlog stays compressed, nothing is
++dropped, latency and lip sync unchanged. PTV_FQ_BP=0 reverts.
++**Rejoin (T-472).** A LIVE LOSS / NEW DOMAIN return's first picture waits one base cushion; no RE-PRIME while no video
++arrives for 0.5 s (PTV_REPRIME_QUIET=1 reverts).
++Logs: every [PTV-TL] line names its input / slot (in%d).
++Kit: T-479 ~3 s all-source holes (single + mosaic), designed-mute judge (--mute-ok), aflip60 / tl003 / vfirst keys,
++T056_SENSOR_AFTER, T056_FQHW_MAX + T-482 keys.
++
++## 2.2.1-rc4 — rc3 + an ABR size switch survived (T-469), a source without audio carries silence (T-470), the PES tail after bars (T-474), the rc2 regression after outages (T-475)
++
++**After an outage the T-463 rules stay out (T-475, a regression since rc2).** After an input silence of the stall class
++(>= 3 s, ended <= 3 s before the event's window) or while the input holds, the video-decides-alone rule, the await and an
++audio's "clock of its own" no longer apply: the source returns or restarts and the rules up to rc1 decide. rc2/rc3
++repaired a 12 s hole's audio return as a clock of its own (lip sync −11.9 s for good, audio dark 11.5 s; 2.2.0 and rc1
++were right) and a source restart after a stall (cow-1 Adrenaline+ under rc2: lip sync +65 s until the next restart).
++**A picture-size switch is survived (T-469).** An adaptive-bitrate origin (glo-3 Stingray: 256x144 … 1920x1080) switching
++renditions then stalling restarted the channel (exit 4, ~40 a day): the hold repeated the last decoded picture before it
++was fitted to the graph's size, and production's CUDA hwupload rejected it. The freeze picture is now the fitted one; the
++first two pictures of a new size (dropped until three in a row confirm it) keep their place with a repeat of the last
++picture shown — no 0.12 s video gap at every switch — never while holding, keeping the damage mark, without captions.
++**A planned audio track that never decodes carries silence (T-470, owner).** A source sending no audio (glo-4
++Black_Headline_News for hours) gave a video-only output and a watchdog restart every 7.5 min. When a planned track has
++decoded nothing while the video flowed 3 s (PTV_BORN_SILENT_MS, 0 = off) it is born silent on the house axis; real audio
++joins on its content time in lip sync. Single input; mosaic slots follow.
++**After bars, no old picture flashes back (T-474).** The pre-gap PES tail lavf hands out with the first post-gap packet
++ended the hold and showed the old frozen picture between the bars and the returning content; it now keeps its time and
++carries the hold picture. Residual: a return in a new rendition keeps one such picture.
++Test parity: -init_hw_device videotoolbox gives a hwupload graph its device (macOS stand-in of the CUDA path).
++Kit: production-scan keys (cap-zenlife, cap-bhn, size switches with holes / stalls / loss / captions, holes, born-silent
++join, outage restarts), judges graphsize / stalecheck / ccdup / hscheck, --abs-baseline-ms.
 +
 +## 2.2.1-rc3 — rc2 + the await follows the content (T-464) + a small forward step of the video alone (T-466) + damage at a step judged at its open (T-467)
 +
@@ -6323,10 +6372,10 @@ index 0000000000..77e6134a3b
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..309a968e6a
+index 0000000000..ddab0f356b
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,7754 @@
+@@ -0,0 +1,7880 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6376,7 +6425,7 @@ index 0000000000..309a968e6a
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.1-rc3"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.1-rc5"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -6427,6 +6476,7 @@ index 0000000000..309a968e6a
 +int     g_pestail = 1;             /* 2.0.0-pre4c: see ptvencoder_demux.c (PES-TAIL carry) */
 +int     g_rlcheck = 1;             /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 +int     g_rlundo = 1;              /* 2.0.2 T-395: a silent no-verdict audio erase is undone (PTV_NO_RLUNDO=1 off) */
++int     g_synchk = 1;              /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
 +double  g_rl_relabel_max = 0.3;    /* 2.0.2 T-391: a RELABEL verdict needs the repeat correlation below this (PTV_RL_RELABEL_MAX; 2.0.1: 0.5) */
 +int     g_voutlier = 1;            /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 +_Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
@@ -6548,6 +6598,10 @@ index 0000000000..309a968e6a
 +_Atomic int64_t g_vdisp_skew_us;   /* 2.0.0 T-095: master: (vpts - content index) of the last fresh frame, us */
 +_Atomic int64_t g_dup_out_us;   /* 2.0.0-pre9.4 (T-083): output time on ticks whose content did not advance */
 +int             g_rejoin_map = 1;
++int             g_rj_prime = 1;          /* 2.2.1 T-472 (ptvencoder.h) */
++int             g_reprime_quiet_off = 1; /* 2.2.1 T-472: no RE-PRIME while no video arrives; PTV_REPRIME_QUIET=1 reverts */
++_Atomic int     g_rj_hold_seq0, g_rj_parking;
++_Atomic int64_t g_rj_prime_us;
 +int64_t         g_hold_clean_us = 1000000;
 +int             g_vo_hold = 1;   /* 2.0.0-pre9.8 (T-076): audio keeps its own clock while only the video is gone; PTV_NO_VO_HOLD=1 off */
 +int64_t g_rscorr_slew_fast      = 5000;            /* pre29 adaptive corrector slew above 150ms |R|
@@ -6876,6 +6930,16 @@ index 0000000000..309a968e6a
 + * State is quantized + hysteretic (grow needs recurrence in 1h, shrink needs 6h silence) -> no
 + * oscillation, no per-channel tuning; transitions log [PTV-CUSHION] and depth shows in -stats. */
 +int             g_adapt_cushion = 1;
++/* 2.2.1 T-482 (owner 2026-11-14: GPU memory as lean as the ffmpeg CLI): the frame queues hold pictures AFTER the graph
++ * (hwupload + scale_cuda = GPU pictures), one copy per rung, and the CUDA pools never give a picture back. Fleet-measured
++ * (194 channels, r=0.99): VRAM = 315 MB + 12.2 MB x the deepest the queue has ever been — a stall + catch-up burst parked
++ * 160 pictures there for good (std sync_stop_10: 6.4 s; cor-1 after 600 h: median 2.2 GB a channel vs 0.9 GB after 6 h).
++ * The master publishes the setpoint + 8 ticks (in pictures) and the decoder waits while the master queue holds that
++ * many: a backlog stays COMPRESSED in video_q (what a frame synchronizer does), nothing is dropped, every timing reading
++ * that counts video_q + frame_q is unchanged. PTV_FQ_BP=0 reverts. */
++_Atomic int     g_fq_bp_lim;
++_Atomic int     g_fq_bp_wait;                 /* T-482: the decoder is waiting (video_q = backlog the servo counts) */
++int             g_fq_bp = 1;
 +_Atomic int     g_frameq_depth;               /* DIAG: master video frame_q occupancy (frames), published each tick for the discontinuity logs */
 +_Atomic int64_t g_vdmg_wc;                       /* 2.0.0-pre9.4 (T-083): wall time of the last corrupt video packet/frame */
 +_Atomic int64_t g_vcorrupt_wc;                   /* 2.0.0 T-324: ... corrupt DATA only (no timeline step): the hold's clean rule */
@@ -7070,6 +7134,8 @@ index 0000000000..309a968e6a
 +int     g_copy_gapfill = 1;                    /* 2.0.0-pre9.4 (T-083): copied AC-3 gap fill / overlap drop */
 +int     g_glue_htol = 5;                       /* §2.3 |H−1| tolerance, % (fixture-tuned, G4) */
 +int64_t g_nbs_quantum_us = 100000;             /* fill quantum: 100ms of silence per sentinel */
++int64_t g_born_silent_us = 3000000;            /* 2.2.1 T-470: a planned track never decoded after this much video flow is
++                                                * born silent (PTV_BORN_SILENT_MS, 0 = off) */
 +_Atomic int64_t g_acorrupt;
 +_Atomic int64_t g_adamage_wc[PTV_MAX_AUDIO];   /* 2.0.0-pre9.3 (T-080 A2) */
 +_Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO], g_rl_wc[PTV_MAX_AUDIO], g_rl_seq[PTV_MAX_AUDIO], g_rl_undone[PTV_MAX_AUDIO];   /* 2.0.1 T-087 */
@@ -9141,6 +9207,14 @@ index 0000000000..309a968e6a
 +    qn   = d->frame_q[0] ? av_thread_message_queue_nb_elems(d->frame_q[0]) : 0;
 +    next = atomic_load_explicit(&g_house_out_us, memory_order_relaxed) + tick * (1 + qn);   /* a frame that misses
 +                                                                                              * its tick costs one dup */
++    /* 2.2.1 T-472: a LIVE LOSS / NEW DOMAIN return is shown one base cushion from now, not on the next tick — the
++     * output threads wait that long with it while the frame queue fills (rj_prime_park). Only the rest of the lead is
++     * mapped; a lead inside the cushion is not mapped at all and the picture waits for its own slot. */
++    if (ptv_rj_prime_class()) {
++        int64_t pr = atomic_load_explicit(&g_rj_prime_us, memory_order_relaxed);
++        if (pr > tick * (1 + qn))
++            next += pr - tick * (1 + qn);
++    }
 +    lead = pos - next;
 +    if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
 +        d->rj_dbg_n++;
@@ -9218,12 +9292,66 @@ index 0000000000..309a968e6a
 +    return 0;
 +}
 +
++/* 2.2.1 T-482: wait while the master queue holds the published limit (see g_fq_bp_lim). A master that takes no picture
++ * for 2 s (an output stall) releases it until the queue is below the limit again: the old drop-oldest backstop. */
++static void fq_backpressure(DecodeCtx *d)
++{
++    int64_t t0 = 0;
++    int lim;
++    if (!d->live || !d->frame_q[0])
++        return;
++    while ((lim = atomic_load_explicit(&g_fq_bp_lim, memory_order_relaxed)) > 0 &&
++           av_thread_message_queue_nb_elems(d->frame_q[0]) >= lim) {
++        int64_t nw = av_gettime_relative();
++        if (d->bp_off)
++            return;
++        atomic_store_explicit(&g_fq_bp_wait, 1, memory_order_relaxed);
++        if (!t0)
++            t0 = nw;
++        else if (nw - t0 > 2000000) {
++            d->bp_off = 1;
++            atomic_store_explicit(&g_fq_bp_wait, 0, memory_order_relaxed);
++            av_log(NULL, AV_LOG_WARNING, "[PTV-FQBP] the output took no picture for 2 s with %d queued — "
++                   "back-pressure released until the queue drains\n", lim);
++            return;
++        }
++        av_usleep(2000);
++    }
++    atomic_store_explicit(&g_fq_bp_wait, 0, memory_order_relaxed);
++    d->bp_off = 0;
++}
++
 +static void emit_video(DecodeCtx *d, AVFrame *frame, AVFrame *filt)
 +{
 +    int i;
++    fq_backpressure(d);
 +    if (!hold_clean_pass(d, frame)) {
 +        av_frame_unref(frame);
 +        return;
++    }
++    /* 2.2.1 T-474: a picture that CONTINUES the last real pre-hold picture (within two picture steps) while the hold already
++     * shows bars / black is the pre-gap PES tail lavf hands out with the first post-gap packet (T-074): it ends the hold
++     * (the state machine needs it) but its PICTURE was the old frozen one flashed back on air after the bars (1 picture on
++     * a plain 12 s hole; 9 when the return came in a new rendition: the tail + its dups + the T-469 repeats of it). It
++     * keeps its time and its place; it carries the hold's picture. (Dropping it instead broke the rejoin: rc4-dev4.) */
++    /* only while still holding: after a STOP/CONT the returning content CONTINUES the pre-gap timeline (delayed, not
++     * lost) — carrying the hold picture on every continuing frame put bars on air for good (rc4-dev9: sync_stop_10 /
++     * kill_return_20 live share 0.01). Residual: a return in a new rendition keeps one stale picture (vt-vsw-bars) */
++    if (g_hold_render && d->hr_real_set && d->hr_dur > 0 && ptv_src_holding() && ptv_hold_bars_pic(d, frame)) {
++        int64_t dt = frame->best_effort_timestamp - d->hr_real_pts;
++        if (frame->best_effort_timestamp != AV_NOPTS_VALUE && dt > 0 && dt <= 2 * d->hr_dur) {
++            AVFrame *bp = ptv_hold_bars_pic(d, frame);
++            AVFrame *rp = bp ? av_frame_clone(bp) : NULL;
++            if (rp && av_frame_copy_props(rp, frame) >= 0) {
++                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 a pre-gap picture (+%.0f ms after the last one shown) after "
++                       "the bars carries the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
++                av_frame_side_data_free(&rp->side_data, &rp->nb_side_data);
++                rp->opaque = NULL;
++                av_frame_unref(frame);
++                av_frame_move_ref(frame, rp);
++            }
++            av_frame_free(&rp);
++        }
 +    }
 +    rejoin_map(d, frame);                /* 2.0.0-pre6.1 (single input: emit_video is the non-mosaic path) */
 +    {   /* 2.0.0-pre9.4 (T-083): a frame decoded within 5 s of corrupt video is damage-era — the output clock fills a
@@ -9234,7 +9362,8 @@ index 0000000000..309a968e6a
 +        if (dw && av_gettime_relative() - dw < 5000000)
 +            av_dict_set(&frame->metadata, "ptv_dmg", "1", 0);
 +    }
-+    ptv_hold_note_frame(d, frame);       /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
++    if (!d->filtering)                   /* (with a graph: the FITTED picture, below — T-469) */
++        ptv_hold_note_frame(d, frame);   /* 2.0.0-pre9: the freeze picture + render timeline (T-078/T-079) */
 +    if (!d->filtering) {                 /* no graph: clone the decoded frame to each rung */
 +        if (frame->best_effort_timestamp != AV_NOPTS_VALUE)   /* source time in ist_tb (== out_tb) */
 +            frame->pts = frame->best_effort_timestamp;
@@ -9344,6 +9473,32 @@ index 0000000000..309a968e6a
 +                    fflush(NULL);
 +                    _exit(4);
 +                }
++                /* 2.2.1 T-469: the dropped picture keeps its place on the timeline — the last picture the graph took,
++                 * stamped with this one's time (a drop left a 0.12 s video PTS hole + a PCR gap at every rendition
++                 * switch, vt-vsw: the first two pictures of each new size). A lone damaged picture is still never shown */
++                /* not while the source holds (bars / black after -freeze_max: a return in another rendition must not
++                 * show the pre-outage picture again); the repeat keeps the dropped picture's damage mark (the output
++                 * clock fills a gap in front of damage, leaps in front of anything else) and carries no captions (A/53
++                 * side data of the old picture would be sent twice) — Fable 5.2 review of T-469 */
++                if (d->hr_last && d->hr_last->width == in->w && d->hr_last->height == in->h &&
++                    d->hr_last->format == in->format && !ptv_src_holding()) {
++                    AVFrame *rp = av_frame_clone(d->hr_last);
++                    if (rp) {
++                        int64_t bet = frame->best_effort_timestamp, dur = frame->duration;
++                        int dmg = av_dict_get(frame->metadata, "ptv_dmg", NULL, 0) != NULL;
++                        av_frame_move_ref(frame, rp);
++                        av_frame_free(&rp);
++                        frame->best_effort_timestamp = bet;
++                        frame->pkt_dts = AV_NOPTS_VALUE;
++                        if (dur > 0)
++                            frame->duration = dur;
++                        frame->flags &= ~AV_FRAME_FLAG_KEY;
++                        frame->opaque = NULL;
++                        av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
++                        av_dict_set(&frame->metadata, "ptv_dmg", dmg ? "1" : NULL, 0);
++                        goto feed;
++                    }
++                }
 +                return;
 +            }
 +        } else
@@ -9364,6 +9519,12 @@ index 0000000000..309a968e6a
 +            _exit(4);
 +        }
 +    }
++feed:
++    /* 2.2.1 T-469: the freeze picture is the one the graph takes — FITTED to its input size. Noted before the fit, a hold
++     * right after a rendition switch pushed a picture of another size into the graph: CUDA's hwupload failed ("Frame size
++     * or format changed without filter graph reinitialization"), [PTV-VGRAPH] exit 4 (glo-3 Stingray ~40 restarts/day;
++     * a VideoToolbox / software graph re-sized itself instead: vt-vsw-hole GRAPHSIZE FAIL) */
++    ptv_hold_note_frame(d, frame);
 +    frame->pts = frame->best_effort_timestamp;   /* carry source time through the graph */
 +    if (av_buffersrc_add_frame(d->fsrc, frame) < 0)   /* consumes frame */
 +        return;
@@ -12033,6 +12194,15 @@ index 0000000000..309a968e6a
 +        av_log(NULL, AV_LOG_INFO,
 +               "ptvencoder: CUDA device %s (hwupload + deint + scale + nvenc all share it; created in %.1f s%s)\n",
 +               *ordbuf ? ordbuf : "0", dus / 1e6, g_cudadev.started ? " while the inputs opened" : "");
++    } else if (fcomplex && strstr(fcomplex, "hwupload") && hwdev && strstr(hwdev, "videotoolbox")) {
++        /* 2.2.1 T-469: -init_hw_device videotoolbox + a graph that uploads (hwupload, scale_vt) — the macOS stand-in of
++         * production's GPU path (hwupload + scale_cuda), so a test sees hwupload's real behaviour on a new picture size
++         * (a software scale re-configures by itself). Without a device hwupload cannot init at all */
++        if ((ret = av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0)) < 0) {
++            av_log(NULL, AV_LOG_ERROR, "cannot create the VideoToolbox device: %s\n", av_err2str(ret));
++            goto end;
++        }
++        av_log(NULL, AV_LOG_INFO, "ptvencoder: VideoToolbox device for the filter graph (hwupload)\n");
 +    }
 +
 +    /* shared filter graph: -filter_complex (N video inputs -> split/mosaic ->
@@ -13737,6 +13907,7 @@ index 0000000000..309a968e6a
 +    if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 2.0.0-pre4c: PES-tail carry off */
 +    if (getenv("PTV_NO_RLCHECK")) g_rlcheck = 0;   /* 2.0.1 T-087: relabel content check off */
 +    if (getenv("PTV_NO_RLUNDO")) g_rlundo = 0;     /* 2.0.2 T-395: keep a silent no-verdict audio erase (2.0.1 behaviour) */
++    if (getenv("PTV_NO_SYNCCHK")) g_synchk = 0;    /* 2.2.1 T-480: no [PTV-SYNCCHK] lines (it only observes) */
 +    if (getenv("PTV_RL_RELABEL_MAX")) g_rl_relabel_max = atof(getenv("PTV_RL_RELABEL_MAX"));   /* 2.0.2 T-391 */
 +    if (getenv("PTV_NO_VOUTLIER")) g_voutlier = 0; /* 2.0.1 T-383: video timestamp outlier restamp off */
 +    { const char *s = getenv("PTV_RSCORR_SLEW_FAST");     if (s) g_rscorr_slew_fast = atoi(s) > 0 ? atoi(s) : 0; }  /* 0 = disabled (always the base clamp) */
@@ -13809,6 +13980,7 @@ index 0000000000..309a968e6a
 +    if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
 +    /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
 +     * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
++    { const char *bp = getenv("PTV_FQ_BP"); if (bp && !atoi(bp)) g_fq_bp = 0; }   /* 2.2.1 T-482 */
 +    { const char *fq = getenv("PTV_FRAMEQ"); if (fq && atoi(fq) > 0) { int v = atoi(fq); if (v < PTV_FRAME_QDEPTH) v = PTV_FRAME_QDEPTH; if (v > 1024) v = 1024; g_frameq_cap = v; } }   /* frame_q (decode->output) capacity; raise + deep PTV_PREROLL_MS to absorb an ad-break decode-rate dip (AWE) */
 +    {   /* 0.9.16.5 postmortem guard: a frame_q deeper than the NVENC registration cache makes every
 +         * frame past the cache evict+re-register = 2 RM WRITE ioctls/frame/rung — at fleet scale that
@@ -13867,8 +14039,11 @@ index 0000000000..309a968e6a
 +    if (getenv("PTV_CC_NO_REWRAP")) g_cc_rewrap = 0;   /* 2.0.0 T-023(b) */
 +    { const char *hc = getenv("PTV_HOLD_CLEAN_MS"); if (hc) g_hold_clean_us = (int64_t)atoi(hc) * 1000; }   /* 2.0.0 T-324 */
 +    if (getenv("PTV_NO_REJOIN_MAP")) g_rejoin_map = 0; /* 2.0.0-pre6.1 kill switch: PTS jumps at a rejoin again */
++    if (getenv("PTV_NO_RJ_PRIME")) g_rj_prime = 0;
++    if (getenv("PTV_REPRIME_QUIET")) g_reprime_quiet_off = 0;   /* 2.2.1 T-472 kill switch */     /* 2.2.1 T-472 kill switch: a rejoin starts on an empty frame queue */
 +    { const char *s = getenv("PTV_GLUE_HTOL_PCT");     if (s && atoi(s) > 0) g_glue_htol = atoi(s); }             /* tuning knob (G4) */
 +    { const char *s = getenv("PTV_NBS_QUANTUM_MS");    if (s && atoi(s) > 0) g_nbs_quantum_us = (int64_t)atoi(s) * 1000; }  /* TEST ONLY (G8) */
++    { const char *s = getenv("PTV_BORN_SILENT_MS");    if (s && atoi(s) >= 0) g_born_silent_us = (int64_t)atoi(s) * 1000; }  /* T-470 */
 +    /* TEST-ONLY overrides (PTV_WRAP_GUARD_S precedent): shorten the dwell/quiet windows or move
 +     * the band/slew so the F-gate fixtures can exercise storm/authority paths in bounded wall
 +     * time. NEVER set in production — the 5min/3min/80ms/2ms/s defaults are the owner-approved
@@ -14083,10 +14258,10 @@ index 0000000000..309a968e6a
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..c63278ae77
+index 0000000000..46b96216ae
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2209 @@
+@@ -0,0 +1,2268 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -14439,6 +14614,11 @@ index 0000000000..c63278ae77
 +    _Atomic int64_t uev_us[PTV_MAX_INPUT];  /* per-slot VIDEO unevidenced deletions */
 +    _Atomic int64_t uea_us[PTV_MAX_AUDIO];  /* per-track AUDIO unevidenced deletions (demux side;
 +                                             * the door adds its own AudioState.u_door_us) */
++    /* 2.2.1 T-480 (the sync check, observe only): the part of ea_us that is the offset of an audio on a clock of its
++     * own (the timeline's rep_big: placed by design, no desync), and the input's [PTV-TL] event number. The slot's
++     * demux thread writes both (ptv_tl_ingest) */
++    _Atomic int64_t eo_us[PTV_MAX_AUDIO];
++    _Atomic int64_t tl_ev[PTV_MAX_INPUT];
 +    int             n_a;                    /* transcoded tracks wired (pre16: = n_audio ALWAYS, mv included) */
 +    int             a_in[PTV_MAX_AUDIO];    /* track → input slot map (stats printers; plain int,
 +                                             * set in transcode() before threads spawn) */
@@ -14509,6 +14689,25 @@ index 0000000000..c63278ae77
 +                                     * process (10s of trim failed to close R — re-arming would
 +                                     * walk the same doomed staircase); logged once at the cap */
 +} CorrState;
++
++/* 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY: see synchk_update() in ptvencoder_audio.c.
++ * One per transcoded track, owned by its audio thread. */
++typedef struct SyncChk {
++    int         init;               /* the feeds are snapshotted (the first frame = event "start") */
++    int         watch;              /* an event is waiting for its decision */
++    int         paired;             /* this frame's sound found its picture in the vring (set by the pairing) */
++    int64_t     ev_n;               /* this track's events so far (the id on the line) */
++    const char *ev_why;             /* ... what the last one was */
++    int64_t     ev_wc;              /* ... and its wall time */
++    int64_t     epoch_snap, tl_snap, led_snap, rejoin_snap;     /* event feeds, consumed */
++    int         glue_snap, afmt_snap, reopen_snap, fill_snap, slate_snap;
++    int64_t     hs_last, hs_wc;     /* single input: house_skew at the last frame, wall time of its last step */
++    int64_t     dirty_wc;           /* the source is clean since here (the last event, damage, hold, fill ...) */
++    int64_t     agree_wc, lo, hi;   /* the readings agree since here, within [lo, hi] */
++    int         n;                  /* ... this many of them */
++    int64_t     led, own, last;     /* the last reading: its ledger part, the exempt own-clock offset, the sum */
++    int64_t     log_wc;             /* PTV_DIAG: the last "undecided" line */
++} SyncChk;
 +
 +/* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
 + * Holds the per-run wiring every escalation event needs (the per-rung delivery gates, the
@@ -14853,6 +15052,7 @@ index 0000000000..c63278ae77
 +    int              live;
 +    VideoHold       *hold;                    /* multiview: stage frames here (NULL = filter inline) */
 +    int64_t          rj_hold_id;              /* 2.0.0-pre6.1: the hold the rejoin map last armed for */
++    int              bp_off;                  /* 2.2.1 T-482: back-pressure gave up (the master stopped taking pictures) */
 +    int              rj_done;                 /* ... and whether it was applied */
 +    int64_t          hc_hold_id, hc_since, hc_flag_since, hc_last;   /* 2.0.0 T-324: the damaged hold's clean runs: frames
 +                                              * continuous / no corrupt data (wall us) */
@@ -14877,6 +15077,8 @@ index 0000000000..c63278ae77
 +    /* 2.0.0-pre9 (T-078/T-079): hold pictures rendered through the graph while input 0 holds */
 +    AVFrame         *hr_last;                 /* ref of the last decoded frame (single input; shape + freeze picture) */
 +    int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
++    int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
++    int              hr_real_set;
 +    int64_t          hr_next;                 /* wall us of the next render */
 +    struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
 +    /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -15280,6 +15482,7 @@ index 0000000000..c63278ae77
 +     * evaluation, never corrupts state). afmt_rebuilds counts [PTV-AFMT] path rebuilds — a
 +     * rebuild is an event (§4.4). */
 +    CorrState        corr;
++    SyncChk          sc;                              /* 2.2.1 T-480: the post-event sync check (observe only) */
 +    _Atomic int_least64_t *corr_epoch;                /* -> Input.house_disturb (event feed) */
 +    int              afmt_rebuilds;                   /* [PTV-AFMT] rebuild count (corrector event feed) */
 +    /* 1.0.1-pre16: per-input event feeds (this track's OWN input slot; NULL → global
@@ -15840,6 +16043,7 @@ index 0000000000..c63278ae77
 +extern int     g_dmgstat;   /* 2.0.2 T-402: no step / cadence statistics across corrupt-discarded packets (PTV_NO_DMGSTAT=1 off) */
 +extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 +extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
++extern int     g_synchk;    /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
 +extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 +extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 +/* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
@@ -15953,6 +16157,9 @@ index 0000000000..c63278ae77
 +extern int     g_adapt_cushion;
 +extern CushionPlan g_cp;                 /* defined in ptvencoder_gate.c */
 +extern _Atomic int     g_frameq_depth;
++extern _Atomic int     g_fq_bp_lim;
++extern _Atomic int     g_fq_bp_wait;
++extern int             g_fq_bp;
 +extern _Atomic int64_t g_fq0_tail_pts;
 +extern _Atomic int64_t g_vdmg_wc;
 +extern _Atomic int64_t g_vcorrupt_n, g_hold_vcorrupt_n0;   /* 2.0.0 T-324: corrupt video events; the count when the hold began */
@@ -15986,6 +16193,7 @@ index 0000000000..c63278ae77
 +extern const char      ptv_hold_tag;     /* &ptv_hold_tag in AVFrame.opaque marks a rendered hold picture */
 +int  ptv_hold_slate_load(const char *path);
 +void ptv_hold_render(DecodeCtx *d);      /* decode thread, video_q empty: render one picture when due */
++AVFrame *ptv_hold_bars_pic(DecodeCtx *d, const AVFrame *frame);   /* 2.2.1 T-474 */
 +void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame);   /* emit_video: a real decoded frame */
 +void ptv_hold_route(AVFrame *out, int rung);   /* a rendered picture leaving the graph → the rung's slot */
 +AVFrame *ptv_hold_cell_pic(void **state, const AVFrame *ref, int64_t elapsed_us);   /* 2.0.0: a dead mosaic cell's
@@ -16075,6 +16283,28 @@ index 0000000000..c63278ae77
 +{
 +    return g_src_hold_act && atomic_load_explicit(&g_src_state, memory_order_relaxed);
 +}
++/* 2.2.1 T-472: the cushion is primed again at a LIVE LOSS / NEW DOMAIN rejoin. The output played its frame queue out
++ * into the hole, and the rejoin map put the first returning picture on the very next house tick: an empty queue for
++ * good (sync_holes: content age 1.74 s -> 0.97 s, refilled at ~1 % by the servo; house_skew -2.24 s). Now the map leaves
++ * the base cushion's worth of the lead unmapped (g_rj_prime_us, the master's sp_cap(base_sp) in house time) and each
++ * rung's output thread keeps repeating until the returning picture's own slot comes up (g_rj_parking: the master is
++ * doing so), while the queue fills behind it. Never more than the lead, so no latency is added; a BURST rejoin and a
++ * STOP/CONT catch-up (content behind the house) are not touched. PTV_NO_RJ_PRIME=1 = off. */
++extern int             g_rj_prime;
++extern int             g_reprime_quiet_off;     /* T-472: no RE-PRIME while no video arrives (ptvencoder_clock.c) */
++extern _Atomic int     g_rj_hold_seq0;           /* master: g_rj_cls_seq when the current / last hold began */
++extern _Atomic int     g_rj_parking;
++extern _Atomic int64_t g_rj_prime_us;
++static inline int ptv_rj_prime_class(void)      /* this hold's rejoin is classified, and not as BURST */
++{
++    int cls;
++    if (!g_rj_prime || !g_src_hold_act ||
++        atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire) ==
++        atomic_load_explicit(&g_rj_hold_seq0, memory_order_relaxed))
++        return 0;
++    cls = atomic_load_explicit(&g_rj_cls, memory_order_relaxed);
++    return cls == 2 || cls == 3;
++}
 +/* 2.0.0-pre8.5: has house_skew taken its post-rejoin value? (cls_seq0 = g_rj_cls_seq when the fill began.) BURST at
 + * once; LIVE LOSS when the master showed the content jump; NEW DOMAIN at the jump or 200 ms after the rejoin (LAYERA
 + * re-bases it). Shared by the transcoded rejoin buffer and the copied-audio park, so the two cannot drift apart again
@@ -16089,7 +16319,9 @@ index 0000000000..c63278ae77
 +    switch (atomic_load_explicit(&g_rj_cls, memory_order_relaxed)) {
 +    case 1:  return 1;
 +    case 2:  return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj;
-+    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj || now - rj > 200000;
++    default: return atomic_load_explicit(&g_src_jump_wc, memory_order_relaxed) >= rj ||
++                    (now - rj > 200000 &&                 /* 2.2.1 T-472: not while the returning picture still waits */
++                     !atomic_load_explicit(&g_rj_parking, memory_order_acquire));
 +    }
 +}
 +/* 2.0.0 T-315: has the input come back as a BURST (a sender catching up a pause) since cls_seq0? Only then are frames
@@ -16159,6 +16391,7 @@ index 0000000000..c63278ae77
 +extern int     g_copy_gapfill;           /* 2.0.0-pre9.4 (T-083): copied AC-3 stays continuous while video flows
 +                                          * (PTV_NO_COPY_GAPFILL=1 off) */
 +extern int     g_glue_htol;              /* §2.3 label-health tolerance, percent (5; PTV_GLUE_HTOL_PCT — TEST/tuning) */
++extern int64_t g_born_silent_us;         /* 2.2.1 T-470: born-silent threshold (0 = off) */
 +extern int64_t g_nbs_quantum_us;         /* fill quantum (100ms; PTV_NBS_QUANTUM_MS — TEST ONLY, G8) */
 +extern _Atomic int64_t g_acorrupt;                        /* total corrupt-discarded AUDIO pkts (acor= stats) */
 +extern _Atomic int64_t g_rl_step_us[PTV_MAX_AUDIO];      /* 2.0.1 T-087: per global track, the edit the demux posted with its
@@ -16269,6 +16502,7 @@ index 0000000000..c63278ae77
 +void ptv_vwait_rebase(DemuxArgs *d, int64_t from_us, int64_t old_end_us, int64_t open_wc, int64_t open_pos,
 +                      int64_t open_vn, int64_t dpo);
 +int  ptv_tl_settling(DemuxArgs *d);
++int  ptv_tl_muted(DemuxArgs *d, int si);   /* 2.2.1 T-480: the stream is off the program clock, its packets not sent */
 +extern int64_t g_gap_min_us;
 +int ptv_slot_acquire(struct Input *in, int idx);   /* 2.0.2 T-386 */
 +/* ptvencoder_mv.c */
@@ -16298,10 +16532,10 @@ index 0000000000..c63278ae77
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..e9786f2bb3
+index 0000000000..82c5977445
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,3815 @@
+@@ -0,0 +1,4040 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -16526,7 +16760,12 @@ index 0000000000..e9786f2bb3
 +    if (!r.mv_wall || !r.ma_wall || now - r.mv_wall > 3000000 || now - r.ma_wall > 3000000)
 +        return r;
 +    r.L_us = atomic_load_explicit(&g_rsx.ev_us[in], memory_order_relaxed)
-+           - atomic_load_explicit(&g_rsx.ea_us[k],  memory_order_relaxed);
++           - atomic_load_explicit(&g_rsx.ea_us[k],  memory_order_relaxed)
++           + atomic_load_explicit(&g_rsx.eo_us[k],  memory_order_relaxed);   /* 2.2.1 T-480: an adopted clock of its own
++                                                                              * (rep_big) is the stream's own timing, not a
++                                                                              * desync: lipsync= read +10313001 ms through
++                                                                              * aflip60's adopted offset (in sync on air) —
++                                                                              * sync_check would have restarted it */
 +    r.R_us = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed) - a->rs_ma_ema + r.L_us;
 +    if (g_rscorr_testwalk_us_s == 0) {
 +        const char *tw = getenv("PTV_RSCORR_TESTWALK");
@@ -17107,6 +17346,200 @@ index 0000000000..e9786f2bb3
 +    a->glue_events++;                   /* corrector event edge: it re-dwells fresh */
 +    a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
 +}
++
++/* ===================== 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY =====================
++ * After every event on a track's input, once its source is clean again, read the track's A/V offset from the terms
++ * that are exact at once and say what ONE bounded step would do. Nothing is changed here: one [PTV-SYNCCHK] line per
++ * (track, event). R = vring + ledger  [+ = audio early, the stats line's lipsync= convention]:
++ *   vring  = out_v(C) - out_a(C) for the same label C, per emitted frame, no averaging (av_offset_us): the PLACEMENT
++ *            error (a hold's rejoin, the door, the slot's delay line). Blind to label edits by construction
++ *   ledger = (ev - ea) + own + relabels - glue_off: what was done to the LABELS of this stream and not to the video's.
++ *            ev / ea = the demux ledgers; own = the offset of an audio on a clock of its own (the timeline's rep_big:
++ *            its placement by design, part of ea); relabels = the erases the content check judged relabels (T-087,
++ *            rl_neutral_us); glue_off = this door's own label steps. Exact, step-accurate
++ * This is the sensor's R (m_v - m_a + ev - ea) without its two ~30 s averages — where the false readings after an
++ * event live (the decaying reading after a kept hole, T-446; the re-seeds) — so a step taken as glue_off += R retires
++ * exactly R ([PTV-ANCHOR] algebra, ptv_label_step). A resampler slip (rs_slip_us) is waited out, not added.
++ * Event  = any feed below moved (synchk_event). Clean = this track's own input only, no sibling (synchk_unclean).
++ * Decision = PTV_SC_CLEAN_US clean and PTV_SC_AGREE_US of paired readings within +-PTV_SC_TOL_US.
++ * PTV_NO_SYNCCHK=1 off. */
++#define PTV_SC_CLEAN_US   3000000   /* the source is clean after this long with no event, damage, hold or fill */
++#define PTV_SC_AGREE_US   2000000   /* ... and a decision needs the readings to agree for this long */
++#define PTV_SC_TOL_US       10000   /* ... within +- this */
++#define PTV_SC_MIN_N           20   /* ... over at least this many paired frames */
++#define PTV_SC_BAND_US      25000   /* in sync within this (the golden rule's bound) */
++#define PTV_SC_CAP_US     5000000   /* a step beyond this would never be taken */
++#define PTV_SC_BUDGET_US 10000000   /* decided within this of a clean source, or said so (once) */
++#define PTV_SC_HS_US      4000000   /* single input: a house_skew step is in flight through a buffering -af filter
++                                     * (loudnorm, 3 s) this long: the frames at the sink still carry the old value */
++
++/* An event on this track's input. Every feed is read and consumed, so one event with several faces fires once; the
++ * most specific name wins. NULL = none. */
++static const char *synchk_event(AudioState *a)
++{
++    SyncChk *s = &a->sc;
++    const char *why = NULL;
++    int64_t v;
++    int     b;
++
++    v = a->corr_epoch ? atomic_load_explicit(a->corr_epoch, memory_order_relaxed) : 0;
++    if (v != s->epoch_snap) { s->epoch_snap = v; why = "input event"; }             /* a timeline window opened */
++    v = atomic_load_explicit(&g_rsx.tl_ev[a->dbg_in], memory_order_relaxed);
++    if (v != s->tl_snap)    { s->tl_snap = v;    why = "timeline event"; }          /* a [PTV-TL] event line */
++    v = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
++        atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
++    if (v != s->led_snap)   { s->led_snap = v;   why = "label edit on one stream"; }  /* repair, undo, adopted offset */
++    if (a->glue_events != s->glue_snap)   { s->glue_snap = a->glue_events;     why = "label step at the door"; }
++    if (a->afmt_rebuilds != s->afmt_snap) { s->afmt_snap = a->afmt_rebuilds;   why = "audio format switch"; }
++    if (a->dec_reopens != s->reopen_snap) { s->reopen_snap = a->dec_reopens;   why = "decoder reopen"; }
++    b = a->nbs_fill_active;                                    /* the track's silence fill (absent, muted T-480) */
++    if (s->fill_snap && !b)
++        why = "silence fill ended";
++    s->fill_snap = b;
++    if (a->multiview) {                                        /* the slot's own bit: T-386 join, return from the slate */
++        b = (atomic_load_explicit(&g_mv_slate_mask, memory_order_relaxed) >> a->dbg_in) & 1;
++        if (s->slate_snap && !b)
++            why = "slot joined / returned";
++        s->slate_snap = b;
++    } else {
++        v = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
++        if (v != s->rejoin_snap) { s->rejoin_snap = v; why = "hold ended"; }
++    }
++    if (!s->init) {
++        s->init = 1;
++        why = "start";
++    }
++    return why;
++}
++
++/* Why this track's source is not clean right now, NULL = clean. Its own input and its own door only: no sibling slot
++ * freezes it. */
++static const char *synchk_unclean(AudioState *a, int64_t now)
++{
++    SyncChk *s = &a->sc;
++    int64_t v;
++
++    if (!a->multiview && a->house_skew) {                      /* (a slot's lag step is taken on its content boundary) */
++        int64_t hs = *a->house_skew;
++        if (llabs(hs - s->hs_last) > PTV_SC_TOL_US / 2)        /* a step, not the servo's walk */
++            s->hs_wc = now;
++        s->hs_last = hs;
++    }
++    if (a->nbs_fill_active)
++        return "the track is filled with silence";
++    if (a->multiview ? s->slate_snap : ptv_src_holding())
++        return a->multiview ? "the slot is slated" : "the source is held";
++    v = a->v_arrive_wc ? atomic_load_explicit(a->v_arrive_wc, memory_order_relaxed)
++                       : atomic_load_explicit(&g_v_arrive_wc, memory_order_relaxed);
++    if (!v || now - v > 1000000)
++        return "the input is not flowing";
++    v = atomic_load_explicit(&g_rsx.mv_wall[a->dbg_in], memory_order_relaxed);
++    if (!v || now - v > 1000000)
++        return "no pictures shown";
++    if (a->rl_pend || a->rl_undo_us)
++        return "a relabel verdict is pending";                 /* T-087 / T-395: wait for it */
++    if (a->reanch_wc || a->pend_comp_us || a->reanch_mono)
++        return "a label step is in flight at the door";
++    if (a->rs_slip_us)
++        return "the resampler has not settled";
++    if (s->hs_wc && now - s->hs_wc < PTV_SC_HS_US)
++        return "a house_skew step is in flight";
++    return NULL;
++}
++
++/* One call per emitted frame, after the vring pairing. */
++static void synchk_update(AudioState *a, int64_t now)
++{
++    SyncChk *s = &a->sc;
++    const char *ev, *bad;
++    int64_t dmg, clean;
++    int paired = s->paired;
++
++    s->paired = 0;
++    if (!g_synchk || !g_rsync_sense || a->dbg_k < 0 || a->dbg_k >= PTV_MAX_AUDIO ||
++        a->dbg_in < 0 || a->dbg_in >= PTV_MAX_INPUT)
++        return;
++    ev = synchk_event(a);
++    if (ev) {                                                  /* events before the decision merge into one watch */
++        if (!s->watch)
++            s->log_wc = now;
++        s->ev_n++;
++        s->ev_why   = ev;
++        s->ev_wc    = now;
++        s->watch    = 1;
++        s->dirty_wc = now;
++        s->n        = 0;
++    }
++    bad = synchk_unclean(a, now);
++    if (!s->watch)
++        return;
++    if (!bad && !paired)
++        bad = "no picture pairs with this sound";              /* a fill phase, the ring restarted (T-089, T-093) */
++    /* corrupt data: this track's (decode errors, discarded packets) and, single input, the video's. A mosaic has no
++     * per-slot video stamp (g_mv_vdmg_wc is never written): there a slot's corrupt video counts by its timeline events */
++    dmg = FFMAX(a->dmg_wc, atomic_load_explicit(&g_adamage_wc[a->dbg_k], memory_order_relaxed));
++    if (!a->multiview) {
++        dmg = FFMAX(dmg, atomic_load_explicit(&g_vdmg_wc, memory_order_relaxed));
++        dmg = FFMAX(dmg, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
++    }
++    if (bad || dmg > s->dirty_wc) {
++        s->dirty_wc = bad ? now : FFMIN(dmg, now);
++        s->n        = 0;
++    } else {
++        int64_t own = atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed);
++        int64_t led = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
++                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) +
++                      own + a->rl_neutral_us - a->glue_off_us;
++        int64_t r   = a->av_offset_us + led;
++        if (!s->n || FFMAX(s->hi, r) - FFMIN(s->lo, r) > 2 * PTV_SC_TOL_US) {
++            s->n        = 0;                                   /* the reading moved: agreement starts again here */
++            s->agree_wc = now;
++            s->lo = s->hi = r;
++        }
++        s->lo = FFMIN(s->lo, r);
++        s->hi = FFMAX(s->hi, r);
++        s->n++;
++        s->led  = led;
++        s->own  = own;
++        s->last = r;
++    }
++    clean = now - s->dirty_wc;
++    if (!bad && s->n >= PTV_SC_MIN_N && clean >= PTV_SC_CLEAN_US && now - s->agree_wc >= PTV_SC_AGREE_US) {
++        int64_t mid = (s->lo + s->hi) / 2;
++        char slow[32] = "--";
++        if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare */
++            snprintf(slow, sizeof(slow), "%+"PRId64" ms",
++                     (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +
++                      atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
++                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed)) / 1000);
++        av_log(NULL, llabs(mid) <= PTV_SC_BAND_US ? AV_LOG_INFO : AV_LOG_WARNING,
++               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): %s %+"PRId64" ms (ledger %+"PRId64
++               " vring %+"PRId64" ms, agree %.1f s, clean %.1f s, %.1f s after the event; own clock %+"PRId64" ms exempt; "
++               "lipsync %s)  [+ = audio early; observe only, PTV_NO_SYNCCHK=1 off]\n",
++               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap,
++               llabs(mid) <= PTV_SC_BAND_US ? "in sync" :
++               llabs(mid) <= PTV_SC_CAP_US  ? "would step" : "beyond the 5 s cap, would not step",
++               mid / 1000, s->led / 1000, (mid - s->led) / 1000, (now - s->agree_wc) / 1e6, clean / 1e6,
++               (now - s->ev_wc) / 1e6, s->own / 1000, slow);
++        s->watch = 0;
++    } else if (!bad && clean >= PTV_SC_BUDGET_US) {
++        av_log(NULL, AV_LOG_INFO,
++               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): no steady reading in %.0f s of "
++               "clean source (last %+"PRId64" ms, %d readings within %"PRId64" ms for %.1f s): would not step  "
++               "[+ = audio early; observe only]\n",
++               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, clean / 1e6, s->last / 1000, s->n,
++               (s->hi - s->lo) / 1000, (now - s->agree_wc) / 1e6);
++        s->watch = 0;
++    } else if (g_diag && now - s->log_wc >= 10000000) {        /* the default log gets the decision only */
++        s->log_wc = now;
++        av_log(NULL, AV_LOG_INFO,
++               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): undecided %.0f s after it — %s "
++               "(clean %.1f s, %d readings, last %+"PRId64" ms)\n",
++               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, (now - s->ev_wc) / 1e6,
++               bad ? bad : clean < PTV_SC_CLEAN_US ? "the source is clean, waiting" : "the readings do not agree yet",
++               clean / 1e6, s->n, s->last / 1000);
++    }
++}
 +/* ======================================================================================= */
 +
 +/* -af path: drain the filtergraph's (fixed-size) output frames straight to the
@@ -17598,7 +18031,8 @@ index 0000000000..e9786f2bb3
 +                    if (mvw) {
 +                        int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed);
 +                        int64_t ev = atomic_load_explicit(&g_rsx.ev_us[a->dbg_in],  memory_order_relaxed);
-+                        int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed);
++                        int64_t ea = atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) -
++                                     atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed);   /* T-480 */
 +                        int64_t dm = mv - a->rs_ma_ema;
 +                        a->rs_log_last = nowr;
 +                        av_log(NULL, AV_LOG_INFO,
@@ -17659,7 +18093,9 @@ index 0000000000..e9786f2bb3
 +                                                                       * composition lags the audio drain in WALL time). */
 +                    /* Latch the latest measurement for the [PTV-AVSYNC] line (PTV_DIAG-only since v0.9.2). */
 +                    a->av_offset_us = offset; a->av_vlag_us = vlag; a->av_alag_us = alag; a->av_off_valid = 1;
++                    a->sc.paired = 1;                                /* T-480: this frame's reading is fresh */
 +                }
++                synchk_update(a, av_gettime_relative());             /* T-480 step 4: observe only */
 +            }
 +            /* v0.9.2 — aresample WORK RATE (always-on, primary track only). The honest measure is the
 +             * RATE of change of the audio's realized output-vs-content span: d(outspan − content)/d(wall)
@@ -18900,7 +19336,10 @@ index 0000000000..e9786f2bb3
 +
 +    if (!a->slot_deferred || a->pts_set)
 +        return 0;
-+    target = av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000);
++    /* 2.2.1 T-470: single input — the master's output position, 200 ms behind (the margin T-409 keeps) */
++    target = a->multiview ? av_rescale(atomic_load_explicit(&g_mv_house_us, memory_order_relaxed), a->out_rate, 1000000)
++                          : av_rescale(FFMAX(0, atomic_load_explicit(&g_house_out_us, memory_order_relaxed) - 200000),
++                                       a->out_rate, 1000000);
 +    lim    = a->pump_next + 2 * a->out_rate;
 +    while (ret >= 0 && a->pump_next + a->frame_size <= FFMIN(target, lim)) {
 +        AVFrame *f = av_frame_alloc();
@@ -18979,6 +19418,14 @@ index 0000000000..e9786f2bb3
 +            /* 2.0.2 T-386: a joining slot — the silence covered house 0 .. pump_next; real audio continues from there:
 +             * a frame before it is dropped, a gap after it is filled (from the silence's end, not from house 0) */
 +            int64_t pump_us = av_rescale(a->pump_next, 1000000, a->out_rate);
++            if (!a->multiview) {
++                /* 2.2.1 T-470 (born silent, single input): the audio door places a frame at content - h0 + house_skew,
++                 * not at its label — the join compares on that axis; while the door is in its vmap mode (holding /
++                 * within 30 s of a program event) the join waits, the pump keeps the silence going */
++                if (vm_mode(a)) { a->anchor_drop_pre++; return 0; }
++                if (g_avlock && a->house_skew)
++                    house_us += *a->house_skew;
++            }
 +            if (house_us < pump_us) { a->anchor_drop_pre++; return 0; }
 +            a->slot_deferred = 0;
 +            if (house_us > pump_us && frame->sample_rate > 0 && frame->nb_samples > 0) {
@@ -19923,6 +20370,18 @@ index 0000000000..e9786f2bb3
 +        }
 +        if (pkt && (pkt->flags & PTV_PKT_FLAG_SLOT_FILL)) {   /* 2.0.2 T-386: a deferred slot's silence, not a packet */
 +            av_packet_free(&pkt);
++            if (!a->multiview && !a->slot_deferred && !a->pts_set && !a->aq_npending && !a->apark_n) {
++                /* 2.2.1 T-470: born silent — the demux saw this planned track never decode while the video flowed */
++                int64_t h0;
++                pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
++                if (h0 != AV_NOPTS_VALUE) {
++                    a->slot_deferred = 1;
++                    a->pump_next     = 0;
++                    av_log(NULL, AV_LOG_WARNING, "[PTV-ANCHOR] a%d(in%d) born silent: no audio decoded while the video "
++                           "flowed %.0f s — silence on the house axis until real audio joins (PTV_BORN_SILENT_MS=0 off)\n",
++                           a->dbg_k, a->dbg_in, g_born_silent_us / 1e6);
++                }
++            }
 +            if ((ret = slot_pump(a)) < 0)
 +                break;
 +            continue;
@@ -20426,10 +20885,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..92b857aa5c
+index 0000000000..599617c0c8
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2107 @@
+@@ -0,0 +1,2192 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -20646,6 +21105,34 @@ index 0000000000..92b857aa5c
 +    int cap = occ_ticks(v, g_cp.frameq_cap) != g_cp.frameq_cap ? occ_ticks(v, g_cp.frameq_cap * 3 / 4)
 +                                                               : g_cp.frameq_cap - 8;
 +    return sp < cap ? sp : cap;
++}
++
++/* 2.2.1 T-472: does this picture, just taken from the frame queue, wait for its slot? The first picture of a LIVE LOSS /
++ * NEW DOMAIN return whose content index lies ahead of the next tick by no more than the base cushion: where rejoin_map
++ * left it. During the hold or within 3 s of its end (a pre-gap PES tail can end the hold first; rejoin_map decides up
++ * to 2 s after it, and its picture must still find this door open). Once per classified rejoin (*seq_done). Decided
++ * from the content index and published state only, so every rung shows the picture on the same output tick. A picture
++ * further ahead (PTV_NO_REJOIN_MAP=1) is the old leap. */
++static int rj_prime_park(VideoCtx *v, const AVFrame *f, int64_t last_vpts, int base_sp, int *seq_done)
++{
++    int seq = atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire);
++    int64_t nc;
++
++    if (!ptv_rj_prime_class() || seq == *seq_done || f->opaque == &ptv_hold_tag)
++        return 0;
++    if (!ptv_src_holding()) {
++        int64_t rj = atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed);
++        if (!rj || av_gettime_relative() - rj > 3000000)
++            return 0;
++    }
++    nc = content_index(v, f->pts);
++    if (nc <= last_vpts + 1 || nc - last_vpts - 1 > sp_cap(v, base_sp) + 2)
++        return 0;
++    *seq_done = seq;
++    if (v->is_master)
++        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 rejoin: the returning picture waits %.2f s for its slot while the "
++               "frame queue fills (PTV_NO_RJ_PRIME=1 reverts)\n", (nc - last_vpts - 1) * v->tick_dur_us / 1e6);
++    return 1;
 +}
 +
 +/* ---- -cc_extract: EIA-608 -> DVB-teletext emitter (see the CcTap header in ptvencoder.h) ----
@@ -21219,7 +21706,7 @@ index 0000000000..92b857aa5c
 + * state machine and clock-follow latch live in *hr, the published estimator rates in
 + * *est (0.9.18 R3/R4). Master thread only — non-reentrant. */
 +static int64_t house_rate_corr_ppm(HouseRateState *hr, const RateEstimator *est,
-+                                   int occ, int sp, int base_sp, int64_t tick_dur_us, int damaged)
++                                   int occ, int sp, int base_sp, int64_t tick_dur_us, int damaged, int quiet)
 +{
 +    /* PROPORTIONAL occupancy servo (v0.9.6). The earlier INTEGRAL servo (corr += K·err)
 +     * oscillated: the buffer is itself an integrator (ρ → consume-rate → ∫ → occupancy),
@@ -21242,7 +21729,13 @@ index 0000000000..92b857aa5c
 +    /* 2.0.1 T-381 (measured, 50 % loss): no RE-PRIME while the source is damaged — an empty queue there is lost
 +     * content (the decoder waits for an IDR), not a buffer to refill: the house ran 0.77x for 10 s and the output
 +     * caught up with a 3.32 s video PTS hole when the pictures came back. A damaged phase ends an engagement. */
-+    if (g_reprime && !damaged && occ <= (base_sp + 1) / 2) {       /* RE-PRIME: drained below half the BASE floor (true starvation —
++    /* 2.2.1 T-472: nor while no video arrives (quiet): the queue empties because the source stopped, not because
++     * the buffer runs low — slowing the house then only plays the last cushion out at 0.77x and leaves the content
++     * that ahead of the house when it returns (sync_holes: hs -1.2 s for good, mapped by the rejoin). The state
++     * machine is left as it is: arrivals resuming inside an engagement continue it. PTV_REPRIME_QUIET=1 reverts */
++    if (quiet) {
++        ;
++    } else if (g_reprime && !damaged && occ <= (base_sp + 1) / 2) {       /* RE-PRIME: drained below half the BASE floor (true starvation —
 +                                                                    * NOT the adaptive raised target). Slow the house HARD to refill fast.
 +                                                                    * 0.9.10.1 state machine: an engagement lasts AT MOST 10s, then a 300s
 +                                                                    * cooldown applies unconditionally — occupancy oscillating around the
@@ -21530,6 +22023,9 @@ index 0000000000..92b857aa5c
 +        int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
 +        int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
 +        int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
++        int rj_park = 0, rj_park_n = 0, rj_park_seq = 0;   /* 2.2.1 T-472: nextf is a rejoin's first picture waiting for
++                                                     * its slot; ticks waited; the g_rj_cls_seq that had its wait */
++        int64_t blk_wc = 0;                         /* T-472: when this rung last showed its own black picture */
 +        int64_t vgap_filled = 0, vgap_log_wc = 0;   /* ticks filled since the last [PTV-VFILL] line */
 +        int64_t svo_cr = 0, svo_dmg_wc = 0;        /* T-083: corrupt count seen by the servo + when it last moved */
 +        unsigned rff_bits = 0;
@@ -21543,13 +22039,26 @@ index 0000000000..92b857aa5c
 +        int fresh = 0, cadence_hold = 0;
 +        if (v->is_master)
 +            PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
-+        if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
++        /* 2.2.1 T-472: a rejoin's first picture waits in nextf until its slot is due (rj_prime_park). These ticks are
++         * the hold's own repeats — a dup each, the hold picture on air, house_skew and the fills' clock moving on — not
++         * cadence residence, so the audio fill runs up to the tick the picture is shown on. Bounded by the base cushion
++         * (+2 ticks: h0 or the map moving under it must not hold the picture back) */
++        if (rj_park && (!next_have || content_index(v, nextf->pts) <= last_vpts + 1 ||
++                        ++rj_park_n > sp_cap(v, base_sp) + 2))
++            rj_park = 0;
++        if (rj_park) {
++            ;                                       /* repeat; nextf is promoted below once it is due */
++        } else if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
 +            if (!next_have) {
 +                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
-+                if (ret >= 0) { nextf = f; next_have = 1; }
++                if (ret >= 0) {
++                    nextf = f; next_have = 1;
++                    rj_park   = rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq);   /* 2.2.1 T-472 */
++                    rj_park_n = 0;
++                }
 +                else if (ret == AVERROR_EOF) break; /* pending nextf was already promoted (recv only when empty) */
 +            }
-+            if (next_have) {
++            if (next_have && !rj_park) {
 +                int64_t nc = content_index(v, nextf->pts);
 +                /* residence CAP: film holds a picture 1 tick extra at most (3:2); a slower source as many as its
 +                 * cadence needs (29.97 in 59.94: 1, 25 in 59.94: 2) */
@@ -21610,6 +22119,11 @@ index 0000000000..92b857aa5c
 +                        pp_n   = 0;
 +                        pp_t0  = ps;
 +                    }
++                }
++                if (ret >= 0 && have && rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq)) {
++                    nextf = f; next_have = 1; rj_park = 1; rj_park_n = 0;   /* 2.2.1 T-472: before the gap fill — these
++                                                                             * ticks are repeats, not residence */
++                    break;
 +                }
 +                if (ret >= 0 && g_vgapfill && have && f->opaque != &ptv_hold_tag) {
 +                    /* 2.0.0-pre9.4 (T-083): a content gap INSIDE frame_q (frames lost or corrupt-discarded at the
@@ -21804,6 +22318,12 @@ index 0000000000..92b857aa5c
 +                int64_t nw = av_gettime_relative();
 +                int64_t ep;
 +                atomic_store_explicit(&g_frameq_depth, av_thread_message_queue_nb_elems(v->frame_q), memory_order_relaxed);
++                if (g_fq_bp && primed) {   /* 2.2.1 T-482: the decoder's limit = setpoint + 8 ticks, in pictures */
++                    int lim = sp_cap(v, g_curt.cur_sp + 8);
++                    if (v->src_per_us > 0 && v->src_per_us * 5 / 4 < v->tick_dur_us)
++                        lim = (int)((int64_t)lim * v->tick_dur_us / v->src_per_us);
++                    atomic_store_explicit(&g_fq_bp_lim, lim, memory_order_relaxed);
++                }
 +                if (g_diag) {   /* video_q/mux_q: log only >=2s episodes — empty is their NORMAL state (consumer
 +                                 * drains instantly; sub-2s "refills" are sampling noise — the Cinestar lesson).
 +                                 * A >=2s video_q episode = a real input stall, still event-worthy. */
@@ -21981,16 +22501,25 @@ index 0000000000..92b857aa5c
 +                    }
 +                    /* 2.0.0-pre4: a hold is not a rate signal — nominal pacing, no REPRIME (it would run
 +                     * the house at 0.77x, then 1.5 % slow, for as long as the source is gone) */
++                    int quiet = 0;
 +                    if (v->dbg_video_q) {   /* 2.0.1 T-361: the bank margin at the last video arrival */
 +                        int64_t arr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
++                        quiet = g_reprime_quiet_off && arr &&   /* 2.2.1 T-472: no video read for 0.5 s (4 ticks at least) */
++                                av_gettime_relative() - arr > FFMAX(500000, 4 * v->tick_dur_us);
 +                        if (arr && arr != v->hr->bk_arr_wc) {
 +                            v->hr->bk_arr_wc = arr;
 +                            v->hr->bk_have   = occ_ticks(v, av_thread_message_queue_nb_elems(v->dbg_video_q)) + occ;
 +                        }
 +                    }
++                    /* 2.2.1 T-482: while the decoder waits on the frame queue, video_q holds the backlog a free-running
++                     * decoder would have put into frame_q (2.2.1-rc4: the servo drained a burst from there and pinned on
++                     * a fast source — without it rich2997long-settle burst_once_6 kept +1.4 s, t471f 13.2 s vs 4.2 s).
++                     * The servo counts it; the bank margin above already reads video_q + frame_q. */
++                    if (v->dbg_video_q && atomic_load_explicit(&g_fq_bp_wait, memory_order_relaxed))
++                        occ += occ_ticks(v, av_thread_message_queue_nb_elems(v->dbg_video_q));
 +                    atomic_store_explicit(&v->hr->rho_corr_ppm,
-+                        ptv_src_holding() ? 0 :
-+                        house_rate_corr_ppm(v->hr, v->est, occ, sp_cap(v, g_curt.cur_sp), sp_cap(v, base_sp), v->tick_dur_us, damaged),
++                        ptv_src_holding() || rj_park ? 0 :   /* 2.2.1 T-472: nor is the wait for a rejoin's slot */
++                        house_rate_corr_ppm(v->hr, v->est, occ, sp_cap(v, g_curt.cur_sp), sp_cap(v, base_sp), v->tick_dur_us, damaged, quiet),
 +                        memory_order_relaxed);
 +                }
 +                int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
@@ -22105,6 +22634,10 @@ index 0000000000..92b857aa5c
 +                                      ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
 +                                      : vpts * v->tick_dur_us, memory_order_relaxed);
 +                atomic_store_explicit(&g_house_tick_us, v->tick_dur_us, memory_order_relaxed);
++                /* 2.2.1 T-472: the base cushion in house time (what rejoin_map leaves unmapped), and whether the
++                 * master is waiting for a rejoin's slot (before the tick that ends the hold publishes the rejoin) */
++                atomic_store_explicit(&g_rj_prime_us, (int64_t)sp_cap(v, base_sp) * v->tick_dur_us, memory_order_relaxed);
++                atomic_store_explicit(&g_rj_parking, rj_park, memory_order_release);
 +            }
 +            if (src_ts != AV_NOPTS_VALUE)   /* [PTV-CHAIN] video source-content being emitted (us); any rung (same content) */
 +                atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
@@ -22167,7 +22700,8 @@ index 0000000000..92b857aa5c
 +             * frozen frame. A black DUP: same props and content pts as the held frame, so house_skew, the
 +             * sensors and the audio fill see an ordinary repeat. Dropped as soon as fresh content returns. */
 +            AVFrame *emit = held;
-+            if (!fresh && ptv_src_holding()) {
++            if (!fresh && (ptv_src_holding() || rj_park)) {   /* 2.2.1 T-472: also while a rejoin's first picture
++                                                               * waits for its slot — the hold is over by then */
 +                int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
 +                int64_t nw  = av_gettime_relative();
 +                /* 2.0.0-pre9 (T-078/T-079): the decode thread renders the hold picture through the graph once per
@@ -22178,13 +22712,18 @@ index 0000000000..92b857aa5c
 +                    AVFrame *np = atomic_exchange_explicit(v->hold_pic, NULL, memory_order_acq_rel);
 +                    if (np) { av_frame_free(&hpic); hpic = np; hpic_wc = nw; }
 +                }
-+                if (hpic && nw - hpic_wc < 1000000) {
++                if (hpic && (nw - hpic_wc < 1000000 || rj_park)) {   /* T-472: no picture is rendered while real
++                                                                      * frames flow — the last one stays */
 +                    hpic->pts = held->pts; hpic->pkt_dts = AV_NOPTS_VALUE; hpic->duration = 0; hpic->opaque = NULL;
 +                    emit = hpic;
-+                } else if (g_hold_black || (g_freeze_max_us > 0 && hs0 && nw - hs0 >= g_freeze_max_us)) {
++                } else if (g_hold_black || (g_freeze_max_us > 0 && hs0 && nw - hs0 >= g_freeze_max_us) ||
++                           (rj_park && blk_wc && nw - blk_wc < 500000)) {   /* T-472: black was on air: it stays (the
++                                                                             * hold's start time is gone, and a pre-gap
++                                                                             * tail may have been shown in between) */
 +                    if (black_like(&blk, held) >= 0) {
 +                        emit = blk;
-+                        if (!blk_logged && v->is_master)
++                        blk_wc = nw;
++                        if (!blk_logged && v->is_master && !rj_park)
 +                            av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 held picture \xe2\x86\x92 black (%s)\n",
 +                                   g_hold_black ? "-hold black" : "-freeze_max reached");
 +                        blk_logged = 1;
@@ -22228,13 +22767,18 @@ index 0000000000..92b857aa5c
 +                    atomic_store_explicit(&g_hold_vcorrupt_n0, atomic_load_explicit(&g_vcorrupt_n, memory_order_relaxed),
 +                                          memory_order_relaxed);   /* 2.0.0 T-324 */
 +                    atomic_store_explicit(&g_src_hold_start, nw, memory_order_relaxed);
++                    atomic_store_explicit(&g_rj_hold_seq0, atomic_load_explicit(&g_rj_cls_seq, memory_order_acquire),
++                                          memory_order_relaxed);   /* 2.2.1 T-472: before the state — a class needs it */
 +                    atomic_store_explicit(&g_src_state, 1, memory_order_relaxed);
 +                    src_note = nw + 60000000; src_lost_logged = 0;
 +                    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 LIVE \xe2\x86\x92 STALLED%s: frame queue and "
 +                           "video_q empty, no video for %.1f s (threshold %.1f s)\n", g_src_hold_act ? "" : " (observe-only)",
 +                           (nw - arr) / 1e6, thr / 1e6);
 +                }
-+            } else if (fresh) {
++            } else if (fresh || rj_park) {   /* 2.2.1 T-472: the returning picture is here — the hold ends on the tick it
++                                              * would have been shown on before, although it waits for its slot. Held
++                                              * on, the audio would drop the returning sound as fragments of the hold
++                                              * and emit_video would put the bars on every returning picture (T-474) */
 +                int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
 +                atomic_store_explicit(&g_src_state, 0, memory_order_relaxed);
 +                atomic_store_explicit(&g_src_hold_start, 0, memory_order_relaxed);
@@ -22539,10 +23083,10 @@ index 0000000000..92b857aa5c
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..39a22bba1d
+index 0000000000..24b3a9e5b7
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3178 @@
+@@ -0,0 +1,3200 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -25450,8 +25994,30 @@ index 0000000000..39a22bba1d
 +                                 atomic_load_explicit(&g_adamage_wc[d->aglobal[k]], memory_order_relaxed) : 0;
 +                    if (d->single)
 +                        dw = FFMAX(dw, atomic_load_explicit(&g_vcorrupt_wc, memory_order_relaxed));
-+                    if (!d->a_arr_us[k] || nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
-+                                           (dw && nw - dw < 5000000 ? 1000000 : 2000000) ||
++                    /* 2.2.1 T-470 (owner 2026-11-13: fill silence): a planned track that has NEVER decoded a frame while
++                     * the video flowed g_born_silent_us (3 s) — the source sends no audio (glo-4 Black_Headline_News, for
++                     * hours): the track is born silent on the house axis (the T-386 deferred-slot pump: encoder-only, no
++                     * graph) so the output carries audio from the start; real audio joins on its content time. Keyed on
++                     * "never decoded", not "no packets": a source whose audio arrives but never decodes is the same */
++                    if (d->single && g_born_silent_us > 0 && d->aglobal[k] >= 0 && d->aglobal[k] < PTV_MAX_AUDIO &&
++                        !atomic_load_explicit(&g_adec_frame_wc[d->aglobal[k]], memory_order_relaxed) &&
++                        nw - d->v_flow_since_us >= g_born_silent_us) {
++                        if (nw - d->nbs_last_fill_us[k] >= g_nbs_quantum_us) {
++                            d->nbs_last_fill_us[k] = nw;
++                            if ((fs = av_packet_alloc())) {
++                                fs->stream_index = d->astream[k];
++                                fs->flags |= PTV_PKT_FLAG_SLOT_FILL;
++                                if (av_thread_message_queue_send(d->audio_q[k], &fs, AV_THREAD_MESSAGE_NONBLOCK) < 0)
++                                    av_packet_free(&fs);
++                            }
++                        }
++                        continue;
++                    }
++                    /* 2.2.1 T-480: a track the timeline muted (its audio off the program clock) is silence from the
++                     * first quantum — its packets arrive, they are not sent: no 1-2 s wait (the PID dark on the wire) */
++                    if (!d->a_arr_us[k] || (!ptv_tl_muted(d, d->astream[k]) &&
++                                            nw - FFMAX(d->a_arr_us[k], d->v_flow_since_us) <
++                                            (dw && nw - dw < 5000000 ? 1000000 : 2000000)) ||
 +                        nw - d->nbs_last_fill_us[k] < g_nbs_quantum_us)
 +                        continue;
 +                    d->nbs_last_fill_us[k] = nw;
@@ -26856,10 +27422,10 @@ index 0000000000..5c9acdc9f5
 +
 diff --git a/fftools/ptvencoder_hold.c b/fftools/ptvencoder_hold.c
 new file mode 100644
-index 0000000000..19c992a98f
+index 0000000000..3d8bf6d11d
 --- /dev/null
 +++ b/fftools/ptvencoder_hold.c
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,348 @@
 +/*
 + * ptvencoder — hold pictures (2.0.0-pre9, T-078 + T-079).
 + *
@@ -27147,6 +27713,22 @@ index 0000000000..19c992a98f
 +    }
 +}
 +
++/* 2.2.1 T-474: the hold's bars / black / slate picture when the hold has gone past -freeze_max (or -hold black) and the
++ * picture was built in this frame's shape; NULL otherwise (still frozen, nothing built, another shape) */
++AVFrame *ptv_hold_bars_pic(DecodeCtx *d, const AVFrame *frame)
++{
++    HoldPic *hp = d->hr_pic;
++    int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
++    int64_t el  = hs0 ? av_gettime_relative() - hs0 : 0;
++    if (!hp || !hp->pic || hp->fmt < 0 || hs0 != hp->hold_id)
++        return NULL;
++    if (!(g_hold_mode == PTV_HOLD_BLACK || (g_freeze_max_us && el >= g_freeze_max_us)))
++        return NULL;
++    if (hp->pic->width != frame->width || hp->pic->height != frame->height || hp->pic->format != frame->format)
++        return NULL;
++    return hp->pic;
++}
++
 +/* emit_video: a real decoded frame (before the graph). Keeps the freeze picture and the render timeline, and closes
 + * the account of a finished hold. */
 +void ptv_hold_note_frame(DecodeCtx *d, const AVFrame *frame)
@@ -27160,8 +27742,11 @@ index 0000000000..19c992a98f
 +        return;
 +    if (frame->duration > 0)
 +        d->hr_dur = frame->duration;
-+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-+        d->hr_pts = frame->best_effort_timestamp + d->hr_dur;
++    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
++        d->hr_pts      = frame->best_effort_timestamp + d->hr_dur;
++        d->hr_real_pts = frame->best_effort_timestamp;   /* T-474 */
++        d->hr_real_set = 1;
++    }
 +    /* No picture while real frames flow: at a rejoin the hold lasts until the master shows a fresh frame, and a
 +     * render pushed between real frames would carry the real frame a temporal filter (bwdif) delays by one out
 +     * into the hold slot — no real frame ever reached frame_q and the hold never ended (local, bwdif + two
@@ -30038,10 +30623,10 @@ index 0000000000..996ff6b986
 +}
 diff --git a/fftools/ptvencoder_timeline.c b/fftools/ptvencoder_timeline.c
 new file mode 100644
-index 0000000000..1fe4e2f9ff
+index 0000000000..12e7d04e8e
 --- /dev/null
 +++ b/fftools/ptvencoder_timeline.c
-@@ -0,0 +1,1147 @@
+@@ -0,0 +1,1390 @@
 +/*
 + * ptvencoder — 2.1 T-409: the program timeline, source stage (M_in).
 + *
@@ -30080,6 +30665,8 @@ index 0000000000..1fe4e2f9ff
 +#define TL_BIG_US     2000000       /* 2.2 T-451: a step beyond this is no relabel (the repair bound): a program-wide step */
 +#define TL_SAME_US    1000000       /* 2.2 T-451: the audio of a program event crossed by the video's J within this */
 +#define TL_AWAIT_US   5000000       /* 2.2.1 T-463: an audio the video's big step left behind is awaited on its new path */
++#define TL_CLK_US     1000000       /* 2.2.1 T-480: an audio is on the program clock within this of its own A/V label offset */
++#define TL_MUTE_US    10000000      /* 2.2.1 T-480: an audio off the program clock is silent this long at most, then adopted */
 +
 +typedef struct TlPkt {
 +    AVPacket *pkt;
@@ -30120,11 +30707,23 @@ index 0000000000..1fe4e2f9ff
 +    int     await_more;                       /* T-464: a later program event in this window moved its awaited path */
 +    int64_t open_us;                          /* T-466: its path end when the window opened (old_end_us grows with the
 +                                               * old-path packets the window holds) */
++    /* 2.2.1 T-480: an audio whose clock left the program clock (the video's) while the pictures run is muted like a frame
++     * sync: followed and classified as before, not sent (the silence fill keeps its track continuous) until it is back
++     * on the program clock, or TL_MUTE_US passed (then, once, the offset that keeps its labels where they were) */
++    int     mute, mute_old;                   /* muted now / before this window's decision (its held old-path packets) */
++    int64_t mute_wc, mute_rep;                /* since when; the offset its steps since would need (adopted at the bound) */
++    int64_t hk_us, hk_wc;                     /* T-481: the hole this stream kept alone (within its own silence) and when */
++    int     clk_ok;                           /* clk_ref is set */
++    int64_t clk_ref;                          /* the source's own A/V label offset: its labels (less a big offset) minus the
++                                               * video's path at the same arrival time, while it is on the program clock */
++    int64_t clk_cand, clk_cand_wc;            /* a new offset its labels as sent settle on (2 s steady: the new truth) */
++    int64_t big_pub;                          /* T-480: rep_big as last published to the sync check (g_rsx.eo_us) */
 +} TlStream;
 +
 +struct PtvTimeline {
 +    int64_t   k_us;
-+    int64_t   ev_n, strag_n, drop_n;
++    int64_t   ev_n, strag_n, drop_n, mute_n;
++    int64_t   ev_pub;                   /* T-480: ev_n as last published to the sync check (g_rsx.tl_ev) */
 +    int       active, trig, nst, cap;   /* nst = streams followed; cap = st[] room (2.2: adoption) */
 +    int       win_big;                  /* T-451: the trigger stepped more than TL_BIG_US */
 +    int64_t   open_wc, open_s_us;
@@ -30243,8 +30842,94 @@ index 0000000000..1fe4e2f9ff
 +    s->ok      = 1;
 +}
 +
++/* 2.2.1 T-480: PTV_TL_NO_MUTE=1 = rule B as in rc4 (an audio's clock step under running pictures repaired on the stream) */
++static int tl_mute_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++        on = !getenv("PTV_TL_NO_MUTE");
++    return on;
++}
++
++/* T-480: how far the stream is off the program clock — a big offset held on it (an adopted clock of its own) plus, while
++ * muted, the steps it took since. The video stepping by minus this joins it; its own step by this is its return */
++static int64_t own_off(const TlStream *s)
++{
++    return s->rep_big + (s->mute ? s->mute_rep : 0);
++}
++
++/* T-480: the last packet of the stream's new run in this window */
++static void run_end(const PtvTimeline *t, int si, int64_t *us, int64_t *wc)
++{
++    int i;
++    for (i = t->nheld - 1; i >= 0; i--)
++        if (t->held[i].si == si && t->held[i].path == 1) {
++            *us = t->held[i].s_us;
++            *wc = t->held[i].wc;
++            return;
++        }
++}
++
++/* T-480: the audio's A/V label offset at a packet (source time s_us, arrived wc) against its own reference: its labels
++ * less a big offset, minus where the video's path is at that arrival time (the video's clock runs on with the wall
++ * between its packets and through its holes). in_close: the video's new run of the closing window is its path.
++ * Returns 0 when there is no video path to judge by; before the first reading (clk_ok) clk_ref is 0 */
++static int clk_off(const DemuxArgs *d, const PtvTimeline *t, int si, int64_t s_us, int64_t wc, int in_close, int64_t *off)
++{
++    const TlStream *s = &t->st[si], *v;
++    int64_t vu, vw;
++    if (d->vstream < 0 || d->vstream >= t->nst || d->vstream == si || !t->st[d->vstream].ok)
++        return 0;
++    v  = &t->st[d->vstream];
++    vu = v->last_us;
++    vw = v->last_wc;
++    if (in_close && v->res == 1)
++        run_end(t, d->vstream, &vu, &vw);
++    *off = (s_us - s->rep_big) - (vu + (wc - vw)) - s->clk_ref;
++    return 1;
++}
++
++/* T-480: learn the source's own A/V label offset from an audio packet on its path — only while the stream is on the
++ * program clock (not muted, no big offset). Slow, near the reference; labels as sent that settle elsewhere for 2 s are
++ * the source's new truth (a restart whose audio lands 0.8 s / 6 s off its pictures: vt-adjp, vt-vfgap); a PES tail after
++ * an outage (old labels for a few frames) teaches nothing */
++static void clk_learn(const DemuxArgs *d, PtvTimeline *t, int si, int64_t s_us, int64_t nw)
++{
++    TlStream *s = &t->st[si];
++    int64_t off;
++    if (s->mute || s->rep_big || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
++        !clk_off(d, t, si, s_us, nw, 0, &off))
++        return;
++    if (!s->clk_ok) {
++        s->clk_ref     = off;
++        s->clk_ok      = 1;
++        s->clk_cand_wc = 0;
++    } else if (llabs(off) <= TL_CLK_US / 4) {
++        s->clk_ref    += off / 16;
++        s->clk_cand_wc = 0;
++    } else if (!s->clk_cand_wc || llabs(s->clk_ref + off - s->clk_cand) > TL_CLK_US / 4) {
++        s->clk_cand    = s->clk_ref + off;
++        s->clk_cand_wc = nw;
++    } else if (nw - s->clk_cand_wc >= 2000000) {
++        s->clk_ref    += off;
++        s->clk_cand_wc = 0;
++    }
++}
++
++/* T-480: send a packet of the stream's own path — not while it is muted */
++static int tl_out(DemuxArgs *d, PtvTimeline *t, int si, AVPacket *pkt)
++{
++    if (t->st[si].mute) {
++        t->mute_n++;
++        av_packet_free(&pkt);
++        return 0;
++    }
++    return ptv_demux_dispatch(d, pkt);
++}
++
 +/* T-463: the stream stepped first, alone, and was repaired as a clock of its own — the video now steps the same: it is on
-+ * the new path already; undo its big repair after the release (its held packets are new content: path 3) */
++ * the new path already; undo its big repair after the release (its held packets are new content: path 3).
++ * T-480: or it was muted for that step — on the program clock again, its held packets go out */
 +static void undo_big_repair(PtvTimeline *t, TlStream *s, int si)
 +{
 +    int i;
@@ -30252,6 +30937,8 @@ index 0000000000..1fe4e2f9ff
 +    s->rep_new     = -s->rep_big;
 +    s->rep_us     -= s->rep_big;
 +    s->rep_big     = 0;
++    s->mute        = 0;
++    s->mute_rep    = 0;
 +    s->new_last_us = s->last_us;
 +    for (i = 0; i < t->nheld; i++)
 +        if (t->held[i].si == si && t->held[i].path != 2 && t->held[i].s_us != AV_NOPTS_VALUE) {
@@ -30404,6 +31091,16 @@ index 0000000000..1fe4e2f9ff
 +
 +/* a stream was flowing if it delivered within 2 s of the input's last activity before the event (before the silence
 + * the window opened behind, if any) */
++/* 2.2.1 T-475: the event comes out of a real OUTAGE — an input-wide silence of the stall class (>= 3 s) that ended <= 3 s
++ * before this window, or the input still holds. The T-463 rules (the video decides alone, the await, an audio's clock of
++ * its own) assume the pictures were running: after an outage the source restarts / returns and the rules up to rc1
++ * decide (rc2/rc3: a 12 s hole's audio return repaired +11.9 s; cow-1 Adrenaline+ restart after a stall: lip sync +65 s).
++ * PWHT's restart (a 1.1 s input blip) is not an outage */
++static int after_outage(const PtvTimeline *t)
++{
++    return (t->gap_end_wc && t->gap_us >= 3000000 && t->open_wc - t->gap_end_wc <= 3000000) || ptv_src_holding();
++}
++
 +static int flowing(const PtvTimeline *t, const TlStream *s)
 +{
 +    int64_t ref = t->gap_end_wc && t->open_wc - t->gap_end_wc <= 1000000 ? t->gap_end_wc - t->gap_us : t->open_wc;
@@ -30489,8 +31186,8 @@ index 0000000000..1fe4e2f9ff
 +        t->win_big = jt < -TL_BIG_US || (!nowall && jt - wt > TL_BIG_US);
 +        /* 2.2.1 T-463: an audio coming back from a clock of its own (its big repair, about the same step) is the return
 +         * leg — no partner to wait for: the window held the audio 3 s, banked as a stall (Fashion 2026-11-13 01:01:38) */
-+        retleg = d->ifmt->streams[t->trig]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && ts->rep_big &&
-+                 llabs(jt - ts->rep_big) < TL_SAME_US;
++        retleg = d->ifmt->streams[t->trig]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && own_off(ts) &&
++                 llabs(jt - own_off(ts)) < TL_SAME_US;   /* (T-480: or back from the clock it is muted on) */
 +        /* 2.2.1 T-463: an audio's big step while the video shows pictures on its old path is decided at once (a clock of
 +         * its own, repaired on the stream): a video following by the same step later undoes the repair with its own
 +         * program event (close_window). Waiting up to 2 s for it held the audio 1.8 s (a mosaic's other slots then lost
@@ -30514,7 +31211,7 @@ index 0000000000..1fe4e2f9ff
 +            continue;                          /* not flowing before the event: no partner to wait for */
 +        r = classify_stream(t, si, final, cross);
 +        /* T-463: an audio already repaired for this very step (it stepped first, alone) has crossed — nothing to wait for */
-+        if (r == 0 && s->rep_big && jt && llabs(s->rep_big + jt) < TL_SAME_US)
++        if (r == 0 && own_off(s) && jt && llabs(own_off(s) + jt) < TL_SAME_US)
 +            continue;
 +        if (r == 0 && partner(d, t, si) && !retleg)
 +            all = 0;
@@ -30547,6 +31244,14 @@ index 0000000000..1fe4e2f9ff
 +        h->pkt = NULL;
 +        if (h->path == 2) {
 +            t->drop_n++;
++            av_packet_free(&p);
++            continue;
++        }
++        /* T-480: a muted stream's packets were held and classified like any other; they are not sent — its new run by
++         * the state this window decided, the packets before it by the state it opened in */
++        if (h->si < t->nst && t->st[h->si].dense &&
++            (((h->path == 1 && t->st[h->si].res == 1) || h->path == 3) ? t->st[h->si].mute : t->st[h->si].mute_old)) {
++            t->mute_n++;
 +            av_packet_free(&p);
 +            continue;
 +        }
@@ -30594,6 +31299,8 @@ index 0000000000..1fe4e2f9ff
 +    int ret;
 +
 +    window_resolved(d, t, 1);
++    for (si = 0; si < t->nst; si++)
++        t->st[si].mute_old = t->st[si].mute;
 +    for (si = 0; si < t->nst; si++) {
 +        TlStream *s = &t->st[si];
 +        if (!s->dense || si == vs)
@@ -30607,7 +31314,12 @@ index 0000000000..1fe4e2f9ff
 +            const TlStream *v = &t->st[vs];
 +            int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
 +            int64_t ja = s->new_first_us - (s->old_end_us + (s->step_us ? s->step_us : 20000));
-+            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000))
++            /* 2.2.1 T-481: an audio that already kept this outage's hole alone (its first packets after it, within its own
++             * silence) shows only the rest of the step here — the same outage, one program event: its kept hole counts
++             * (vt-t479v: video +6.04 s, the audio +2.84 s kept then +3.02 s — a 4.6 s video PTS hole as two events) */
++            int64_t hk = s->hk_wc && t->open_wc - s->hk_wc <= 3000000 ? s->hk_us : 0;
++            if (llabs(ja - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000) ||
++                (hk && llabs(ja + hk - jv) <= FFMAX(TL_SAME_US, llabs(jv) / 1000)))
 +                n_aud_cross++;
 +        } else if (s->res == 1)
 +            n_aud_cross++;
@@ -30623,7 +31335,7 @@ index 0000000000..1fe4e2f9ff
 +     * out "labels as sent", hs +8.6 h, ~12 dups/s. Not when an audio flowed into the span a forward step skipped: that is
 +     * the video's own hole (sync_vnull: its PES tail reads its silence ~0, the step "big"). The awaited audio's old-path
 +     * sound goes on on the old offset (release, ingest): the source's audio clock lags its restart, the sound does not */
-+    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !n_aud_cross && n_aud_flow) {
++    if (vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !n_aud_cross && n_aud_flow && !after_outage(t)) {
 +        const TlStream *v = &t->st[vs];
 +        int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
 +        int nowall = atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000;
@@ -30634,8 +31346,8 @@ index 0000000000..1fe4e2f9ff
 +        int vdec = jv < -TL_BIG_US || (!nowall && jv - vsil > TL_BIG_US);
 +        /* an audio repaired for the same step first is evidence by itself (no wall evidence under a bank: no win_big) */
 +        for (si = 0; si < t->nst && !vdec; si++)
-+            if (t->st[si].dense && si != vs && llabs(jv) > TL_BIG_US && t->st[si].rep_big &&
-+                llabs(t->st[si].rep_big + jv) < TL_SAME_US)
++            if (t->st[si].dense && si != vs && llabs(jv) > TL_BIG_US && own_off(&t->st[si]) &&
++                llabs(own_off(&t->st[si]) + jv) < TL_SAME_US)
 +                vdec = 1;
 +        for (si = 0; si < t->nst && vdec; si++) {
 +            const TlStream *s = &t->st[si];
@@ -30644,7 +31356,10 @@ index 0000000000..1fe4e2f9ff
 +             * clock step forward of the video alone, the audio on its own clock, read as a hole after a 1.94 s window:
 +             * labels as sent, lip sync -3 s for good — vt-ap-own) */
 +            if (s->dense && si != vs && d->ifmt->streams[si]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
-+                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US)
++                jv > 0 && s->ok && s->open_us > v->new_first_us - TL_BIG_US &&
++                !(own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US))   /* T-480: not an audio that took this very step
++                                                                         * first (muted on its raw clock: its path is on
++                                                                         * the new labels already — vt-nowall-afwd) */
 +                vdec = 0;
 +        }
 +        for (si = 0; si < t->nst && vdec; si++) {
@@ -30653,7 +31368,7 @@ index 0000000000..1fe4e2f9ff
 +                continue;
 +            /* it stepped first, alone, and was repaired as a clock of its own: the video now follows by the same step —
 +             * the audio is on the new path already, undo its repair (its held packets are new content: path 3) */
-+            if (s->rep_big && llabs(s->rep_big + jv) < TL_SAME_US) {
++            if (own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US) {
 +                undo_big_repair(t, s, si);
 +                continue;
 +            }
@@ -30777,8 +31492,50 @@ index 0000000000..1fe4e2f9ff
 +                int64_t slack   = 0;
 +                if (atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)
 +                    slack = FFMAX(atomic_load_explicit(&g_bank_us, memory_order_relaxed), (int64_t)g_preroll_ms * 1000);
-+                big = vrun && (ret_leg || js < -TL_BIG_US ||
++                /* 2.2.1 T-475: no clock of its own right after the INPUT was silent (an input-wide gap ended <= 3 s before
++                 * this window) or while the input holds — the pictures were not running: a restart / return after an
++                 * outage is the other rules' business (as up to rc1). After an outage the audio's pre-gap PES tail is
++                 * taken as a crossing at the return, its last path packet looks recent and its own silence reads ~0: rc2/
++                 * rc3 repaired a 12 s hole's audio return as a clock of its own (+11.9 s, lip sync -11925 ms for good:
++                 * std sync_gap_12; 2.2.0/rc1: loss), and cow-1 Adrenaline+ (rc2, 2026-11-13 14:45) a source restart
++                 * after a stall (-18.0 / +51.4 / -5.5 s audio-only steps): lip sync +65 s until the next restart */
++                int quiet_in = after_outage(t);
++                big = !quiet_in && vrun && (ret_leg || js < -TL_BIG_US ||
 +                               (js > TL_BIG_US && js - stream_silence(t, s, si) - slack > TL_BIG_US));
++            }
++            /* 2.2.1 T-480 (owner 2026-11-14: mute like a frame sync; no stream carries a big offset of its own): the
++             * question is not "did the audio step alone" but "is it on the program clock after the step" — its labels
++             * within TL_CLK_US of its own A/V label offset to the video's path. On it: labels as sent, nothing muted, a
++             * big offset it held undone exactly (RAV mosaic 2026-11-14 05:59:59, rc3: after a 2.97 s hole slot in3's audio
++             * sent its pre-hole PES tail, then stepped +2.923 s TO the live position its pictures were on already — rule
++             * B "repaired" it: lip sync +2.9 s, sync_check restart). Off it (Fashion: +10313 s for 3 s): muted — its new
++             * run is not sent, the absence watch fills the track with silence at once (ptv_tl_muted), and it is followed
++             * on its own clock until a step brings it back (here), the video steps to it (undo_big_repair), its packets
++             * read on the program clock again or TL_MUTE_US passed (ptv_tl_ingest) */
++            if ((big || s->mute) && tl_mute_on()) {
++                int64_t eu = s->new_last_us, ew = nw, off = 0;
++                run_end(t, si, &eu, &ew);
++                if (clk_off(d, t, si, eu, ew, 1, &off) && s->clk_ok && llabs(off) <= TL_CLK_US) {
++                    cls = s->mute || s->rep_big ? "audio back on the program clock, labels as sent" :
++                                                  "single-stream step onto the program clock, labels as sent";
++                    s->rep_new  = -s->rep_big;
++                    s->rep_us  -= s->rep_big;
++                    s->rep_big  = 0;
++                    s->mute     = 0;
++                    s->mute_rep = 0;
++                } else {
++                    cls = "audio off the program clock under running pictures, muted";
++                    if (!s->mute) {
++                        s->mute     = 1;
++                        s->mute_wc  = nw;
++                        s->mute_rep = 0;
++                    }
++                    s->mute_rep -= js;
++                }
++                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s off the program clock "
++                       "(band %.1f s)\n", d->rsync_slot, si, s->mute ? "MUTED" : "on the program clock", js / 1e6,
++                       off / 1e6, TL_CLK_US / 1e6);
++                continue;
 +            }
 +            if (!big && d->ts_outl && si < d->nb_streams_open && d->ts_outl[si].dmg_wc && nw - d->ts_outl[si].dmg_wc < 3000000)
 +                continue;
@@ -30841,7 +31598,7 @@ index 0000000000..1fe4e2f9ff
 +                t->st[si].await_more = 1;
 +            }
 +    }
-+    if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1) {
++    if (prog_event && llabs(erase) > TL_BIG_US && vs >= 0 && vs < t->nst && t->st[vs].res == 1 && !after_outage(t)) {
 +        const TlStream *v = &t->st[vs];
 +        int64_t jv = v->new_first_us - (v->old_end_us + (v->step_us ? v->step_us : 20000));
 +        for (si = 0; si < t->nst; si++) {
@@ -30849,7 +31606,7 @@ index 0000000000..1fe4e2f9ff
 +            if (!s->dense || si == vs || s->res == 1 || s->await_more || d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
 +                !((flowing(t, s) && !sil_out) || has_held(t, si)))
 +                continue;
-+            if (s->rep_big && llabs(s->rep_big + jv) < TL_SAME_US) {
++            if (own_off(s) && llabs(own_off(s) + jv) < TL_SAME_US) {
 +                undo_big_repair(t, s, si);    /* it stepped first, alone: on the new path already (another audio crossed) */
 +                continue;
 +            }
@@ -30859,7 +31616,7 @@ index 0000000000..1fe4e2f9ff
 +    }
 +    t->ev_n++;
 +    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-+           "[PTV-TL] event #%"PRId64" (stream %d opened): %s", t->ev_n, t->trig, cls);
++           "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
 +    if (prog_event)
 +        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
 +               " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
@@ -30984,6 +31741,19 @@ index 0000000000..1fe4e2f9ff
 +        return ptv_demux_dispatch(d, pkt);
 +    s = &t->st[si];
 +    s->dense = is_dense(d, si);
++    /* T-480 (the sync check, observe only): the event number and this stream's own-clock offset, as they stood after
++     * its previous packet — the ledgers they belong to were posted then, and both are events to the check */
++    if (t->ev_n != t->ev_pub && d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT) {
++        t->ev_pub = t->ev_n;
++        atomic_store_explicit(&g_rsx.tl_ev[d->rsync_slot], t->ev_n, memory_order_relaxed);
++    }
++    if (s->rep_big != s->big_pub) {
++        int j;
++        s->big_pub = s->rep_big;
++        for (j = 0; j < d->n_audio; j++)
++            if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO)
++                atomic_store_explicit(&g_rsx.eo_us[d->aglobal[j]], s->rep_big, memory_order_relaxed);
++    }
 +
 +    /* 2.2.1 T-463: an audio a clock-step program event left behind (await_j = the video's step). A packet nearer its old
 +     * path than the path it is awaited on is old content: it goes out on the old offset (the source's audio clock lags
@@ -31012,7 +31782,28 @@ index 0000000000..1fe4e2f9ff
 +            s->last_wc       = nw;
 +            s->aw_vref       = v && v->ok ? v->last_us : 0;
 +            relabel(d, pkt, 0, -s->aw_dk);    /* the old offset: its sound runs on where it was */
-+            return ptv_demux_dispatch(d, pkt);
++            return tl_out(d, t, si, pkt);
++        }
++        if (near_old && tl_mute_on()) {
++            /* T-480: not crossed in TL_AWAIT_US — the audio is off the program clock (only the video restarted): muted, no
++             * repair. Its off-clock time counts from the await's start: still there TL_MUTE_US after it, the offset
++             * that keeps its labels where they were is adopted (below, on its path) */
++            if (!s->mute) {
++                s->mute     = 1;
++                /* the await already watched it steady on its own clock for TL_AWAIT_US with its sound in sync on the old
++                 * offset: adopted on its next packet, no silence (owner rule: never silence for nothing; bound <= 10 s) */
++                s->mute_wc  = nw - TL_MUTE_US;
++                s->mute_rep = 0;
++            }
++            s->mute_rep -= s->aw_dk;
++            t->er_lo = t->er_hi = 0;          /* the span the video erased is no sound of its to drop */
++            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: did not cross the video's step %+.3f s in %.0f s — off the "
++                   "program clock, MUTED (%+.3f s)\n", d->rsync_slot, si, s->await_j / 1e6, TL_AWAIT_US / 1e6,
++                   s->mute_rep / 1e6);
++            s->await_j = s->strag_until_wc = 0;
++            s->ok = 0;
++            path_take(s, s_us, nw);
++            return tl_out(d, t, si, pkt);
 +        }
 +        if (near_old) {
 +            /* not crossed in TL_AWAIT_US: the audio keeps a clock of its own (only the video restarted) — repaired on the
@@ -31024,16 +31815,16 @@ index 0000000000..1fe4e2f9ff
 +            ptv_rsync_post_edit(d, si, rp);
 +            relabel(d, pkt, 0, rp);
 +            t->er_lo = t->er_hi = 0;          /* the span the video erased is no sound of its to drop */
-+            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] stream %d: did not cross the video's step %+.3f s in %.0f s — a clock of "
-+                   "its own, repaired on the stream %+.3f s (repair now %+.3f s)\n", si, s->await_j / 1e6,
++            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: did not cross the video's step %+.3f s in %.0f s — a clock of "
++                   "its own, repaired on the stream %+.3f s (repair now %+.3f s)\n", d->rsync_slot, si, s->await_j / 1e6,
 +                   TL_AWAIT_US / 1e6, rp / 1e6, s->rep_us / 1e6);
 +            s->await_j = s->strag_until_wc = 0;
 +            s->ok = 0;
 +            path_take(s, s_us + rp, nw);
 +            return ptv_demux_dispatch(d, pkt);
 +        }
-+        av_log(NULL, AV_LOG_INFO, "[PTV-TL] stream %d: crossed after the video's step %+.3f s (%+.3f s off it)\n",
-+               si, s->await_j / 1e6, (s_us - (s->last_us + e + s->step_us)) / 1e6);
++        av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d stream %d: crossed after the video's step %+.3f s (%+.3f s off it)\n",
++               d->rsync_slot, si, s->await_j / 1e6, (s_us - (s->last_us + e + s->step_us)) / 1e6);
 +        s->ok = 0;                            /* crossed: re-seeded on its new path by this packet, labels as they come */
 +        path_take(s, s_us, nw);
 +        s->await_j = s->strag_until_wc = 0;
@@ -31044,7 +31835,7 @@ index 0000000000..1fe4e2f9ff
 +            av_packet_free(&pkt);
 +            return 0;
 +        } else
-+            return ptv_demux_dispatch(d, pkt);
++            return tl_out(d, t, si, pkt);
 +    }
 +
 +    if (t->active) {
@@ -31096,7 +31887,7 @@ index 0000000000..1fe4e2f9ff
 +    }
 +    if (!s->ok) {
 +        path_take(s, s_us, nw);
-+        return ptv_demux_dispatch(d, pkt);
++        return tl_out(d, t, si, pkt);
 +    }
 +    /* a straggler of the old path after an event: content of the erased span, never shown */
 +    if (s->strag_until_wc && nw < s->strag_until_wc &&
@@ -31122,8 +31913,8 @@ index 0000000000..1fe4e2f9ff
 +            relabel(d, pkt, 0, rp);
 +            s_us += rp;
 +            t->ev_n++;
-+            av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): single-stream %s %+.3f s on the stream "
-+                   "(repair now %+.3f s)\n", t->ev_n, si, rp > 0 ? "relabel, repaired" :
++            av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d event #%"PRId64" (stream %d): single-stream %s %+.3f s on the stream "
++                   "(repair now %+.3f s)\n", d->rsync_slot, t->ev_n, si, rp > 0 ? "relabel, repaired" :
 +                   "return leg, repair undone", rp / 1e6, s->rep_us / 1e6);
 +        }
 +    }
@@ -31135,11 +31926,13 @@ index 0000000000..1fe4e2f9ff
 +        !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000) &&
 +        s_us - (s->last_us + s->step_us) <= nw - s->last_wc + tol_us(s)) {
 +        t->ev_n++;
-+        av_log(NULL, AV_LOG_INFO, "[PTV-TL] event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
-+               "%.3f s, labels as sent, no window\n", t->ev_n, si,
++        s->hk_us = s_us - (s->last_us + s->step_us);   /* T-481: part of the outage a later program event may complete */
++        s->hk_wc = nw;
++        av_log(NULL, AV_LOG_INFO, "[PTV-TL] in%d event #%"PRId64" (stream %d): hole kept — J %+.3f s within its own silence of "
++               "%.3f s, labels as sent, no window\n", d->rsync_slot, t->ev_n, si,
 +               (s_us - (s->last_us + s->step_us)) / 1e6, (nw - s->last_wc) / 1e6);
 +        path_take(s, s_us, nw);
-+        return ptv_demux_dispatch(d, pkt);
++        return tl_out(d, t, si, pkt);
 +    }
 +    if (off_path(s, s_us)) {
 +        TlPkt *h = &t->held[0];
@@ -31161,8 +31954,43 @@ index 0000000000..1fe4e2f9ff
 +            atomic_fetch_add_explicit(d->disturb_epoch, 1, memory_order_relaxed);
 +        return 0;
 +    }
++    if (s->mute) {
++        /* T-480: a muted audio going on on its own path. Its labels read on the program clock again (the program moved
++         * to it, or it came back below the window threshold): unmuted, labels as sent. Still off it TL_MUTE_US after it
++         * left: it stays there — placed by its arrival next to the pictures: the offset that keeps its labels where they
++         * were (its content ran on with the wall) is adopted, once; its step back to the program clock undoes it */
++        int64_t off = 0, rp = s->mute_rep;
++        int on = !s->rep_big && clk_off(d, t, si, s_us, nw, 0, &off) && s->clk_ok && llabs(off) <= TL_CLK_US;
++        if (on || nw - s->mute_wc >= TL_MUTE_US) {
++            s->mute = 0;
++            s->mute_rep = 0;
++            if (on)
++                rp = 0;
++            if (rp) {
++                s->rep_us  += rp;
++                s->rep_big += rp;
++                d->wrap_off[si] += av_rescale_q(rp, AV_TIME_BASE_Q, d->ifmt->streams[si]->time_base);
++                ptv_rsync_post_edit(d, si, rp);
++                relabel(d, pkt, 0, rp);
++                s_us += rp;
++            }
++            t->ev_n++;
++            av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d event #%"PRId64" (stream %d): %s — %+.3f s off the program clock, "
++                   "silent %.1f s, offset on the stream %+.3f s\n", d->rsync_slot, t->ev_n, si,
++                   on ? "audio back on the program clock, unmuted, labels as sent" :
++                        "audio steadily off the program clock, placed by its arrival (offset adopted)",
++                   off / 1e6, (nw - s->mute_wc) / 1e6, s->rep_big / 1e6);
++        }
++    } else
++        clk_learn(d, t, si, s_us, nw);
 +    path_take(s, s_us, nw);
-+    return ptv_demux_dispatch(d, pkt);
++    return tl_out(d, t, si, pkt);
++}
++
++/* T-480: the stream is muted (off the program clock) — the absence watch fills its tracks with silence at once */
++int ptv_tl_muted(DemuxArgs *d, int si)
++{
++    return d->tl && si >= 0 && si < d->tl->nst && d->tl->st[si].mute;
 +}
 +
 +/* our own cut (the depth door): the span [Va, Vb) was dropped on every stream on the pictures' boundaries — erase it
