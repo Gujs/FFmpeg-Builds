@@ -105,16 +105,55 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..d7dc9dab0b
+index 0000000000..86bb9d365b
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6261 @@
+@@ -0,0 +1,6300 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.1-rc7 — rc6 + PCR-locked clock follow (T-471), sync_check-safe logs (T-486), reshaped / renumbered return (T-476, T-484), no frozen picture after bars (T-474), continuous audio in stall storms (T-478)
++
++**The source clock is locked on its PCR, in front (T-471, owner: the professional way).** The input regulator measures the
++source clock against ours from its PCR — the earliest packet of each 2 s against its PCR (delivery only delays a packet),
++a least-squares line over the last 16-60 s, used only when the minima do not scatter (burst delivery, a wandering PCR stay
++on the old path) — feeds it forward into its schedule (the hold stays D) and the house clock follows it at once beyond
++5000 ppm. A 1.9 % fast / 1.5 % slow source locked in 10-15 s instead of 3 min; the delay moved +0.21 / -0.21 s instead of
+++2.2 / -1.2 s. Unregulated inputs and mosaics keep the video estimate and its 2 min rule (T-090).
++**Logs sync_check can trust (T-486, Fable 5.2 review of every line).** lipsync= no longer shows an adopted own-clock
++offset (rc5/rc6 printed +10313001 ms in sync — sync_check's PIN probe would have restarted the channel; 8 gate keys).
++The sync check pairs audio with the picture shown nearest it after a backward clock step (it read -11680 ms with the
++content in sync). STEPPED lines print the sensor's value; async= is not fed by a step; [PTV-LIPSYNC] (DIAG) is the paired
++offset; texts that described removed behaviour corrected; the legend covers every always-on tag; long log calls are no
++longer cut under PTV_LOG_TS.
++**A source that comes back reshaped rejoins in-process (T-476).** A new picture size is fitted like a mid-stream switch,
++an added track is ignored, the mapped streams keep playing; exit 4 only when a mapped stream is gone or changes
++codec / type / language. **A joint backward step is erased per stream** when one stream's own step differs (a85 +105 ms).
++**A rejoin's queued pictures get the slots after the prime (T-472):** vt-holes -240 → -80 ms.
++**A source that comes back with every PID moved keeps its sound (T-484).** The video's PID move was followed in-process,
++the audio's was not (silent for good): an audio stream that starts delivering while a bound one of the same codec has been
++silent 2 s is taken over on the same track. **No frozen picture after the bars (T-474):** after a kept hole the decoder
++input waits for a keyframe — the first returning P-frame decoded against the pre-outage reference and showed the old
++picture once. **The audio PID never goes dark in a stall storm (T-478, owner: professional behaviour):** returning audio
++behind a fill no longer moves the door back (the played span is trimmed, up to 15 s while / right after a fill) and a
++frame dropped at the door does not stop the fill: 1.5 s dark → 0.26 s. **The sync check pairs no picture shown > 5 s
++from its sound; a damage span keeps the whole pictures inside it** (an own-clock audio was adopted 40 ms early).
++
++## 2.2.1-rc6 — rc5 + the sync check corrects A/V once after an event (T-480 step 5, the golden rule)
++
++**A/V sync perfect again within seconds of a clean source (owner's golden rule).** rc5's [PTV-SYNCCHK] now acts: once the
++source has been clean for 3 s and the readings agree for 2 s, an offset outside +-25 ms and within 5 s is stepped out
++ONCE per event (the audio's door labels move by the reading; the [PTV-ANCHOR] algebra retires it exactly). A real audio
++repeat of 341 / 512 ms is corrected 4.1 s after the event instead of by the slow corrector 4-8 minutes later; the slow
++corrector keeps drift only. Not stepped: an erase whose audio could not tell a relabel from a repeat (a steady tone,
++silence — T-087: a relabel never moves the audio), offsets beyond 5 s, and mosaic slots (they log what they would do;
++no mosaic key yet). PTV_NO_B2STEP=1 = rc5 behaviour (observe only).
++Kit: T056_GOLDEN=1 judge (A/V within +-25 ms from 10 s after a clean source), keys rich2997long-t480g arepeat_300 /
++arepeat_600 / arelabel_600 + std-t480g arelabel; identify() drops an isolated chance flash match.
 +
 +## 2.2.1-rc5 — rc4 + audio off the program clock is muted (T-480), the sync check (observe), lipsync= after an adopted offset, a clock step right after an outage (T-481), GPU memory bounded (T-482), the rejoin park (T-472)
 +
@@ -6372,10 +6411,10 @@ index 0000000000..d7dc9dab0b
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..ddab0f356b
+index 0000000000..3385ac5754
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,7880 @@
+@@ -0,0 +1,7902 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6425,7 +6464,7 @@ index 0000000000..ddab0f356b
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.1-rc5"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.1-rc7"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -6477,6 +6516,7 @@ index 0000000000..ddab0f356b
 +int     g_rlcheck = 1;             /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 +int     g_rlundo = 1;              /* 2.0.2 T-395: a silent no-verdict audio erase is undone (PTV_NO_RLUNDO=1 off) */
 +int     g_synchk = 1;              /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
++int     g_synchk_step = 1;         /* 2.2.1 T-480 step 5: ... and its one bounded step (PTV_NO_B2STEP=1 = observe only) */
 +double  g_rl_relabel_max = 0.3;    /* 2.0.2 T-391: a RELABEL verdict needs the repeat correlation below this (PTV_RL_RELABEL_MAX; 2.0.1: 0.5) */
 +int     g_voutlier = 1;            /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 +_Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
@@ -7213,8 +7253,9 @@ index 0000000000..ddab0f356b
 +static void ptv_log_ts_callback(void *avcl, int level, const char *fmt, va_list vl)
 +{
 +    static int print_prefix = 1, at_line_start = 1, repeats;
-+    static char prev[2048];
-+    char buf[2048];
++    static char prev[8192];
++    char buf[8192];                 /* 2.2.1 T-486: was 2048 — a longer call (the legend chunks, 4.9 KB) lost its tail and
++                                     * its newline, gluing the next line on without its stamp */
 +    int n, start;
 +
 +    if (level > av_log_get_level())
@@ -7300,16 +7341,23 @@ index 0000000000..ddab0f356b
 +/* nearest-by-content lookup: of all kept entries, return the out_v and matched src of the one
 + * whose src is closest to want_src. 0 = found (ring non-empty), -1 = empty (or, 2.0.0 T-089, no
 + * pairing: see below). */
-+int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src)
++int vring_lookup(VOutRing *r, int64_t want_src, int64_t out_hint, int64_t *out_v, int64_t *matched_src)
 +{
-+    int64_t best = INT64_MAX, bo = 0, bs = 0, lo = INT64_MAX;
-+    int found = 0, cnt, i;
++    int64_t best = INT64_MAX, bo = 0, bs = 0, lo = INT64_MAX, bt = INT64_MAX;
++    int found = 0, cnt, i, near = 0;
 +    pthread_mutex_lock(&r->lock);
 +    cnt = r->n < PTV_VRING ? (int)r->n : PTV_VRING;
 +    for (i = 0; i < cnt; i++) {
 +        int idx = (int)((r->n - 1 - i) % PTV_VRING);
 +        int64_t d = r->src[idx] - want_src; if (d < 0) d = -d;
-+        if (d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
++        /* 2.2.1 T-486: after a backward clock step the ring holds the same labels twice (the old timeline's pictures
++         * and the new ones). Of the entries whose label matches (within 60 ms), the one shown nearest the audio's own
++         * output time is its picture — nearest-by-label alone paired an old-domain picture 11.7 s back (vt-vfgap: the
++         * sync check read -11680 ms with lipsync=+1 ms and the content in sync; under 5 s it would have STEPPED) */
++        if (out_hint != AV_NOPTS_VALUE && d <= 60000) {
++            int64_t t = r->out[idx] - out_hint; if (t < 0) t = -t;
++            if (!near || t < bt) { bt = t; bo = r->out[idx]; bs = r->src[idx]; found = near = 1; }
++        } else if (!near && d < best) { best = d; bo = r->out[idx]; bs = r->src[idx]; found = 1; }
 +        if (r->src[idx] < lo) lo = r->src[idx];
 +    }
 +    /* 2.0.0 T-089: for 10 s after a multiview slot's ring restarted on a new content segment, audio
@@ -7317,6 +7365,11 @@ index 0000000000..ddab0f356b
 +     * that bridged the outage, drained in a burst. Extrapolating it read −0.8 s and the PLL dropped
 +     * 639 ms of real audio right after the return (audio ~150 ms early for a minute). */
 +    if (found && r->seg_wc && want_src < lo - 1000000 && av_gettime_relative() - r->seg_wc < 10000000)
++        found = 0;
++    /* 2.2.1 T-486: right after a backward step the audio's label may not have been shown yet on the new timeline — the
++     * only match is the old timeline's picture, shown seconds away (vt-vfgap: one -11680 ms reading, then 0 ms). A
++     * picture shown more than 5 s (the sync check's cap) from the sound is not its picture: no pairing for this frame */
++    if (found && out_hint != AV_NOPTS_VALUE && (bo - out_hint > 5000000 || out_hint - bo > 5000000))
 +        found = 0;
 +    pthread_mutex_unlock(&r->lock);
 +    if (found) { *out_v = bo; *matched_src = bs; }
@@ -9212,8 +9265,11 @@ index 0000000000..ddab0f356b
 +     * mapped; a lead inside the cushion is not mapped at all and the picture waits for its own slot. */
 +    if (ptv_rj_prime_class()) {
 +        int64_t pr = atomic_load_explicit(&g_rj_prime_us, memory_order_relaxed);
-+        if (pr > tick * (1 + qn))
-+            next += pr - tick * (1 + qn);
++        /* 2.2.1 T-472: the first returning picture is shown one prime from now, EACH queued one a tick after it —
++         * out + pr + tick*qn. Was out + max(pr, tick*(1+qn)): the slot stood still while the catch-up decoded, the 5th
++         * picture read +80 ms "ahead" and was mapped (vt-holes: hs -80 ms per hole, -240 ms for good; the T-317 trap) */
++        if (pr > tick)
++            next += pr - tick;
 +    }
 +    lead = pos - next;
 +    if (g_diag && d->rj_dbg_n < 16) {   /* 2.0.0-pre8.2: [PTV-RJTRACE] (canary B: the map cancelled — localize) */
@@ -9337,14 +9393,17 @@ index 0000000000..ddab0f356b
 +    /* only while still holding: after a STOP/CONT the returning content CONTINUES the pre-gap timeline (delayed, not
 +     * lost) — carrying the hold picture on every continuing frame put bars on air for good (rc4-dev9: sync_stop_10 /
 +     * kill_return_20 live share 0.01). Residual: a return in a new rendition keeps one stale picture (vt-vsw-bars) */
++    if (!ptv_src_holding())
++        d->hr_tail_said = 0;
 +    if (g_hold_render && d->hr_real_set && d->hr_dur > 0 && ptv_src_holding() && ptv_hold_bars_pic(d, frame)) {
 +        int64_t dt = frame->best_effort_timestamp - d->hr_real_pts;
 +        if (frame->best_effort_timestamp != AV_NOPTS_VALUE && dt > 0 && dt <= 2 * d->hr_dur) {
 +            AVFrame *bp = ptv_hold_bars_pic(d, frame);
 +            AVFrame *rp = bp ? av_frame_clone(bp) : NULL;
 +            if (rp && av_frame_copy_props(rp, frame) >= 0) {
-+                av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 a pre-gap picture (+%.0f ms after the last one shown) after "
-+                       "the bars carries the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
++                if (!d->hr_tail_said++)        /* T-486: once per hold (it was one line per picture) */
++                    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 pre-gap pictures after the bars (the first +%.0f ms after "
++                           "the last one shown) carry the hold picture\n", av_q2d(d->ist_tb) * dt * 1000.0);
 +                av_frame_side_data_free(&rp->side_data, &rp->nb_side_data);
 +                rp->opaque = NULL;
 +                av_frame_unref(frame);
@@ -10065,7 +10124,7 @@ index 0000000000..ddab0f356b
 +                        *d->h0 = av_rescale_q(ts, d->ist_tb, AV_TIME_BASE_Q);
 +                        /* [PTV-ANCHOR] (v0.9.16.3, always-on): the video half of the birth pair —
 +                         * each audio track logs its first_audio-h0 offset against this. */
-+                        av_log(NULL, AV_LOG_WARNING,
++                        av_log(NULL, AV_LOG_INFO,      /* T-486: normal start-up = INFO */
 +                               "[PTV-ANCHOR] h0 anchored at %"PRId64"ms (first decoded video frame)\n",
 +                               *d->h0 / 1000);
 +                        atomic_store_explicit(&g_t_dec_us, av_gettime_relative(), memory_order_relaxed);
@@ -11937,6 +11996,7 @@ index 0000000000..ddab0f356b
 +        inputs[k].est.cf_ema_q20 = 1 << 20;
 +        inputs[k].est.src_rate_q20 = 1 << 20;
 +        inputs[k].est.cf_rate_q20 = 1 << 20;
++        inputs[k].est.reg_k = multiview ? -1 : k;   /* 2.2.1 T-471: single input follows its regulator's PCR measure */
 +        pthread_mutex_init(&inputs[k].h0_lock, NULL);
 +        pthread_mutex_init(&inputs[k].da.pass_lock, NULL);   /* 2.0.0-pre6 */
 +        pthread_mutex_init(&inputs[k].hold.lock, NULL);
@@ -13320,7 +13380,7 @@ index 0000000000..ddab0f356b
 +    { "init_hw_device",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "init hw device", "args" },
 +    { "filter_hw_device", OPT_TYPE_STRING, 0,                        { .off = 0 }, "filter hw device", "name" },
 +    { "filter_complex",   OPT_TYPE_STRING, 0,                        { .off = 0 }, "filtergraph", "graph" },
-+    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any; now comes in 2.1)", "when" },
++    { "start_on",         OPT_TYPE_STRING, 0,                        { .off = 0 }, "when outputs start: video (single input), any|all (mosaic, default any)", "when" },
 +    { "slot_wait",        OPT_TYPE_STRING, 0,                        { .off = 0 }, "mosaic: wait this long for every slot, then start with the live ones (default 3s; inf; -regulate adds its delay)", "dur" },
 +    { "audio_lang_override", OPT_TYPE_STRING, 0,                     { .off = 0 }, "audio rules: relabel source languages first, KEY:LANG,… (KEY = 0xPID, audio index or language)", "list" },
 +    { "audio_codec_pref", OPT_TYPE_STRING, 0,                        { .off = 0 }, "audio rules: survivor codec order among same-programme duplicates (default eac3,ac3,aac,mp2,mp3)", "list" },
@@ -13907,6 +13967,7 @@ index 0000000000..ddab0f356b
 +    if (getenv("PTV_NO_PESTAIL")) g_pestail = 0;   /* 2.0.0-pre4c: PES-tail carry off */
 +    if (getenv("PTV_NO_RLCHECK")) g_rlcheck = 0;   /* 2.0.1 T-087: relabel content check off */
 +    if (getenv("PTV_NO_RLUNDO")) g_rlundo = 0;     /* 2.0.2 T-395: keep a silent no-verdict audio erase (2.0.1 behaviour) */
++    if (getenv("PTV_NO_B2STEP")) g_synchk_step = 0;  /* 2.2.1 T-480 step 5: the sync check observes only (rc5) */
 +    if (getenv("PTV_NO_SYNCCHK")) g_synchk = 0;    /* 2.2.1 T-480: no [PTV-SYNCCHK] lines (it only observes) */
 +    if (getenv("PTV_RL_RELABEL_MAX")) g_rl_relabel_max = atof(getenv("PTV_RL_RELABEL_MAX"));   /* 2.0.2 T-391 */
 +    if (getenv("PTV_NO_VOUTLIER")) g_voutlier = 0; /* 2.0.1 T-383: video timestamp outlier restamp off */
@@ -14123,7 +14184,7 @@ index 0000000000..ddab0f356b
 +            g_start_on_set = 1;
 +            if (strcmp(g_start_on, "video") && strcmp(g_start_on, "any") && strcmp(g_start_on, "all")) {
 +                av_log(NULL, AV_LOG_ERROR, "-start_on %s: %s\n", g_start_on,
-+                       !strcmp(g_start_on, "now") ? "comes in 2.1; supported: video (single input), any|all (mosaic)"
++                       !strcmp(g_start_on, "now") ? "not supported; supported: video (single input), any|all (mosaic)"
 +                                                  : "unknown value (video|any|all)");
 +                uninit_parse_context(&octx); return 1;
 +            }
@@ -14258,10 +14319,10 @@ index 0000000000..ddab0f356b
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..46b96216ae
+index 0000000000..3803110849
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2268 @@
+@@ -0,0 +1,2284 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -14311,6 +14372,7 @@ index 0000000000..46b96216ae
 +    _Atomic int     cf_locked;      /* 20 clean chunks (~60s) before the servo may follow */
 +    _Atomic int64_t src_rate_q20;   /* recovered source rate (content-µs/wall-µs), Q20 */
 +    _Atomic int     src_rate_locked;/* 0 until the FLL trusts the estimate */
++    int     reg_k;                  /* 2.2.1 T-471: its regulator (input index; -1 = mosaic / none) */
 +} RateEstimator;
 +/* 0.9.18 R1+R3/R4: master-output-side house-rate actuation state (the ladder's memory).
 + * One per HOUSE CLOCK — the instance is a transcode()-scope struct shared by the rung set
@@ -14707,6 +14769,8 @@ index 0000000000..46b96216ae
 +    int         n;                  /* ... this many of them */
 +    int64_t     led, own, last;     /* the last reading: its ledger part, the exempt own-clock offset, the sum */
 +    int64_t     log_wc;             /* PTV_DIAG: the last "undecided" line */
++    int         rl_nov;             /* 2.2.1 T-480 step 5: an erase of this watch got NO relabel/repeat verdict */
++    int         steps;              /* ... bounded corrections taken (the stats / end tally) */
 +} SyncChk;
 +
 +/* 0.9.18 M3 — CushionRt: the runtime COORDINATION home for cushion escalation (map §1.3).
@@ -15079,6 +15143,7 @@ index 0000000000..46b96216ae
 +    int64_t          hr_pts, hr_dur;          /* next render pts / one frame, in ist_tb */
 +    int64_t          hr_real_pts;             /* 2.2.1 T-474: the last REAL picture's pts (ist_tb; hr_pts runs on in a hold) */
 +    int              hr_real_set;
++    int              hr_tail_said;     /* 2.2.1 T-486: the pre-gap tail line said for this hold (once per hold) */
 +    int64_t          hr_next;                 /* wall us of the next render */
 +    struct HoldPic  *hr_pic;                  /* bars / slate / black picture cache */
 +    /* filter graph: filtering -> N buffersinks (one per rung); else clone decode */
@@ -15389,6 +15454,11 @@ index 0000000000..46b96216ae
 +    int64_t          glue_raw_last_us;              /* last RAW in-pts (us); NOPTS until first frame */
 +    int64_t          glue_raw_dur_us;                 /* its frame span (us) */
 +    int64_t          glue_wall_last_us;               /* monotonic wall time of the previous fed frame */
++    /* 2.2.1 T-478: the arrival bookkeeping before this frame — restored when the door drops the frame whole (it never
++     * reaches the output: the silence fill must go on, not stop for a frame that is not played) */
++    int64_t          gs_raw, gs_dur, gs_wall, gs_hs, gs_dup;
++    int64_t          hfe_wc;                          /* T-478: wall time the last hold fill ended */
++    int              gs_ok;
 +    int64_t          hf_hs_real, hf_dup_real;         /* 2.0.0-pre9.4 (T-083): house_skew + g_dup_out_us at that frame */
 +    int64_t          hsg_src, hsg_dur, hsg_hs, hsg_wc;  /* T-321: previous door frame's source pts / span / applied
 +                                                         * house_skew / wall time */
@@ -15779,6 +15849,11 @@ index 0000000000..46b96216ae
 +    int64_t               v_last_wc;      /* 2.0.2 T-387: wall time of the last packet of the bound video stream */
 +    int                   vmove_n;        /* ... video packets of a late-born video stream while the bound one is silent */
 +    int                   vmove_force;    /* ... the video moved to a new PID: reopen now (single input: -> exit 4) */
++    /* 2.2.1 T-484: an AUDIO stream that moved to a new PID (renumbered source) is taken over in-process: the new stream's
++     * packets are routed to the bound stream's index (amove_to[new] = bound + 1; amove_from[bound] = new + 1) */
++#define PTV_AMOVE_MAX 64
++    int8_t                amove_to[PTV_AMOVE_MAX], amove_from[PTV_AMOVE_MAX];
++    int64_t               amove_seen[PTV_AMOVE_MAX];   /* wall time the late-born audio stream's first packet came */
 +    /* 2.1 T-003 step 1: the source's program and mapped audio, checked once a second from the video path (ptv_src_check) */
 +    int64_t               src_chk_wc;     /* last check (wall) */
 +    int64_t               v_flow_wc;      /* the video flowing since (wall; a 1 s pause restarts it) */
@@ -16044,6 +16119,7 @@ index 0000000000..46b96216ae
 +extern int     g_pestail;   /* 2.0.0-pre4c: PES-tail wall-gap carry for video wall evidence (PTV_NO_PESTAIL=1 off) */
 +extern int     g_rlcheck;   /* 2.0.1 T-087: content check of a backward audio erase (PTV_NO_RLCHECK=1 off) */
 +extern int     g_synchk;    /* 2.2.1 T-480: the post-event sync check, observe only (PTV_NO_SYNCCHK=1 off) */
++extern int     g_synchk_step; /* 2.2.1 T-480 step 5: the sync check takes its one bounded step (PTV_NO_B2STEP=1 = observe) */
 +extern double  g_rl_relabel_max;   /* 2.0.2 T-391 */
 +extern int     g_voutlier;  /* 2.0.1 T-383: one-picture timestamp outlier restamped (PTV_NO_VOUTLIER=1 off) */
 +/* 2.0.0-pre6.1 (T-077): rejoin map — content that comes back AHEAD of the house after a hold (the WUCR stretch at the
@@ -16241,6 +16317,7 @@ index 0000000000..46b96216ae
 +char *ptv_regulate_start(const char *url, int64_t delay_us, int k);
 +void  ptv_regulate_stop(void);
 +int   ptv_regulate_unregulated(void);   /* 2.2 T-444: inputs passing unregulated now (no clock), for the status line */
++int   ptv_regulate_rate(int k, int64_t *ppm);   /* 2.2.1 T-471: input k's source clock rate measured on its PCR (1 = a measure) */
 +/* 2.2: audio track rules on -map (ptvencoder_bind.c, spec §7): a:main | a:langs | a:lang=xxx | a:multich | a:pid=0x.. |
 + * a:index=N [,c=,b=,ac=,af=,lang=,label=,title=,default=1] */
 +enum { PTV_BIND_MAIN, PTV_BIND_LANGS, PTV_BIND_LANG, PTV_BIND_MULTICH, PTV_BIND_PID, PTV_BIND_INDEX };
@@ -16527,15 +16604,15 @@ index 0000000000..46b96216ae
 +/* ptvencoder.c */
 +void vring_put(VOutRing *r, int64_t src_us, int64_t out_us);
 +int vring_shown(VOutRing *r, int64_t c_us, int64_t *out_us, int64_t *gap_us);
-+int vring_lookup(VOutRing *r, int64_t want_src, int64_t *out_v, int64_t *matched_src);
++int vring_lookup(VOutRing *r, int64_t want_src, int64_t out_hint, int64_t *out_v, int64_t *matched_src);   /* out_hint: AV_NOPTS_VALUE = none (T-486) */
 +
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..82c5977445
+index 0000000000..f79a544a5d
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,4040 @@
+@@ -0,0 +1,4095 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -17347,9 +17424,10 @@ index 0000000000..82c5977445
 +    a->acomp_exp_us  = AV_NOPTS_VALUE;  /* deliberate step, not a click risk */
 +}
 +
-+/* ===================== 2.2.1 T-480 step 4 — the post-event sync check (B2), OBSERVE ONLY =====================
++/* ===================== 2.2.1 T-480 steps 4-5 — the post-event sync check (B2) =====================
 + * After every event on a track's input, once its source is clean again, read the track's A/V offset from the terms
-+ * that are exact at once and say what ONE bounded step would do. Nothing is changed here: one [PTV-SYNCCHK] line per
++ * that are exact at once; since rc6 (step 5) an offset of 25 ms .. 5 s is stepped out ONCE (ptv_label_step), unless an
++ * erase of the event had no verdict, on a mosaic slot, or with PTV_NO_B2STEP=1: one [PTV-SYNCCHK] line per
 + * (track, event). R = vring + ledger  [+ = audio early, the stats line's lipsync= convention]:
 + *   vring  = out_v(C) - out_a(C) for the same label C, per emitted frame, no averaging (av_offset_us): the PLACEMENT
 + *            error (a hold's rejoin, the door, the slot's delay line). Blind to label edits by construction
@@ -17362,6 +17440,11 @@ index 0000000000..82c5977445
 + * exactly R ([PTV-ANCHOR] algebra, ptv_label_step). A resampler slip (rs_slip_us) is waited out, not added.
 + * Event  = any feed below moved (synchk_event). Clean = this track's own input only, no sibling (synchk_unclean).
 + * Decision = PTV_SC_CLEAN_US clean and PTV_SC_AGREE_US of paired readings within +-PTV_SC_TOL_US.
++ * 2.2.1 T-480 STEP 5 (golden rule, owner 2026-11-14): a decision outside +-25 ms and within the 5 s cap TAKES the step
++ * (ptv_label_step(R): glue_off += R), once per event — A/V back within ~4 s of a clean source instead of the slow
++ * corrector's minutes (rich2997long arepeat_300 / _600: -341 / -512 ms for 4-8 min). Not when an erase of the event had
++ * no relabel verdict (a steady tone or silence cannot vouch: std sync_arelabel reads -300 ms in sync = T-087) and not
++ * on a mosaic slot yet (no mosaic key). The slow corrector keeps drift. PTV_NO_B2STEP=1 = observe only (rc5).
 + * PTV_NO_SYNCCHK=1 off. */
 +#define PTV_SC_CLEAN_US   3000000   /* the source is clean after this long with no event, damage, hold or fill */
 +#define PTV_SC_AGREE_US   2000000   /* ... and a decision needs the readings to agree for this long */
@@ -17461,8 +17544,10 @@ index 0000000000..82c5977445
 +        return;
 +    ev = synchk_event(a);
 +    if (ev) {                                                  /* events before the decision merge into one watch */
-+        if (!s->watch)
++        if (!s->watch) {
 +            s->log_wc = now;
++            s->rl_nov = 0;
++        }
 +        s->ev_n++;
 +        s->ev_why   = ev;
 +        s->ev_wc    = now;
@@ -17507,26 +17592,44 @@ index 0000000000..82c5977445
 +    if (!bad && s->n >= PTV_SC_MIN_N && clean >= PTV_SC_CLEAN_US && now - s->agree_wc >= PTV_SC_AGREE_US) {
 +        int64_t mid = (s->lo + s->hi) / 2;
 +        char slow[32] = "--";
-+        if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare */
-+            snprintf(slow, sizeof(slow), "%+"PRId64" ms",
-+                     (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +
++        const char *act = NULL;                                /* step 5: what was done (NULL = observe only) */
++        if (a->rs_ma_seed)                                     /* the averaged sensor's reading now, to compare — read */
++            snprintf(slow, sizeof(slow), "%+"PRId64" ms",      /* BEFORE a step re-seeds it (T-486: every STEPPED line */
++                     (atomic_load_explicit(&g_rsx.mv_ema[a->dbg_in], memory_order_relaxed) - a->rs_ma_ema +   /* printed -- ) */
 +                      atomic_load_explicit(&g_rsx.ev_us[a->dbg_in], memory_order_relaxed) -
-+                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed)) / 1000);
++                      atomic_load_explicit(&g_rsx.ea_us[a->dbg_k], memory_order_relaxed) +
++                      atomic_load_explicit(&g_rsx.eo_us[a->dbg_k], memory_order_relaxed)) / 1000);   /* T-486 */
++        if (llabs(mid) > PTV_SC_BAND_US && llabs(mid) <= PTV_SC_CAP_US) {
++            if (!g_synchk_step)
++                act = NULL;
++            else if (a->multiview)                             /* no mosaic key yet (rc6): a slot observes */
++                act = "observe only on a mosaic slot";
++            else if (s->rl_nov)
++                act = "not stepped: an erase of this event had no verdict (a relabel cannot be ruled out, T-087) — "
++                      "left to the corrector";
++            else {
++                ptv_label_step(a, mid, now);                   /* glue_off += R retires exactly R ([PTV-ANCHOR]) */
++                s->steps++;
++                act = "STEPPED";
++            }
++        }
 +        av_log(NULL, llabs(mid) <= PTV_SC_BAND_US ? AV_LOG_INFO : AV_LOG_WARNING,
 +               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): %s %+"PRId64" ms (ledger %+"PRId64
 +               " vring %+"PRId64" ms, agree %.1f s, clean %.1f s, %.1f s after the event; own clock %+"PRId64" ms exempt; "
-+               "lipsync %s)  [+ = audio early; observe only, PTV_NO_SYNCCHK=1 off]\n",
++               "lipsync %s)%s%s  [+ = audio early; PTV_NO_B2STEP=1 observe only, PTV_NO_SYNCCHK=1 off]\n",
 +               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap,
 +               llabs(mid) <= PTV_SC_BAND_US ? "in sync" :
-+               llabs(mid) <= PTV_SC_CAP_US  ? "would step" : "beyond the 5 s cap, would not step",
++               llabs(mid) > PTV_SC_CAP_US   ? "beyond the 5 s cap, not stepped" :
++               act && !strcmp(act, "STEPPED") ? "STEPPED" : "would step",
 +               mid / 1000, s->led / 1000, (mid - s->led) / 1000, (now - s->agree_wc) / 1e6, clean / 1e6,
-+               (now - s->ev_wc) / 1e6, s->own / 1000, slow);
++               (now - s->ev_wc) / 1e6, s->own / 1000, slow,
++               act && strcmp(act, "STEPPED") ? " — " : "", act && strcmp(act, "STEPPED") ? act : "");
 +        s->watch = 0;
 +    } else if (!bad && clean >= PTV_SC_BUDGET_US) {
 +        av_log(NULL, AV_LOG_INFO,
 +               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): no steady reading in %.0f s of "
-+               "clean source (last %+"PRId64" ms, %d readings within %"PRId64" ms for %.1f s): would not step  "
-+               "[+ = audio early; observe only]\n",
++               "clean source (last %+"PRId64" ms, %d readings within %"PRId64" ms for %.1f s): not stepped  "
++               "[+ = audio early]\n",
 +               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, clean / 1e6, s->last / 1000, s->n,
 +               (s->hi - s->lo) / 1000, (now - s->agree_wc) / 1e6);
 +        s->watch = 0;
@@ -17536,7 +17639,7 @@ index 0000000000..82c5977445
 +               "[PTV-SYNCCHK] a%d(in%d) after event %"PRId64" (%s, timeline #%"PRId64"): undecided %.0f s after it — %s "
 +               "(clean %.1f s, %d readings, last %+"PRId64" ms)\n",
 +               a->dbg_k, a->dbg_in, s->ev_n, s->ev_why, s->tl_snap, (now - s->ev_wc) / 1e6,
-+               bad ? bad : clean < PTV_SC_CLEAN_US ? "the source is clean, waiting" : "the readings do not agree yet",
++               bad ? bad : clean < PTV_SC_CLEAN_US ? "waiting for 3 s of clean source" : "the readings do not agree yet",
 +               clean / 1e6, s->n, s->last / 1000);
 +    }
 +}
@@ -18084,7 +18187,7 @@ index 0000000000..82c5977445
 +                    content -= a->corr.corr_us;
 +                if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
 +                      src_abs_us >= a->mvf_lo_us && src_abs_us < a->mvf_hi_us) &&  /* content to pair */
-+                    vring_lookup(a->vring, content, &out_v, &msrc) == 0) {
++                    vring_lookup(a->vring, content, out_a_us, &out_v, &msrc) == 0) {
 +                    int64_t vlag   = out_v    - (msrc    - h0_us);   /* video realized output − content (at msrc) */
 +                    int64_t alag   = out_a_us - (content - h0_us);   /* audio realized output − content (at content) */
 +                    int64_t offset = vlag - alag;                    /* the content-referenced (via shared h0) lip-sync the
@@ -18112,8 +18215,12 @@ index 0000000000..82c5977445
 +                    int64_t r  = dw > 0 ? (bal - a->async_prev_bal) * 1000000 / dw : 0;
 +                    int64_t cur = atomic_load_explicit(&g_async_ppm, memory_order_relaxed);
 +                    /* EMA (÷8): the per-interval balance is quantized to ~one audio frame (~21ms ⇒
-+                     * ~1000ppm noise @10s), so smooth to the NET rate — idle ≈ 0, a sustained sign = real work. */
-+                    atomic_store_explicit(&g_async_ppm, cur + ((r - cur) >> 3), memory_order_relaxed);
++                     * ~1000ppm noise @10s), so smooth to the NET rate — idle ≈ 0, a sustained sign = real work.
++                     * 2.2.1 T-486: a balance that moved faster than the resampler can work (async=1000 = 20.8 ms/s;
++                     * > 2.5 %) is a step — a hold, a fill, a label step — not work: re-baselined, not averaged in
++                     * (it read +332143 ppm decaying for minutes after one, vt-vfgap, lipsync=+1 ms throughout) */
++                    if (llabs(r) <= 25000)
++                        atomic_store_explicit(&g_async_ppm, cur + ((r - cur) >> 3), memory_order_relaxed);
 +                    a->async_stat_last = nowa; a->async_prev_bal = bal;
 +                }
 +            }
@@ -18211,20 +18318,21 @@ index 0000000000..82c5977445
 +                int64_t now = av_gettime_relative();
 +                if (a->dbg_first_out == AV_NOPTS_VALUE) a->dbg_first_out = opts;
 +                if (now - a->dbg_diag_last >= FFMAX(1000000, g_stats_period_us)) {
-+                    int64_t content_us   = av_rescale_q(a->dbg_last_src - a->dbg_first_src, a->ist_tb, AV_TIME_BASE_Q);
-+                    int64_t outspan_us   = a->out_frames * (int64_t)a->frame_size * 1000000 / a->out_rate;
-+                    int64_t async_pad_us = outspan_us - content_us;                  /* audio realized output−content */
 +                    int64_t hs_us        = a->house_skew ? *a->house_skew : 0;       /* commanded skew (capped/floored) */
 +                    int64_t lag_us       = a->house_lag_true ? *a->house_lag_true    /* TRUE video lag (multiview) … */
 +                                                             : hs_us;               /* … or house_skew (single-input, uncapped) */
++                    char errs[24] = "--";
 +                    a->dbg_diag_last = now;
-+                    /* err = audio's realized lag − video's TRUE lag. Using the TRUE (uncapped) video lag, not the
-+                     * commanded house_skew, so a slot pinned at the 250ms cap or floored at 0 (video racing/dragging
-+                     * beyond the correctable range) still surfaces. lag≠house_skew ⇒ the actuator is saturated. */
++                    /* 2.2.1 T-486: err = the ring-paired offset (the picture shown with this audio label: the sync
++                     * check's vring term, [PTV-AVSYNC]'s headline), + = audio late. It was async_pad − lag, async_pad =
++                     * the frames the encoder took minus the span of source frames FED into the filter graph: whatever
++                     * the graph holds (one AAC frame, a buffering -af) read as audio early — Cinestar −21 ms with the
++                     * content −0.9 ms. -- until the ring pairs. */
++                    if (a->av_off_valid)
++                        snprintf(errs, sizeof(errs), "%+"PRId64"ms", -a->av_offset_us / 1000);
 +                    av_log(NULL, AV_LOG_INFO,
-+                        "[PTV-LIPSYNC] a%d(in%d) err=%+"PRId64"ms  (lag_true=%+"PRId64"ms house_skew=%+"PRId64"ms async_pad=%+"PRId64"ms first_out=%"PRId64"ms)  [+ = audio late]\n",
-+                        a->dbg_k, a->dbg_in, (async_pad_us - lag_us) / 1000,
-+                        lag_us / 1000, hs_us / 1000, async_pad_us / 1000, a->dbg_first_out * 1000 / a->out_rate);
++                        "[PTV-LIPSYNC] a%d(in%d) err=%s  (paired picture vs sound; lag_true=%+"PRId64"ms house_skew=%+"PRId64"ms first_out=%"PRId64"ms)  [+ = audio late]\n",
++                        a->dbg_k, a->dbg_in, errs, lag_us / 1000, hs_us / 1000, a->dbg_first_out * 1000 / a->out_rate);
 +                }
 +            }
 +            /* 1.0.1-pre26 D3 instrumentation (PTV_MUXDIAG=1, temporary/gated): the emission-point
@@ -18636,6 +18744,7 @@ index 0000000000..82c5977445
 +{
 +    uint8_t **out = NULL;
 +    int out_max, got, ret = 0;
++    a->gs_ok = 0;                                  /* T-478: no snapshot for this frame yet */
 +    if (a->cv_feeding)
 +        goto graph_in;                             /* a converted frame: vetted by its source frame's pass */
 +    if (a->multiview && g_audio_follow && a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO) {   /* T-352 ledger history */
@@ -19158,9 +19267,14 @@ index 0000000000..82c5977445
 +                               a->dbg_k, a->dbg_in, a->hold_fill_us / 1e6);
 +                    a->hold_fill_us  = 0;
 +                    a->hold_fresh_wc = 0;
++                    a->hfe_wc        = now_wc;   /* T-478 */
 +                    if (a->dbg_k >= 0 && a->dbg_k < PTV_MAX_AUDIO)
 +                        atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
 +                }
++            }
++            if (!a->hold_feeding) {        /* T-478: a real frame — keep what it replaces until it passes the door */
++                a->gs_raw = a->glue_raw_last_us; a->gs_dur = a->glue_raw_dur_us; a->gs_wall = a->glue_wall_last_us;
++                a->gs_hs  = a->hf_hs_real;       a->gs_dup = a->hf_dup_real;     a->gs_ok   = 1;
 +            }
 +            a->glue_raw_last_us  = raw_us;
 +            a->glue_raw_dur_us   = frame->sample_rate > 0 ?
@@ -19246,13 +19360,27 @@ index 0000000000..82c5977445
 +             * 2.0.0 T-374: any overlap over 1 ms (label rounding stays below it), not only > 25 ms — the first real
 +             * frame after a hold fill landed 24 ms behind the fill's end on some runs (which tick the fill stops on is
 +             * a wall-clock phase), aresample carried it as an 18 ms step back and the encoder wrote one AAC overlap */
-+            if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= 5000000) {
++            /* 2.2.1 T-478 (owner: professional behaviour = the audio output runs on): while a fill runs or within 5 s
++             * after one, the span behind the door was already played (as silence) — a step back of up to 15 s is
++             * trimmed too. Let through (the 5 s cap), an 8.3 s step back moved the door back, the fill refilled the
++             * played span and nothing new reached the encoder for ~1.5 s (storm_2: the audio PID dark). Outside a fill
++             * the 5 s cap stays (a restart of the audio's own clock keeps its sound; T-480 adopts within 10 s) */
++            int64_t cap = a->hold_fill_us > 0 || (a->hfe_wc && av_gettime_relative() - a->hfe_wc < 5000000) ?
++                          15000000 : 5000000;
++            if (ov > (a->bk_trim_us ? 0 : 1000) && ov <= cap) {
 +                int64_t k = av_rescale(ov, frame->sample_rate, 1000000);
 +                if (!a->bk_trim_us)
 +                    av_log(NULL, AV_LOG_WARNING, "[PTV-ATRIM] a%d(in%d) input stepped back %.0f ms — the overlap is "
 +                           "dropped at the graph door (labels kept)\n", a->dbg_k, a->dbg_in, ov / 1000.0);
 +                if (k >= frame->nb_samples) {
 +                    a->bk_trim_us += av_rescale(frame->nb_samples, 1000000, frame->sample_rate);
++                    /* 2.2.1 T-478: dropped whole = not played: it must not count as the track's last arrival, or the
++                     * silence fill stops while the real sound is still behind the door (storm_2: 1.5 s of an audio
++                     * PID with nothing on it — neither the fill nor the trimmed sound — until the timeline erased) */
++                    if (a->gs_ok) {
++                        a->glue_raw_last_us = a->gs_raw; a->glue_raw_dur_us = a->gs_dur; a->glue_wall_last_us = a->gs_wall;
++                        a->hf_hs_real       = a->gs_hs;  a->hf_dup_real     = a->gs_dup;
++                    }
 +                    return 0;
 +                }
 +                if ((ret = av_frame_make_writable(frame)) < 0)
@@ -19487,7 +19615,7 @@ index 0000000000..82c5977445
 +         * Zimbo-class startup-structural offset — visible at birth, invisible to every drift
 +         * sensor. ring_dropped>0 means the pre-h0 buffer overflowed (audio led video by more
 +         * than the ring; the kept head is NOT the true source head). */
-+        av_log(NULL, AV_LOG_WARNING,
++        av_log(NULL, AV_LOG_INFO,                  /* T-486: normal start-up = INFO */
 +               "[PTV-ANCHOR] a%d(in%d) anchored: first_audio-h0=%+"PRId64"ms (h0=%"PRId64"ms) "
 +               "dropped_pre_h0=%d ring_dropped=%d\n",
 +               a->dbg_k, a->dbg_in, house_us / 1000, h0 / 1000,
@@ -19650,6 +19778,10 @@ index 0000000000..82c5977445
 +    else
 +        av_log(NULL, AV_LOG_INFO, "[PTV-RELABEL] a%d(in%d) -%"PRId64"ms erase: no verdict (corr %.2f, other lags %.2f); "
 +               "the sensor keeps the source's A/V\n", a->dbg_k, a->dbg_in, a->rl_S_us / 1000, c_rep, c_oth);
++    /* 2.2.1 T-480 step 5: an erase without a verdict may be a relabel the audio cannot vouch for (std sync_arelabel: a
++     * steady tone, the reading -300 ms while the ruler is in sync) — the sync check must not step it (T-087) */
++    if (why || (c_rep >= g_rl_relabel_max && !(c_rep >= 0.8 && c_rep - c_oth >= 0.3)))
++        a->sc.rl_nov = 1;
 +    a->rl_pend = 0;
 +}
 +
@@ -19758,7 +19890,7 @@ index 0000000000..82c5977445
 +    a->apark_drop_us += av_rescale(f->nb_samples, 1000000, f->sample_rate > 0 ? f->sample_rate : 48000);
 +    if (av_gettime_relative() - a->apark_log_wc >= 10000000) {
 +        a->apark_log_wc = av_gettime_relative();
-+        av_log(NULL, AV_LOG_INFO, "[PTV-MV] a%d sound more than %d s ahead of its picture: dropped (%"PRId64" ms so far)\n",
++        av_log(NULL, AV_LOG_WARNING, "[PTV-MV] a%d sound more than %d s ahead of its picture: dropped (%"PRId64" ms so far)\n",
 +               a->dbg_k, (int)(PTV_APARK_SPAN_US / 1000000), a->apark_drop_us / 1000);
 +    }
 +}
@@ -20294,7 +20426,7 @@ index 0000000000..82c5977445
 +                av_rescale_q(door + i * dur_us, AV_TIME_BASE_Q, a->ist_tb);
 +            ret = audio_feed(a, s);
 +            if (a->hold_fill_us < 3000000 && a->hold_fill_us + dur_us >= 3000000)   /* short repeat runs stay quiet */
-+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] a%d(in%d) hold fill: silence aligned to the held video "
++                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] a%d(in%d) silence fill: no audio for 3 s while the pictures run "
 +                       "(PTV_NO_SRC_FILL=1 disables)\n", a->dbg_k, a->dbg_in);
 +            a->hold_fill_us += dur_us;
 +        }
@@ -20885,10 +21017,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..599617c0c8
+index 0000000000..58ec089e5c
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2192 @@
+@@ -0,0 +1,2207 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -21817,8 +21949,18 @@ index 0000000000..599617c0c8
 +            hr->cf_sat_since = av_gettime_relative();
 +        }
 +    }
-+    if (g_clockfollow && atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
-+        int64_t cf_ppm = ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
++    /* 2.2.1 T-471 (owner 2026-11-15, faster lock): a regulated input's clock is measured on its PCR in front (the
++     * regulator's earliest-arrival fit, de-jittered) — followed at once, no 2 min pinned first: T-090's false follows
++     * were the coarse estimator reading delivery jitter, which the regulator's measure does not see. Unregulated inputs
++     * (and an untrusted PCR) keep the coarse estimator and T-090's rule */
++    int64_t reg_ppm = 0;
++    int     reg = est->reg_k >= 0 && ptv_regulate_rate(est->reg_k, &reg_ppm);
++    if (g_clockfollow && hr->cf_following && !reg && !atomic_load_explicit(&est->cf_locked, memory_order_relaxed)) {
++        hr->cf_following = 0;              /* the measure it followed is gone (PCR untrusted / estimator unlatched) */
++        av_log(NULL, AV_LOG_WARNING, "[PTV-CLOCK] source clock measure lost — released\n");
++    }
++    if (g_clockfollow && (reg || atomic_load_explicit(&est->cf_locked, memory_order_relaxed))) {
++        int64_t cf_ppm = reg ? reg_ppm : ((atomic_load_explicit(&est->cf_rate_q20, memory_order_relaxed)
 +                           - (1 << 20)) * 1000000) >> 20;
 +        /* v0.9.15.3: a BURSTY-classified channel (auto-bank armed) violates the coarse
 +         * estimator's smooth-delivery assumption — its clump windows alias into a bogus
@@ -21838,13 +21980,13 @@ index 0000000000..599617c0c8
 +         * runs the house fast); the noise never does. Arm only after the servo has been pinned in the offset's
 +         * direction for 2 min. */
 +        if (!hr->cf_following && llabs(cf_ppm) > 5000 &&
-+            hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
-+            av_gettime_relative() - hr->cf_sat_since >= 120000000) {
++            (reg || (hr->cf_sat_dir == (cf_ppm > 0 ? -1 : 1) &&
++                     av_gettime_relative() - hr->cf_sat_since >= 120000000))) {
 +            hr->cf_following = 1;
 +            av_log(NULL, AV_LOG_WARNING,
-+                   "[PTV-CLOCK] source clock runs %+lldppm off realtime — FOLLOWING it "
++                   "[PTV-CLOCK] source clock runs %+lldppm off realtime (%s) — FOLLOWING it "
 +                   "(output+PCR pace at the source's true rate; PTV_NO_CLOCKFOLLOW reverts)\n",
-+                   (long long)cf_ppm);
++                   (long long)cf_ppm, reg ? "measured on its PCR" : "estimated from its video");
 +        } else if (hr->cf_following && llabs(cf_ppm) < 2000) {
 +            hr->cf_following = 0;
 +            av_log(NULL, AV_LOG_WARNING,
@@ -22783,8 +22925,8 @@ index 0000000000..599617c0c8
 +                atomic_store_explicit(&g_src_state, 0, memory_order_relaxed);
 +                atomic_store_explicit(&g_src_hold_start, 0, memory_order_relaxed);
 +                atomic_store_explicit(&g_src_rejoin_wall, nw, memory_order_relaxed);
-+                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s%s\n",
-+                       (nw - hs0) / 1e6, g_src_hold_act ? "" : " (observe-only)");
++                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 STALLED \xe2\x86\x92 LIVE after %.1f s held%s\n",
++                       (nw - hs0) / 1e6, g_src_hold_act ? "" : " (observe-only)");   /* T-486: the hold's length */
 +            } else {
 +                int64_t hs0 = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
 +                if (!src_lost_logged && arr && nw - arr >= g_lost_after_us) {
@@ -22960,6 +23102,11 @@ index 0000000000..599617c0c8
 +                    int64_t cq = atomic_load_explicit(&v->est->cf_rate_q20, memory_order_relaxed);
 +                    int64_t cp = ((cq - (1 << 20)) * 1000000) >> 20;
 +                    int     lk = atomic_load_explicit(&v->est->cf_locked, memory_order_relaxed);
++                    int64_t rp;
++                    if (v->est->reg_k >= 0 && ptv_regulate_rate(v->est->reg_k, &rp)) {   /* T-471: what is followed */
++                        cp = rp;
++                        lk = 1;
++                    }
 +                    int     n = 0;
 +                    if (lk || llabs(cp) > 500)
 +                        n = snprintf(cfs, sizeof cfs, " cf=%+lldppm%s", (long long)cp, lk ? "" : "?");
@@ -23083,10 +23230,10 @@ index 0000000000..599617c0c8
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..24b3a9e5b7
+index 0000000000..0efea9dc91
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3200 @@
+@@ -0,0 +1,3266 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -24294,8 +24441,8 @@ index 0000000000..24b3a9e5b7
 +    AVFormatContext *nf = NULL;
 +    AVDictionary *o2 = NULL;
 +    int r;
-+    unsigned i, nb;
-+    int renum = 0;
++    unsigned i, nb, extra = 0;
++    int renum = 0, resized = 0;
 +    if (!(nf = avformat_alloc_context()))
 +        return AVERROR(ENOMEM);
 +    if (d->single)
@@ -24317,7 +24464,15 @@ index 0000000000..24b3a9e5b7
 +    nb = nf->nb_streams;
 +    while (nb > old_nb && nf->streams[nb - 1]->codecpar->codec_id == AV_CODEC_ID_EPG)
 +        nb--;
-+    if (nb > old_nb || (nb < old_nb && !d->single))
++    /* 2.2.1 T-476 (owner 2026-11-15: a reshaped return rejoins in-process, like a professional encoder keeping its
++     * configured outputs): streams beyond the open layout are ignored like any stream born after the open (T-064 drops
++     * their packets) — the mapped ones carry on. Only when the ones there before keep their PIDs: a renumber AND new
++     * streams together could put a new track at a mapped index (stays RESHAPED). Was: exit 4 (~25-40 s dark) */
++    if (nb > old_nb) {
++        extra = nb - old_nb;
++        nb = old_nb;
++    }
++    if (nb < old_nb && !d->single)
 +        goto bad;
 +    /* 2.2 (spec §6 / E9): a PID renumber with the layout unchanged — the same streams in the same order, the same
 +     * languages, the same video codec and size — is the same source (the video moved to a new PID, a provider's mux
@@ -24332,11 +24487,14 @@ index 0000000000..24b3a9e5b7
 +            renum++;
 +        if (d->single &&
 +            (strcmp(now.lang, old[i].lang) ||
-+             (now.type == AVMEDIA_TYPE_VIDEO &&
-+              (now.codec_id != old[i].codec_id ||
-+               (now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))))))
++             (now.type == AVMEDIA_TYPE_VIDEO && now.codec_id != old[i].codec_id)))
 +            goto bad;
++        /* 2.2.1 T-476: a new video size is fitted in-process like a mid-stream size switch (T-406), not a re-probe */
++        if (d->single && now.type == AVMEDIA_TYPE_VIDEO && now.w && old[i].w && (now.w != old[i].w || now.h != old[i].h))
++            resized = 1;
 +    }
++    if (extra && renum)
++        goto bad;
 +    /* 2.1 T-424: fewer streams, the ones there as before = the source is not complete yet, not reshaped. A provider's
 +     * encoder restart came back with video + audio and its SCTE-35 PID a moment later (cor-3 Fintech_247, ~1/day): read
 +     * as RESHAPED, exit 4, the wrapper's re-probe found the same three streams — ~40 s dark for nothing. Retried as a
@@ -24372,6 +24530,10 @@ index 0000000000..24b3a9e5b7
 +    if (renum)
 +        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 came back with %d of its %u streams on new PIDs, the layout unchanged — "
 +               "resumed (the same source renumbered)\n", renum, nb);
++    if (extra || resized)
++        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d came back reshaped%s%s — rejoined in-process: the mapped streams carry "
++               "on%s\n", d->rsync_slot > 0 ? d->rsync_slot : 0, extra ? " (more streams than at the start)" : "",
++               resized ? " (a new video size)" : "", extra ? ", the new ones are ignored" : "");
 +    d->ifmt = nf;
 +    if (d->ifmt_home) *d->ifmt_home = nf;      /* teardown close target follows the swap */
 +    d->pmt_seen = 0;                           /* T-003: the new open's PMT is the reference */
@@ -24380,14 +24542,18 @@ index 0000000000..24b3a9e5b7
 +    if (d->rsync_slot >= 0 && d->rsync_slot < PTV_MAX_INPUT)   /* rider (a), rr191 F3: the ASTAMP
 +                                                                * extrapolation carry must not span the reopen */
 +        atomic_store_explicit(&g_reopen_wc[d->rsync_slot], av_gettime_relative(), memory_order_relaxed);
++    memset(d->amove_to, 0, sizeof(d->amove_to));     /* 2.2.1 T-484: new demuxer, new stream indices */
++    memset(d->amove_from, 0, sizeof(d->amove_from));
++    memset(d->amove_seen, 0, sizeof(d->amove_seen));
 +    av_log(NULL, AV_LOG_WARNING,
 +           "[PTV-REOPEN] input '%s' re-opened after read failure (#%"PRId64") — resuming as a "
 +           "fresh join (slate/recovery machinery downstream)\n", d->url, d->reopen_cnt);
 +    return 0;
 +bad:
 +    if (r == PTV_REOPEN_RESHAPED)
-+        av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 came back RESHAPED (%u streams, was %u; or a PID, language, "
-+               "video codec or size changed) on %s\n", nf->nb_streams, old_nb, d->url);
++        av_log(NULL, AV_LOG_ERROR, "[PTV-SRC] in0 came back RESHAPED (%u streams, was %u): a mapped stream is gone or "
++               "changed its type, language or video codec, or the PIDs moved together with new streams — on %s\n",
++               nf->nb_streams, old_nb, d->url);   /* T-486: a PID move alone, a new size, added streams rejoin (rc7) */
 +    avformat_close_input(&nf);
 +    return r;
 +}
@@ -24525,7 +24691,7 @@ index 0000000000..24b3a9e5b7
 +            return r;
 +    }
 +    d->ifmt = f;                                     /* *d->ifmt_home == in->ifmt already (the acquire set it) */
-+    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
++    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in%d WAITING → LIVE: slot %d joins the mosaic\n", d->rsync_slot, d->rsync_slot);
 +    return 0;
 +}
 +
@@ -24889,9 +25055,10 @@ index 0000000000..24b3a9e5b7
 +                                   "failed (%s), next in %.0f s\n", (av_gettime_relative() - lost_t0) / 1e6,
 +                                   d->url, attempt, av_err2str(rr), backoff / 1e6);
 +                        else
-+                            av_log(NULL, AV_LOG_WARNING,
-+                                   "[PTV-REOPEN] input '%s' still down — retrying (backoff %.0fs)\n",
-+                                   d->url, backoff / 1e6);
++                            av_log(NULL, AV_LOG_WARNING,                 /* T-486: EINVAL = it came back, other layout */
++                                   "[PTV-REOPEN] input '%s' %s — retrying (backoff %.0fs)\n", d->url,
++                                   rr == AVERROR(EINVAL) ? "came back with another stream layout, not taken" : "still down",
++                                   backoff / 1e6);
 +                    }
 +                    if (backoff > 0)
 +                        av_usleep((unsigned)backoff);
@@ -24921,6 +25088,20 @@ index 0000000000..24b3a9e5b7
 +         * The per-stream arrays are sized to the stream count at open, and a late-born stream is
 +         * routed nowhere (dispatch matches only the streams bound at open): drop its packets here,
 +         * before any bookkeeping indexes them (was a heap overflow in demux_unwrap). */
++        /* 2.2.1 T-484: a moved audio PID's packets go on as the bound stream's (taken over below); the bound PID itself
++         * flowing again ends it (the source moved back) */
++        if (pkt->stream_index < PTV_AMOVE_MAX) {
++            int si = pkt->stream_index;
++            if (d->amove_from[si]) {
++                int ni = d->amove_from[si] - 1;
++                d->amove_to[ni] = 0;
++                d->amove_from[si] = 0;
++                d->amove_seen[ni] = 0;
++                av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': audio pid 0x%x flows again — the take-over of pid 0x%x "
++                       "ends\n", d->url, d->ifmt->streams[si]->id, d->ifmt->streams[ni]->id);
++            } else if (d->amove_to[si])
++                pkt->stream_index = d->amove_to[si] - 1;
++        }
 +        if (pkt->stream_index >= d->nb_streams_open) {
 +            const AVStream *ls = d->ifmt->streams[pkt->stream_index];
 +            int adopt = 0, pi;
@@ -24964,6 +25145,38 @@ index 0000000000..24b3a9e5b7
 +                        d->vmove_force = 1;
 +                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': video moved to pid 0x%x (pid 0x%x silent "
 +                               "%.1f s) — reopening\n", d->url, ls->id, d->ifmt->streams[was]->id, (now - d->v_last_wc) / 1e6);
++                    }
++                }
++            }
++            /* 2.2.1 T-484: the source renumbered its audio (renumber_return: 0x101 -> 0x201 with the video's move; the
++             * video was taken over above, the sound stayed dark for good — "audio track 0 silent for 10 s"). A late-born
++             * AUDIO stream that delivers for 1 s while a bound audio stream of the same codec is silent >= 2 s (the same
++             * language preferred) = the move: its packets go on as the bound stream's — same track, decoder, timeline and
++             * output PID; a label difference is an ordinary timeline event. Like a hardware decoder following the PMT */
++            if (!adopt && d->reopen && ls->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
++                pkt->stream_index < PTV_AMOVE_MAX) {
++                int ni = pkt->stream_index, oi, best = -1;
++                int64_t now = av_gettime_relative();
++                const AVDictionaryEntry *nl = av_dict_get(ls->metadata, "language", NULL, 0);
++                if (!d->amove_seen[ni])
++                    d->amove_seen[ni] = now;
++                if (now - d->amove_seen[ni] >= 1000000) {
++                    for (oi = 0; oi < (int)d->nb_streams_open && oi < PTV_AMOVE_MAX; oi++) {
++                        const AVStream *os = d->ifmt->streams[oi];
++                        const AVDictionaryEntry *ol = av_dict_get(os->metadata, "language", NULL, 0);
++                        if (os->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || os->codecpar->codec_id != ls->codecpar->codec_id ||
++                            d->amove_from[oi] || !d->wrap_wall_last || !d->wrap_wall_last[oi] ||
++                            now - d->wrap_wall_last[oi] < 2000000)
++                            continue;
++                        if (best < 0 || (nl && ol && !strcmp(nl->value, ol->value)))
++                            best = oi;
++                    }
++                    if (best >= 0) {
++                        d->amove_to[ni]     = best + 1;
++                        d->amove_from[best] = ni + 1;
++                        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] input '%s': audio moved to pid 0x%x (pid 0x%x silent %.1f s) — "
++                               "taken over in-process on the same track\n", d->url, ls->id, d->ifmt->streams[best]->id,
++                               (now - d->wrap_wall_last[best]) / 1e6);
 +                    }
 +                }
 +            }
@@ -25576,7 +25789,7 @@ index 0000000000..24b3a9e5b7
 +    ptv_tl_cut(d, cut_us);                   /* 2.1 T-409: the program offset, every stream alike */
 +    d->door_erased = 1;
 +    d->door_vb     = vb;
-+    av_log(NULL, AV_LOG_INFO, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
++    av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in0 burst: the cut is erased at the door — %.3f s (%"PRId64" pictures) on every "
 +           "stream, joined on the pictures' boundaries\n", cut_us / 1e6, cut / fd);
 +}
 +
@@ -28250,10 +28463,10 @@ index 0000000000..4a0614cfdc
 +#endif /* FFTOOLS_PTVENCODER_LANG_H */
 diff --git a/fftools/ptvencoder_legend.c b/fftools/ptvencoder_legend.c
 new file mode 100644
-index 0000000000..31b97bc668
+index 0000000000..f33bafb5a2
 --- /dev/null
 +++ b/fftools/ptvencoder_legend.c
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,769 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -28311,7 +28524,8 @@ index 0000000000..31b97bc668
 +        "                        runs once per input: each slot gets its OWN track, stamped on that\n"
 +        "                        slot's own clock (so captions stay on their own dialogue) and its\n"
 +        "                        own page, walked in BCD from the base (888, 889, 890, 891).\n"
-+        "                        -cc_slots 0,2 limits it to named inputs (default: all) — use it\n"
++        "                        -cc_slots 0,2 limits it to named inputs (default: all) — use it\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                        when a slot already carries real DVB subtitles to copy.\n"
 +        "                        -cc_lang <iso639-2> sets the language + G0 national subset for\n"
 +        "                        every extraction (default: that input's first non-und audio\n"
@@ -28331,7 +28545,8 @@ index 0000000000..31b97bc668
 +        "                        It engages ONLY after a roll-up carriage return has actually been\n"
 +        "                        seen, so a source that never rolls up is passed through byte for\n"
 +        "                        byte under either style. A pop-on caption FLIPPED IN over live\n"
-+        "                        roll-up content (an ad break on a news channel) is finished text\n"
++        "                        roll-up content (an ad break on a news channel) is finished text\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                        by definition and goes out whole, at once.\n"
 +        "                        Block advances are PACED: a completed line joins a queue and the\n"
 +        "                        window advances one line at a time, no sooner than 1500 ms after\n"
@@ -28351,7 +28566,8 @@ index 0000000000..31b97bc668
 +        "                        -pid_plan video=200,audio=300,subtitle=400,data=500; \"off\" =\n"
 +        "                        the legacy source-order PIDs). Within a class: this run's\n"
 +        "                        mapped/synthesised tracks first (the video; transcoded audio in\n"
-+        "                        -map order; CC->teletext in slot order), then COPIED tracks by\n"
++        "                        -map order; CC->teletext in slot order), then COPIED tracks by\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                        SCTE-35-first (data class), SOURCE language, a content sub-key\n"
 +        "                        (subtitles: plain before hearing-impaired; audio: more channels\n"
 +        "                        first), codec name, INPUT INDEX, and finally source PID / source\n"
@@ -28371,7 +28587,8 @@ index 0000000000..31b97bc668
 +        "                        in PID order and PCR sits on the video PID; every ABR rung gets\n"
 +        "                        the same plan. Per-type option indices (-c:a:N / -metadata:s:s:N\n"
 +        "                        / -disposition:a:N) are UNCHANGED — they still count in\n"
-+        "                        -map/resolve order — but the PHYSICAL stream order DOES change\n"
++        "                        -map/resolve order — but the PHYSICAL stream order DOES change\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                        (CC teletext now leads the subtitle class), so a downstream that\n"
 +        "                        selects by output stream POSITION rather than by PID or language\n"
 +        "                        sees a different track. The startup [PTV-PID] lines print the\n"
@@ -28395,7 +28612,8 @@ index 0000000000..31b97bc668
 +        "    PTV_CUSHION_MAX_MS  AUTO-BANK ceiling (default 12000): bursty channels self-escalate a\n"
 +        "                        compressed video_q bank to 1.5x their worst stall — no env needed\n"
 +        "    PTV_DELIVERY_CAP_MS / PTV_DELIVERY_MAXQ   audio delivery-gate sizing (auto-sized normally)\n"
-+        "    PTV_RSS_CAP_MB=N    process RSS ceiling (default 8192; 0 disables): [PTV-MEMCAP] warn at\n"
++        "    PTV_RSS_CAP_MB=N    process RSS ceiling (default 8192; 0 disables): [PTV-MEMCAP] warn at\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                        75%%, supervised-respawn exit at cap — bounds the flap-storm memory\n"
 +        "                        runaway class so one channel can never ENOMEM its neighbors\n"
 +        "    PTV_NO_AFMT_BREAKER=1  disable the [PTV-AFMT] rebuild-storm breaker (escalating 2..60s\n"
@@ -28414,7 +28632,8 @@ index 0000000000..31b97bc668
 +        "    PTV_NO_REPRIME      fast post-glue buffer refill\n"
 +        "    PTV_NO_EXACTTICK    exact-rational video stamping     PTV_NO_MV_EXACTTICK  mosaic measurement axes\n"
 +        "    PTV_NO_PULLDOWN     telecine-aware film emit          PTV_NO_AVLOCK   audio house-lock\n"
-+        "    PTV_NO_GENLOCK      source-rate estimator\n"
++        "    PTV_NO_GENLOCK      source-rate estimator\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "    PTV_NO_DELIVERY     audio delivery-alignment gate     PTV_NO_DELIVERY_MV ungated mosaics (pre-0.9.12.1)\n"
 +        "    PTV_NO_VDELIVERY    symmetric EARLY-VIDEO hold (pre12; back to video-ahead wire under a buffering -af)\n"
 +        "    PTV_NO_AUTOBANK     runtime bursty-channel bank escalation (back to advisor-only)\n"
@@ -28432,7 +28651,8 @@ index 0000000000..31b97bc668
 +/* v0.9.2 self-documenting log legend. full=0 (compact) describes the always-on `-stats` progress
 + * line and is printed once at startup below the banner, so every channel log explains itself;
 + * full=1 (via `-log-legend`, exits after) also documents the PTV_DIAG debug lines + env switches.
-+ * Split into <1KiB av_log calls (the default log callback truncates a single line at 1024). */
++ * Every av_log call stays under 2 KiB: the PTV_LOG_TS callback formats one call into a 2048-byte buffer
++ * (ptvencoder.c) — a longer chunk lost its tail AND its newline, gluing the next log line onto the legend. */
 +void ptv_print_log_legend(int full)
 +{
 +    av_log(NULL, AV_LOG_INFO,
@@ -28447,10 +28667,11 @@ index 0000000000..31b97bc668
 +        "  pd         intentional cadence holds (v0.9.11 telecine-aware emit): during 23.976-film-in-\n"
 +        "             29.97 segments a repeat_pict frame occupies its 2:3 residence — ~6/s during a\n"
 +        "             movie is CORRECT pulldown, not a fault (PTV_DIAG: [PTV-PULLDOWN] brackets film segments)\n"
-+        "  drop       frames SKIPPED at frame_q overflow — the latency-drain meter: after a stall,\n"
-+        "             drop= ticks up while hs= bleeds down (the debt repaid in skipped content)\n"
++        "  drop       frames SKIPPED at frame_q overflow ([PTV-FRAMEQ]) — 0 in normal running (2.1+:\n"
++        "             an outage's hold is kept or erased by the timeline, not drained by drops)\n"
 +        "  corrupt    corrupt packets discarded (demux + decode)\n"
-+        "  async      aresample compensation RATE (ppm); ~0 = idle/healthy, large = resampler fighting\n");
++        "  async      aresample compensation RATE (ppm, EMA); ~0 = idle/healthy, a sustained large value =\n"
++        "             resampler fighting (2.2.1: a step — hold, fill, label step — is not averaged in)\n");
 +    av_log(NULL, AV_LOG_INFO,
 +        "  dlvhold    (delivery gate) ms of audio HELD waiting for matching video (≈ encoder latency +\n"
 +        "             cushion); normal ~1-2s, scales with the cushion\n"
@@ -28471,13 +28692,14 @@ index 0000000000..31b97bc668
 +        "  wucr_buf   frame_q occupancy (frames/ms) — the jitter cushion fill vs cushion= target\n"
 +        "  fqhw       deepest any frame queue has ever been (frames) — the CUDA pool high-water;\n"
 +        "             this, not the cushion tier, sets the per-process VRAM footprint\n"
-+        "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n"
++        "  wucr_rho   applied house-rate offset (ppm) = recovered source-clock deviation (+ = source\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "             faster); pegged ±6000 = gentle-zone fill/drain in progress\n");
 +    av_log(NULL, AV_LOG_INFO,
-+        "  hs         house_skew: latency debt vs baseline (ms) — a feed stall steps it up, catch-up\n"
-+        "             drops bleed it back; A/V stays LOCKED throughout (this is delay, not lip-sync)\n"
-+        "  hsres      (0.9.18.7) LAYERA erase-residue ledger (ms) — 2.1: always 0 (LAYERA is not run;\n"
-+        "             the timeline erases on every stream at once, so hs is real retained latency)\n"
++        "  hs         house_skew (ms): output time minus source label time since the start. Grows by every\n"
++        "             kept hole, hold, erased relabel and skipped catch-up and does not come back — it is\n"
++        "             NOT latency (latency = wucr_buf + bank + dlvhold) and not lip sync (that is lipsync=)\n"
++        "  hsres      always 0 since 2.1 (the LAYERA erase-residue ledger is not run); kept for parsers\n"
 +        "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
 +        "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet;\n"
 +        "             1.0.1-pre10: [PTV-CUSHREL] releases a raised tier held against a starved-\n"
@@ -28493,10 +28715,11 @@ index 0000000000..31b97bc668
 +        "             from the stalls' own retained latency, retires after 1 h quiet; a lone\n"
 +        "             >=3 s stall's bank (pre20) holds only what came and retires after 10 min\n");
 +    av_log(NULL, AV_LOG_INFO,
-+        "  cf         (v0.9.15, shown when notable) coarse source-CLOCK estimate (ppm vs realtime,\n"
-+        "             `?` = not yet locked ~60s). |cf|>5000 locked => output+PCR FOLLOW the source's\n"
-+        "             true rate ([PTV-CLOCK] logs arm/release); frozen while BURSTY/bank is armed\n"
-+        "             (clump delivery is not a clock measurement)\n"
++        "  cf         (v0.9.15, shown when notable) the source CLOCK's rate (ppm vs realtime, + = fast).\n"
++        "             2.2.1: a regulated input = measured on its PCR by the regulator (earliest arrival per\n"
++        "             2 s, 16-60 s fit) and followed at once beyond 5000 ppm; otherwise the coarse video\n"
++        "             estimate (`?` = not locked, ~60 s; followed after the servo was pinned 2 min).\n"
++        "             [PTV-CLOCK] logs follow/release; never followed while BURSTY/bank is armed\n"
 +        "  decim      (v0.9.15.2, shown when >0) SURPLUS frames decimated: source delivers more real\n"
 +        "             frames than its declared rate (e.g. ~25.4 fps declaring 25) — each skip is a\n"
 +        "             content position already displayed, so perceived speed is always EXACTLY 1x;\n"
@@ -28505,12 +28728,13 @@ index 0000000000..31b97bc668
 +        "             (ms, + = audio EARLY): per-stream source→output content mapping difference\n"
 +        "             (video EMA(out−src) + demux edit ledger vs audio ledger m_a) — sees\n"
 +        "             relabel-erases, wrong glues and parked resampler slip; shared latency (hs)\n"
-+        "             cancels. `--` = a side not flowing, the track filled with silence (afill=)\n"
++        "             cancels; an ADOPTED clock of its own ([PTV-TL] offset adopted) is excluded. `--` = a side not flowing, the track filled with silence (afill=)\n"
 +        "             or (2.0.2, single input) the source STALLED — no content to compare.\n"
 +        "             On mv each track pairs against ITS OWN\n"
 +        "             slot's video (aK: prefix always; track→slot map = the startup [PTV-RSYNC]\n"
 +        "             tracks: line). 1.0.1-pre11: the slip probe is scoped to the async-aresample\n"
-+        "             boundary — a buffering -af's hold (loudnorm ~3s) is label-preserving latency,\n"
++        "             boundary — a buffering -af's hold (loudnorm ~3s) is label-preserving latency,\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "             EXCLUDED from R (the pre9 whole-graph probe read it as false audio-early).\n"
 +        "             Soak-CERTIFIED vs the external oracle 2026-07-16 (Δ12-21ms on real excursions,\n"
 +        "             both signs human-verified, NTSC 24h flat) — the corrector's gate condition.\n"
@@ -28518,7 +28742,7 @@ index 0000000000..31b97bc668
 +        "             (both modes). Components: [PTV-RSYNC] under PTV_DIAG.\n"
 +        "  corr       (1.0.1-pre14, only when nonzero/engaged) residual-sync\n"
 +        "             CORRECTOR cumulative resampler trim (ms; `*` = actively integrating). The\n"
-+        "             actuation half of the supervisor: when the sensor's R dwells outside ±80ms\n"
++        "             actuation half of the supervisor: when the sensor's R dwells outside ±40ms\n"
 +        "             for 5min stable + 3min event-free with ALL rungs' wire provably moving, it\n"
 +        "             steers R→0 through aresample (≤2ms/s; park |R|≤20ms; authority 5s/engagement,\n"
 +        "             10s lifetime → hard disarm). [PTV-RSCORR] logs every state change\n"
@@ -28544,7 +28768,8 @@ index 0000000000..31b97bc668
 +        "             The difference is clears superseded by a new caption before they were due,\n"
 +        "             plus clears the encoder had nothing to do (page already blank).\n"
 +        "             ccheld climbing with cclate flat => clears are being LOST, not delayed, and\n"
-+        "             pages will outlive the source's (that was the pre-fix behaviour)\n"
++        "             pages will outlive the source's (that was the pre-fix behaviour)\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "  ccmux      (shown when >0) teletext packets OUR OWN mux backward-dts guard dropped\n"
 +        "             ([PTV-MUXGUARD], stream = the teletext PID). Every other counter here is\n"
 +        "             taken where the page was produced, so this is the only one that speaks for\n"
@@ -28564,7 +28789,8 @@ index 0000000000..31b97bc668
 +        "             not a fault. One [PTV-CC] INFO line names it the first time it happens.\n"
 +        "             (2.1 T-326) [PTV-CC] inK captions of a corrupt-discarded picture kept: the picture is\n"
 +        "             dropped before decode, its EIA-608 pair still reaches the tap in display order;\n"
-+        "             [PTV-CC] inK the source carries EIA-608 captions but -cc_extract is not set for it\n"
++        "             [PTV-CC] inK the source carries EIA-608 captions but -cc_extract is not set for it\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "             (2.1 T-400, once, after 10 real pairs): pin SV_CC_EXTRACT=true for this channel\n"
 +        "  unreg      (shown when >0, 2.2.0-pre12) inputs the regulator passes as they arrive now\n"
 +        "             (their PCR is no clock: [PTV-REG] 'no clock to pace by' / 'regulated again')\n"
@@ -28590,11 +28816,35 @@ index 0000000000..31b97bc668
 +        "                 part erased (labels jumped further than the wall time: the rest erased) | relabel erased\n"
 +        "                 (a jump with no wall time) | step back erased | new domain, gap kept (a restart) |\n"
 +        "                 outlier window (corrupt labels dropped) | single-stream step (one stream only, labels\n"
-+        "                 as sent; RELABEL may repair it). WARNING when the program moved, INFO otherwise\n"
++        "                 as sent; RELABEL may repair it). WARNING when the program moved, INFO otherwise.\n"
++        "                 2.2.1: an audio whose clock leaves the program clock while pictures run is MUTED\n"
++        "                 (silence, like a frame synchronizer) until it is back on the program clock; still\n"
++        "                 off after 10 s its offset is ADOPTED (its own timing: lipsync= excludes it). Also:\n"
++        "                 'did not cross / crossed after the video's step', 'its own step ... erased on the\n"
++        "                 stream' (a joint backward step erased per stream by its own step, rc7)\n"
++        "  [PTV-SYNCCHK]  (2.2.1) once per track and event, after 3 s of clean source and 2 s of agreeing\n"
++        "                 readings: the A/V offset (ledger + vring, + = audio early) — in sync (within 25 ms)\n"
++        "                 | STEPPED (25 ms .. 5 s stepped out of the audio labels once) | would step ... not\n"
++        "                 stepped (an erase without a verdict, a mosaic slot, PTV_NO_B2STEP=1) | beyond the 5 s\n");
++    av_log(NULL, AV_LOG_INFO,
++        "                 cap | no steady reading. Prints the lipsync= sensor's value to compare\n"
++        "  [PTV-SRC]      (2.0, single input) the source state machine, one line per change: in0 LIVE (start),\n"
++        "                 LIVE \xe2\x86\x92 STALLED (no picture for -stall_min: the last picture is held, then bars / black\n"
++        "                 after -freeze_max; the sound is filled with silence: 'hold fill' / 'hold fill ended'),\n"
++        "                 STALLED \xe2\x86\x92 LOST (no packets: the input is reopened, 'reopen attempt #N failed' every 30 s),\n"
++        "                 LOST \xe2\x86\x92 reopened, STALLED \xe2\x86\x92 LIVE after N s (N = the hold's length), 'still STALLED'\n"
++        "                 (1/min, after 10 min every 10 min). 'rejoin class BURST | LIVE LOSS | NEW DOMAIN' = how the\n"
++        "                 source came back (its backlog / the live content / a restarted clock); 'skipped the\n"
++        "                 catch-up' = more than the max delay would be kept, the output resumes at the live content.\n"
++        "                 'came back reshaped ... rejoined in-process' (2.2.1: more streams, a new picture size);\n"
++        "                 'came back RESHAPED' + 'exiting 4' = a mapped stream is gone or changed: the wrapper\n"
++        "                 re-probes and restarts (normal after a source change, a fault when it repeats).\n"
++        "                 inK WAITING / PROBING (start, with the frame=0 heartbeat line), inK WAITING \xe2\x86\x92 LIVE (mosaic slot)\n"
 +        "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
 +        "                 or 'stays as a hole' (the source paused inside it)\n"
 +        "  [PTV-SRC] inK PMT version a \xe2\x86\x92 b: the source's program changed (PIDs added / gone); inK audio\n"
-+        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n"
++        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                 in0 source frame rate changed a \xe2\x86\x92 b fps (held 30 s; the output rate stays, the\n"
 +        "                 pictures of a slower source are shown on their due ticks — 2.1, T-011)\n"
 +        "  [PTV-VMAP]     copies / captions placed where the video showed their content (counts)\n"
@@ -28603,9 +28853,21 @@ index 0000000000..31b97bc668
 +        "                 content far ahead); the slot's sound takes the same step at the same content. A\n"
 +        "                 repeated / skipped picture (lost, late, a backlog catching up, rate conversion)\n"
 +        "                 moves nothing and is not logged\n"
-+        "  (2.0 lines no longer written in 2.1: [PTV-LAYERA], [PTV-GLUE], [PTV-DISCONT], the [PTV-AGLUE] step\n"
-+        "   verdicts, the mosaic [PTV-PLL] ACQUIRE / FROZEN, [PTV-RESFOLLOW], [PTV-REANCHOR2], [PTV-RESYNC],\n"
-+        "   [PTV-RECANCHOR])\n"
++        "                 Reasons as printed: late for 1 s | content ahead | the buffer overflowed (the\n"
++        "                 pictures before it are gone) | the buffer never below N ms in 60 s. Other lines:\n"
++        "                 inK joined: first picture (a late slot starts) | inK catch-up: the decoder had N\n"
++        "                 packets banked ... the slot cuts to the live edge (after a return) | aK sound\n"
++        "                 re-placed (lag step / drift: the sound follows its picture) | aK sound more than N s\n"
++        "                 ahead of its picture: dropped | inK pictures are WxH ... scaled to the cell (the\n"
++        "                 source changed size) | inK no signal \xe2\x86\x92 bars / slate / black in its cell\n"
++        "  [PTV-RES]      inK startup backlog trimmed N frames (keep M): a slot's start-up burst cut to its buffer\n"
++        "                 depth — normal at every mosaic start (PTV_DIAG adds the per-second [PTV-RES] t= depths)\n"
++        "  [PTV-DISCONT]  one picture's corrupt timestamp restamped between its neighbours / a wrap step\n");
++    av_log(NULL, AV_LOG_INFO,
++        "                 reverted (a single bad label, not a timeline event)\n"
++        "  [PTV-LAYERA]   a video PTS far from its DTS (a corrupt label): the PTS dropped, the frame keeps its DTS\n"
++        "  (2.0 lines no longer written in 2.1: [PTV-GLUE], the [PTV-AGLUE] step verdicts, the mosaic\n"
++        "   [PTV-PLL] ACQUIRE / FROZEN, [PTV-RESFOLLOW], [PTV-REANCHOR2], [PTV-RESYNC], [PTV-RECANCHOR])\n"
 +        "  [PTV-ADISC]    (1.0.1-pre15 #33, unconditional) corrupt-flagged AUDIO discarded at the\n"
 +        "                 demux (rate-limited count + acor= stats) — the NBS undecodable-source\n"
 +        "                 phase, previously silent/restart-only; PTV_NBS_FILL=1 additionally\n"
@@ -28616,14 +28878,65 @@ index 0000000000..31b97bc668
 +        "                 startup-structural lip-sync offset is visible HERE, not in drift\n"
 +        "  [PTV-ACOMP]    (1.0.1-pre3) graph-input audio pts step >25ms — aresample will hard-\n"
 +        "                 compensate (instantaneous sample insert/drop, click risk); rate-limited\n"
-+        "                 ~1/10s per track, cumulative count on the PLL diag line (acomp=)\n"
++        "                 ~1/10s per track, total in the line; acomp= on the mosaic [PTV-AVSYNC] DIAG line\n"
 +        "  [PTV-PID]      (1.2.0-pre8, startup) the deterministic output PID plan and where it came\n"
 +        "                 from (default / -pid_plan / env PTV_PID_PLAN), then one line per output\n"
 +        "                 stream: pid=<n> <class>/<codec>/<source language> <- <source>. When a\n"
 +        "                 -metadata override puts a DIFFERENT tag on the wire the column reads\n"
-+        "                 src(wire:tag) — the sort used the source tag, never the override. The same\n"
++        "                 src(wire:tag) — the sort used the source tag, never the override. The same\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "                 plan is written to every rung, so the lines are printed once. Absent when\n"
 +        "                 -pid_plan off restores the legacy source-order PIDs\n");
++    av_log(NULL, AV_LOG_INFO,
++        "audio path events (always-on, aK(inN) = output track K from input N):\n"
++        "  [PTV-BIND]     which source stream each output track / the video is bound to (start: '-map rule \xe2\x86\x92\n"
++        "                 inN 0xPID codec ch lang'), decoder open lines, and mid-run: 'pid gone ... silent until\n"
++        "                 one comes' / 're-bound: pid A \xe2\x86\x92 B' (same language + role) / 'no source track qualifies'.\n"
++        "                 'the track stays silent' (no decoder / open failed) is a fault to look at\n"
++        "  [PTV-AFMT]     the audio INPUT format changed (rate / layout / sample format, confirmed over several\n"
++        "                 frames): a converter is put in front of the unchanged path, or the path is rebuilt; the\n"
++        "                 output format never changes. 'rebuild BREAKER' = the source flaps its format, rebuilds\n"
++        "                 are spaced 2..60 s (frames dropped meanwhile). 'splice overlap trimmed' / 'source gap ...\n"
++        "                 filled with silence' = what the switch itself cost. Normal at ad splices; a storm is not\n"
++        "  [PTV-ATRIM]    'input stepped back N ms — the overlap is dropped at the graph door (labels kept)': the\n"
++        "                 sound's labels went back up to 5 s (after a rejoin map or a hold fill); what was already\n"
++        "                 sent is not sent twice. Followed by 'N ms dropped in all'. Normal after an event\n"
++        "  [PTV-ADEC]     'decode error ... dropped, track continues' (first one, then a 10 s count) = damaged\n"
++        "                 audio packets; 'impossible samples ... muted as damage' = a decoder output far over full\n"
++        "                 scale replaced by silence. A few at a loss are normal, a steady stream is a bad source\n"
++        "  [PTV-ADECWD]   no decoded audio for 45 s although its packets arrive: the decoder is reopened (the\n");
++    av_log(NULL, AV_LOG_INFO,
++        "                 anchor is kept). Rare; repeated = the source's audio is undecodable\n"
++        "  [PTV-ACHOP]    the audio stayed chopped (errors above the floor) for minutes: the whole audio path of\n"
++        "                 the track is rebuilt once ([PTV-AFMT] follows). PTV_NO_ACHOP_REBUILD=1 disables\n"
++        "  [PTV-ASTAMP]   decoded audio frames without a timestamp (a probe-failed source phase): stamped by\n"
++        "                 counting samples from the last label\n"
++        "  [PTV-AVLOCK]   (single input) 'short gap (+N ms, no hold)': the sound returned after a gap too short\n"
++        "                 for a hold; it keeps the pre-gap house_skew until the video shows the same content\n"
++        "                 ('house_skew ... again after N s'). First 3 gaps per track only. Informational\n"
++        "  [PTV-RELABEL]  the content check after an audio-only step back that the timeline repaired: 'was a\n"
++        "                 RELABEL' (the sound did not repeat: the repair stands) | 'the audio REPEATS' (a real step\n"
++        "                 back: left to the sync check / corrector) | 'no verdict' (tone, silence, a splice) |\n"
++        "                 'erase UNDONE' (silent on both sides, no evidence). Decides what the lipsync sensor reads after it\n"
++        "  [PTV-WALLEV]   measurement only: more real audio than video (or the reverse) was deleted without wall-\n"
++        "                 time evidence, by more than 0.5 s — pressure towards a lasting offset; watch the lipsync sensor\n");
++    av_log(NULL, AV_LOG_INFO,
++        "start-up lines (once per start):\n"
++        "  [PTV-START]    'first picture on air N s after start' with the split (source live / set-up done / first\n"
++        "                 picture decoded) and the content queued behind it; 'start-up window closed after 30 s'\n"
++        "                 (longer when a start-up backlog was kept); 'start-up backlog drained'. PTV_DIAG adds the\n"
++        "                 mosaic per-tick trace [PTV-START] t=\n"
++        "  [PTV-RATE]     the output frame rate and why (-r source | auto | <rate> | max:<rate> | field; the source's\n"
++        "                 rate and scan). A wrong output rate is read here first\n"
++        "  [PTV-OUT]      'GOP N ticks on the output timeline' (every rung's keyframes on the same pictures);\n"
++        "                 mosaic: 'all N slots live after X s' or 'slot_wait expired: starting with K of N slots\n"
++        "                 live'; '-map ...: slot K not live — silent until it joins / skipped'; 'no slot live' (ERROR)\n"
++        "  [PTV-LADDER]   (-ladder) one line per rung (size, video / audio bitrate, destination), the -max_res\n"
++        "                 cap when it trimmed rungs, and the generated filter graph\n"
++        "  [PTV-REPORT]   (-bind_report) the planned PIDs and bindings, nothing encoded\n"
++        "  [PTV-MEMCAP]   'RSS cap watchdog armed: N MB' at start; WARNING at 75%% of the cap (memory growth:\n"
++        "                 capture the [PTV-AFMT] / [PTV-CUSHION] lines), FATAL exit for a supervised respawn after\n"
++        "                 two 10 s samples at the cap. PTV_RSS_CAP_MB tunes it, 0 disables\n");
 +    av_log(NULL, AV_LOG_INFO,
 +        "health events (always-on):\n"
 +        "  [PTV-BURSTY]   per-minute delivery-stall status (count + worst gap + bank state) while a\n"
@@ -28644,14 +28957,17 @@ index 0000000000..31b97bc668
 +        "                 'no clock to pace by' (2.2.0-pre11) = the input's PCR runs ahead of its\n"
 +        "                 arrivals or comes less than once a second: the input passes as it arrives\n"
 +        "                 (not regulated); 'regulated again' (2.2.0-pre12) = its PCR was a clock for\n"
-+        "                 10 min, the hold builds back up to D over ~1 min\n"
++        "                 10 min, the hold builds back up to D over ~1 min\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "  [PTV-CUSHION]  adaptive cushion tier moves + BANK escalations (target, sizing rationale)\n"
 +        "  [PTV-CUSHREL]  (1.0.1-pre10) raised cushion tier released: frame_q starved >=60s with\n"
 +        "                 input FLOWING while the tier held — the 6h zero-starvation release is\n"
 +        "                 unreachable under churn; tier back to base, gate caps restored\n"
 +        "                 (PTV_NO_CUSHREL disables; an input outage never triggers this)\n"
-+        "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED/back-in-range) +\n"
-+        "                 estimator frozen on BURSTY (PTV_DIAG adds re-acquire + lock progress)\n"
++        "  [PTV-CLOCK]    clock-follow arm/release (source clock offset FOLLOWED — '(measured on its PCR)' for a\n"
++        "                 regulated input, '(estimated from its video)' otherwise — back in range / measure lost) +\n"
++        "                 estimator frozen on BURSTY (PTV_DIAG adds re-acquire + lock progress; [PTV-REGDIAG]\n"
++        "                 carries the regulator's clock measure)\n"
 +        "  [PTV-DEGRADED] (1.0.1-pre10, opt-in PTV_DEGRADED=1, SINGLE-INPUT ONLY — hard-disabled\n"
 +        "                 with a startup WARNING on multiview) sustained-deficit demand admission\n"
 +        "                 enter/status/release; entry needs a >=3min train of QSHED full-cycles\n"
@@ -28659,6 +28975,48 @@ index 0000000000..31b97bc668
 +        "  [PTV-EMPTY]    frame_q starvation episodes >=2s (refill time; PTV_DIAG: sub-2s aggregate\n"
 +        "                 per 60s + a 5s still-empty heartbeat)\n"
 +        "  [PTV-WATCHDOG] (WARNING) the encoder stalled and stopped advancing\n");
++    av_log(NULL, AV_LOG_INFO,
++        "  [PTV-STALL]    (ERROR, at most 1/min) which thread stopped and where: 'vdec thread (inK) stalled N s at\n"
++        "                 <position>' (packets arrive, nothing decoded for 5 s) or 'output/stats thread stalled'.\n"
++        "                 With [PTV-WATCHDOG] (no picture emitted for 2 s) the line to send with a wedge report\n"
++        "  [PTV-NOVIDEO]  (FATAL) packets flow but no picture decoded since the start (PTV_NOVIDEO_EXIT_S, default\n"
++        "                 300 s): undecodable video, the process exits for a supervised respawn\n"
++        "  [PTV-VFILL]    N pictures repeated into content gaps (source pictures lost or corrupt), at most one\n"
++        "                 line per 10 s; the output timestamps stay continuous. Counts as dup= too\n"
++        "  [PTV-DUKF]     after a jump of 1 s or more in the video the decoder input waits for the next keyframe:\n"
++        "                 'resume at keyframe — dropped N video frames' (normal, at most one GOP) | 'escape — no IDR\n"
++        "                 within 5000ms' (resumed without one: a few damaged pictures may show)\n"
++        "  [PTV-VDEC]     'the source changed to WxH ... scaled to fit' (a mid-stream size switch, taken in-process,\n"
++        "                 each new size once) | 'N damaged picture(s) in another size dropped' | 'decoder error on\n"
++        "                 output ... frame lost' | 'scaling ... failed' (ERROR). The first is normal on ABR sources\n"
++        "  [PTV-VGRAPH]   (ERROR) the video filter graph took pictures and returned none: a filter failed, the\n"
++        "                 process exits 4 for a re-probe\n"
++        "  [PTV-QSHED]    the decoder cannot keep up: 'video_q full — shedding whole GOPs' / 'overflow: dropped GOP\n"
++        "                 N pkts ... from the head' / 'tail-dropped ... to the IDR boundary' / 'tail escape ... without\n");
++    av_log(NULL, AV_LOG_INFO,
++        "                 IDR'. Pictures are lost each time: look at the GPU / CPU load of the box\n"
++        "  [PTV-SELFHEAL] the frame queue stayed empty for tens of seconds although input flows: video_q and the decoder are\n"
++        "                 flushed and decoding resumes at the next keyframe ('no IDR within 5s' = resumed mid-GOP).\n"
++        "                 A decoder that lost its references; repeated = report it. PTV_NO_SELFHEAL disables\n");
++    av_log(NULL, AV_LOG_INFO,
++        "  [PTV-FRAMEQ]   'frame queue full (N pictures): dropping the oldest decoded pictures — a timestamp hole\n"
++        "                 on the wire' then 'stopped dropping: N pictures dropped over X s'. The output did not\n"
++        "                 take pictures (encoder / egress slow)\n"
++        "  [PTV-FQBP]     the output took no picture for 2 s with pictures queued: the decoder's back-pressure\n"
++        "                 is released until the queue drains (a guard against a decoder / output deadlock)\n"
++        "  [PTV-DLV]      'delivery gate full (N packets): copied packet dropped' = a copied (passthrough)\n"
++        "                 packet waited for its video longer than the gate holds (dlvdrop= on the stats line) —\n"
++        "                 must stay 0; the line says how far the video is behind\n"
++        "  [PTV-MUX]      WARNING 'dropped a packet stamped before the start' (start-up only, harmless). FATAL,\n"
++        "                 each exits for a supervised respawn: 'MUXGUARD drop span 60s with no accepted pkt' (a\n"
++        "                 stream's labels are dead) | 'egress dead 60s' | 'write failed' (the output is gone)\n"
++        "  [PTV-MUXGUARD] a packet with a backward dts dropped before the muxer ('remedy leak, channel survives')\n"
++        "                 + a total per rung at exit. Any line is a label bug to report with the lines before it\n"
++        "  [PTV-MUXTOL]   a mux write returned ENOMEM / EAGAIN (egress pressure): the packet is dropped, the\n"
++        "                 channel survives; 60 s of it ends in the [PTV-MUX] egress-dead exit. PTV_NO_MUXTOL reverts\n"
++        "  [PTV-DEMUX]    'stream #N (pid, type) appeared after open — ignored' (a PID born mid-run that is not\n"
++        "                 mapped; normal) | 'AAC now N Hz ... labels inside a PES re-derived from the ADTS header'\n"
++        "                 (the source switched its AAC sample rate)\n");
 +    av_log(NULL, AV_LOG_INFO,
 +        "multiview stats line — same head (frame/fps/time/dup/drop/dlvhold/dlvforced) + per slot:\n"
 +        "  inK:lipsync  (1.0.1-pre16.1, ALWAYS-ON, inside each inK: group) that slot's sensor R\n"
@@ -28670,15 +29028,19 @@ index 0000000000..31b97bc668
 +        "               absent while quiet. While ANY slot is black-slated no track may engage\n"
 +        "               ([PTV-RSCORR] HOLD 'sibling slate') — finding-1 defense-in-depth\n"
 +        "  [PTV-RSYNC] inK  (pre17; PTV_DIAG since 2.0.0, one round per 30s) per-slot soak summary:\n"
-+        "               R (as inK:lipsync), ev= slot edit ledger, sk= follow skew, occ=\n"
++        "               R (as inK:lipsync), ev= slot edit ledger, sk= the sound's follow offset (not the\n"
++        "               stats line's inK:sk picture lag), occ=\n"
 +        "               jitter depth, SLATED while black\n"
 +        "  [PTV-REOPEN] (pre17 fix round) live mv net input re-opened after a read error\n"
 +        "               (rw_timeout expiry included) — the slot auto-resumes as a fresh join;\n"
-+        "               retries forever with 1..5s backoff while the source is down\n"
++        "               retries forever with 1..5s backoff while the source is down ('still down' /\n"
++        "               'came back with another stream layout, not taken'). A single input logs its\n"
++        "               reopen as [PTV-SRC] in0 LOST ... (-reopen_backoff, default 1,2,5,10,30 s)\n"
 +        "  acor         (when >0) corrupt-discarded audio pkts, GLOBAL sum — per-track detail on\n"
 +        "               the [PTV-ADISC]/NBS log lines\n"
 +        "  inK:qdrop    input-K video queue overflow drops (demux side)\n"
-+        "  inK:corrupt  input-K corrupt packets (demux + decode)\n"
++        "  inK:corrupt  input-K corrupt packets (demux + decode)\n");
++    av_log(NULL, AV_LOG_INFO,
 +        "  inK:pd       cadence repeats: the cell showed its picture again because the next one was not\n"
 +        "               due yet — a 25fps slot in a 29.97 mosaic repeats every 6th tick BY DESIGN (~5/s\n"
 +        "               is correct rate conversion, not a fault)\n"
@@ -28710,7 +29072,7 @@ index 0000000000..31b97bc668
 +    av_log(NULL, AV_LOG_INFO,
 +        "  [PTV-CHAIN]    A/V trace demux→output (rawA-V / srcA-V / unwrap_inj / outA-V) to localize\n"
 +        "                 where an A/V offset enters\n"
-+        "  [PTV-LIPSYNC]  (single input) per-track err = async_pad − video lag (internal estimate);\n"
++        "  [PTV-LIPSYNC]  (single input) per-track err = the ring-paired offset (picture vs sound, + = audio late);\n"
 +        "                 a mosaic slot's lip sync is its inK:lipsync on the mv stats line\n"
 +        "defaults (2.1): the program timeline (one classifier per input, the record door, mosaic frame\n"
 +        "  synchronizers) + WUCR occupancy pacing + REPRIME fast refill + ADAPTIVE cushion + delivery\n"
@@ -28769,7 +29131,11 @@ index 0000000000..31b97bc668
 +            int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
 +                       + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
 +            int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
-+                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
++                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed)
++                       - atomic_load_explicit(&g_rsx.eo_us[ki],  memory_order_relaxed);   /* T-480/T-486: an adopted
++                                                                    * clock of its own is the stream's timing, not desync
++                                                                    * (the corrector's R_us; rc5/rc6 read +10313001 ms
++                                                                    * in sync on aflip60 — sync_check's PIN would restart) */
 +            nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
 +        } else
 +            nn += snprintf(buf + nn, size - nn, "--");
@@ -28804,7 +29170,11 @@ index 0000000000..31b97bc668
 +            int64_t mv = atomic_load_explicit(&g_rsx.mv_ema[in], memory_order_relaxed)
 +                       + atomic_load_explicit(&g_rsx.ev_us[in],  memory_order_relaxed);
 +            int64_t ma = atomic_load_explicit(&g_rsx.ma_ema[ki], memory_order_relaxed)
-+                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed);
++                       + atomic_load_explicit(&g_rsx.ea_us[ki],  memory_order_relaxed)
++                       - atomic_load_explicit(&g_rsx.eo_us[ki],  memory_order_relaxed);   /* T-480/T-486: an adopted
++                                                                    * clock of its own is the stream's timing, not desync
++                                                                    * (the corrector's R_us; rc5/rc6 read +10313001 ms
++                                                                    * in sync on aflip60 — sync_check's PIN would restart) */
 +            nn += snprintf(buf + nn, size - nn, "%+lldms", (long long)((mv - ma) / 1000));
 +        } else
 +            nn += snprintf(buf + nn, size - nn, "--");
@@ -28868,7 +29238,7 @@ index 0000000000..31b97bc668
 +}
 diff --git a/fftools/ptvencoder_mv.c b/fftools/ptvencoder_mv.c
 new file mode 100644
-index 0000000000..b3afcf17e4
+index 0000000000..3e161a811b
 --- /dev/null
 +++ b/fftools/ptvencoder_mv.c
 @@ -0,0 +1,1142 @@
@@ -29111,7 +29481,7 @@ index 0000000000..b3afcf17e4
 +                    if (nf - margin > fs && nf - fs < 60000000)
 +                        tgt = nf - margin;
 +                }
-+                av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer overflowed: the "
++                av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer overflowed: the "
 +                       "pictures before this one are gone, %"PRId64" dropped so far)\n", k, (out - tgt - s->lag) / 1000,
 +                       s->ovf_seen);
 +                mv_tl_step(c, k, s, out - tgt, h0, now_us, tgt);
@@ -29129,7 +29499,7 @@ index 0000000000..b3afcf17e4
 +             * normal for a bursty source and waits (re-locking on 1 s churned an HLS-burst slot every few seconds) */
 +            if (!cand && fs - (out - mv_tl_lag(s, fs)) > margin + 10000000 && now_us - s->shown_wc > 3000000 &&
 +                now_us - s->relock_wc > 3000000) {
-+                av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
++                av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
 +                       k, (out - fs + margin - s->lag) / 1000);
 +                mv_tl_step(c, k, s, out - fs + margin, h0, now_us, AV_NOPTS_VALUE);
 +            }
@@ -29177,7 +29547,7 @@ index 0000000000..b3afcf17e4
 +                relock = out - src + margin;        /* late for 1 s at real-time pace: hold for the primed margin */
 +        }
 +        if (relock != AV_NOPTS_VALUE && relock - s->lag >= c->tick_dur_us) {   /* grows only */
-+            av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (late for 1 s)\n", k,
++            av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (late for 1 s)\n", k,
 +                   (relock - s->lag) / 1000);
 +            s->late_wc = 0;
 +            mv_tl_step(c, k, s, relock, h0, now_us, AV_NOPTS_VALUE);
@@ -29265,7 +29635,7 @@ index 0000000000..b3afcf17e4
 +                                              * top of it — a backlog left over, not a clock: one cut. Up to there drift
 +                                              * goes a picture per window even after damage paused the evidence (a
 +                                              * +1000 ppm slot on a damaged capture: 6 ticks as the limit cut -266 ms) */
-+                        av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer never "
++                        av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (the buffer never "
 +                               "below %"PRId64" ms in 60 s, primed %"PRId64" ms)\n", k, -(lo - margin) / 1000,
 +                               lo / 1000, margin / 1000);
 +                        mv_tl_step(c, k, s, s->lag - (lo - margin), h0, now_us, AV_NOPTS_VALUE);
@@ -29519,7 +29889,7 @@ index 0000000000..b3afcf17e4
 +                last[k] = cand; any_fresh = 1; last_fresh_us[k] = now_us;
 +                if (c->inputs[k].deferred) {             /* 2.0.2 T-386: the slot's first picture — it joins here */
 +                    c->inputs[k].deferred = 0;
-+                    av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d joined: first picture at tick %"PRId64" (%.3f s)\n",
++                    av_log(NULL, AV_LOG_INFO, "[PTV-MV] in%d joined: first picture at tick %"PRId64" (%.3f s)\n",
 +                           k, tick, mv_tick_us(c, tick) / 1e6);
 +                }
 +                if (!born[k]) {                           /* pre17: first display — the slot is live;
@@ -30016,10 +30386,10 @@ index 0000000000..b3afcf17e4
 +
 diff --git a/fftools/ptvencoder_regulate.c b/fftools/ptvencoder_regulate.c
 new file mode 100644
-index 0000000000..996ff6b986
+index 0000000000..27785872f7
 --- /dev/null
 +++ b/fftools/ptvencoder_regulate.c
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,706 @@
 +/*
 + * ptvencoder — the input regulator (2.2 T-423)
 + *
@@ -30080,6 +30450,7 @@ index 0000000000..996ff6b986
 + *   never three in 60 s) and over months every channel would end unregulated; Heartland's and Sportz's PCR never
 + *   look like a clock for 10 min, so they stay as they arrive. */
 +
++#include <math.h>
 +#include <stdarg.h>
 +#include <stdatomic.h>
 +#include <string.h>
@@ -30106,6 +30477,10 @@ index 0000000000..996ff6b986
 +#define REG_SV_MAX   20000                          /* T-439: its largest rate change (ppm) */
 +#define REG_CAP0     2048                           /* T-439: the FIFO's first size (datagrams) */
 +#define REG_RETRUST  600000000                      /* T-444: a clock again for this long (us) = regulated again */
++#define REG_FE_BIN   2000000                        /* T-471: the rate measure's bin (us): its earliest packet */
++#define REG_FE_NB    30                             /* T-471: bins in the fit (60 s) */
++#define REG_FE_MIN   8                              /* T-471: bins before the measure is used (16 s) */
++#define REG_FE_RMS   40000                          /* T-471: the fit's largest residual RMS (us) to be a measure */
 +
 +typedef struct RegItem {
 +    int64_t due;
@@ -30144,6 +30519,13 @@ index 0000000000..996ff6b986
 +    int64_t         bad_wc;                         /* T-444: while untrusted, the last sign that its PCR is no clock */
 +    int64_t         retrust;                        /* T-444: REG_RETRUST (PTV_TEST_REG_RETRUST: TEST-ONLY, s) */
 +    int             tr_cnt, sp_cnt;
++    /* 2.2.1 T-471: the source's clock rate measured on its PCR (reader thread; published for the house clock) */
++    int64_t         sv_p;                           /* the servo's phase term (ppm); sv_rho = sv_p - fe_ppm */
++    int64_t         fe_y, fe_bin_t, fe_bin_min, fe_bin_x, fe_ppm;
++    int64_t         fe_x[REG_FE_NB], fe_o[REG_FE_NB];
++    int             fe_on, fe_bin_has, fe_n, fe_head, fe_ok;
++    _Atomic int64_t fe_ppm_pub;                     /* + = the source's clock runs fast */
++    _Atomic int     fe_ok_pub;
 +} Regulator;
 +
 +static Regulator  *regs[PTV_MAX_INPUT];
@@ -30183,8 +30565,9 @@ index 0000000000..996ff6b986
 +                   "not regulated (its PCR is no clock)\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s", r->by_max / 1e6);
 +        else if (r->by_cnt > 0)
 +            av_log(NULL, AV_LOG_INFO, "[PTV-BURSTY] in%d %d stall%s >=1.5s in the last 60s (worst %.1fs) at the input — "
-+                   "regulated: %.1f-%.1f s held (D %.1f s)\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s",
-+                   r->by_max / 1e6, r->held_min / 1e6, r->held_max / 1e6, r->delay / 1e6);
++                   "regulated: %.1f to %.1f s held (D %.1f s)%s\n", r->k, r->by_cnt, r->by_cnt == 1 ? "" : "s",
++                   r->by_max / 1e6, FFMAX(r->held_min, 0) / 1e6, FFMAX(r->held_max, 0) / 1e6, r->delay / 1e6,
++                   r->held_min < 0 ? ", the hold ran dry in the stall" : "");   /* T-486: was "-9.5-0.5 s held" */
 +        r->by_win = now;
 +        r->by_cnt = 0;
 +        r->by_max = 0;
@@ -30213,6 +30596,83 @@ index 0000000000..996ff6b986
 +    return ((int64_t)p[6] << 25) | (p[7] << 17) | (p[8] << 9) | (p[9] << 1) | (p[10] >> 7);
 +}
 +
++/* 2.2.1 T-471 (owner 2026-11-15: a faster clock lock, the professional way = one PCR-locked recovery in front): the source
++ * clock's rate against ours, measured on its PCR. Delivery only ever DELAYS a packet, so per 2 s bin the packet that came
++ * earliest against its PCR (min of arrival - PCR) is the clock without the jitter; a least-squares line through the last
++ * 16-60 s of those minima is the rate (+ = the source runs fast). It is a measurement of arrivals against the PCR alone —
++ * the schedule does not enter it, so the servo cannot chase itself. Not a measure while the minima scatter (RMS > 40 ms:
++ * burst delivery, a wandering PCR). The schedule takes it as its rate (feed-forward: the hold stays D instead of the
++ * phase term's 30 s x offset), the house clock follows it at once ([PTV-CLOCK]); the old way measured video DTS in 3 s
++ * windows (60 s to lock, 2 min pinned before following: a 1.9 % fast source held +2.2 s for minutes, t471f) */
++static void fe_reset(Regulator *r)
++{
++    r->fe_on = r->fe_bin_has = r->fe_n = r->fe_head = 0;
++    r->fe_y = 0;
++}
++
++static void fe_fit(Regulator *r)
++{
++    double sx = 0, so = 0, sxx = 0, sxo = 0, b, a, rss = 0, x0 = (double)r->fe_x[(r->fe_head - r->fe_n + REG_FE_NB) % REG_FE_NB];
++    int i, n = r->fe_n;
++    for (i = 0; i < n; i++) {
++        int j = (r->fe_head - n + i + REG_FE_NB) % REG_FE_NB;
++        double x = r->fe_x[j] - x0, o = r->fe_o[j];
++        sx += x; so += o; sxx += x * x; sxo += x * o;
++    }
++    if (n < REG_FE_MIN || sxx * n - sx * sx <= 0)
++        return;
++    b = (n * sxo - sx * so) / (n * sxx - sx * sx);  /* d(arrival - PCR) / d(arrival) = 1 - the source's rate */
++    a = (so - b * sx) / n;
++    for (i = 0; i < n; i++) {
++        int j = (r->fe_head - n + i + REG_FE_NB) % REG_FE_NB;
++        double e = r->fe_o[j] - (a + b * (r->fe_x[j] - x0));
++        rss += e * e;
++    }
++    r->fe_ok  = sqrt(rss / n) <= REG_FE_RMS;
++    if (r->fe_ok)
++        r->fe_ppm = av_clip64(llrint(-b * 1e6), -REG_SV_MAX, REG_SV_MAX);
++    atomic_store_explicit(&r->fe_ppm_pub, r->fe_ppm, memory_order_relaxed);
++    atomic_store_explicit(&r->fe_ok_pub, r->fe_ok, memory_order_relaxed);
++}
++
++/* one PCR packet on a continuous PCR (dus = its PCR step in us, 0 for the first) */
++static void fe_feed(Regulator *r, int64_t dus, int64_t now)
++{
++    int64_t o;
++    if (!r->fe_on) {
++        r->fe_on = 1;
++        r->fe_y  = 0;
++    } else
++        r->fe_y += dus;
++    o = now - r->fe_y;
++    if (!r->fe_bin_has || o < r->fe_bin_min) {
++        if (!r->fe_bin_has)
++            r->fe_bin_t = now;
++        r->fe_bin_has = 1;
++        r->fe_bin_min = o;
++        r->fe_bin_x   = now;
++    }
++    if (now - r->fe_bin_t >= REG_FE_BIN) {
++        r->fe_x[r->fe_head] = r->fe_bin_x;
++        r->fe_o[r->fe_head] = r->fe_bin_min;
++        r->fe_head = (r->fe_head + 1) % REG_FE_NB;
++        r->fe_n    = FFMIN(r->fe_n + 1, REG_FE_NB);
++        r->fe_bin_has = 0;
++        fe_fit(r);
++        r->sv_rho = getenv("PTV_TEST_REG_NOSERVO") ? 0 :
++                    av_clip64(r->sv_p - (r->fe_ok ? r->fe_ppm : 0), -REG_SV_MAX, REG_SV_MAX);
++    }
++}
++
++int ptv_regulate_rate(int k, int64_t *ppm)
++{
++    Regulator *r = k >= 0 && k < PTV_MAX_INPUT ? regs[k] : NULL;
++    if (!r || !atomic_load_explicit(&r->fe_ok_pub, memory_order_relaxed))
++        return 0;
++    *ppm = atomic_load_explicit(&r->fe_ppm_pub, memory_order_relaxed);
++    return 1;
++}
++
 +/* 2.2 T-441: the PCR is no clock to pace by: what is held leaves now, every later packet as it arrives (T-444: until
 + * its PCR is a clock again for REG_RETRUST) */
 +static av_printf_format(3, 4) void reg_untrust(Regulator *r, int64_t now, const char *fmt, ...)
@@ -30222,6 +30682,9 @@ index 0000000000..996ff6b986
 +    int i;
 +    r->untrusted = 1;
 +    r->bad_wc    = now;
++    fe_reset(r);                                    /* T-471: not regulated = no rate for the house clock */
++    r->fe_ok = 0;
++    atomic_store_explicit(&r->fe_ok_pub, 0, memory_order_relaxed);
 +    r->tr_cnt    = r->sp_cnt = 0;
 +    atomic_fetch_add_explicit(&reg_unreg, 1, memory_order_relaxed);
 +    va_start(vl, fmt);
@@ -30244,7 +30707,7 @@ index 0000000000..996ff6b986
 +    r->anchor_t  = now;
 +    r->acc       = 0;
 +    r->last_due  = now;
-+    r->sv_win    = r->sv_rho = r->sv_frac = 0;
++    r->sv_win    = r->sv_rho = r->sv_frac = r->sv_p = 0;
 +    r->tr_win    = r->tr_prev = 0;
 +    r->tr_cnt    = r->sp_cnt = 0;
 +    r->sp_win    = now;
@@ -30267,12 +30730,14 @@ index 0000000000..996ff6b986
 +    }
 +    r->sv_max = FFMAX(r->sv_max, wait);
 +    if (now - r->sv_win >= REG_SV_WIN) {
-+        r->sv_rho = av_clip64(-(r->sv_max - r->delay) / REG_SV_TAU, -REG_SV_MAX, REG_SV_MAX);
++        r->sv_p   = av_clip64(-(r->sv_max - r->delay) / REG_SV_TAU, -REG_SV_MAX, REG_SV_MAX);
++        r->sv_rho = av_clip64(r->sv_p - (r->fe_ok ? r->fe_ppm : 0), -REG_SV_MAX, REG_SV_MAX);   /* T-471 */
 +        if (getenv("PTV_TEST_REG_NOSERVO"))         /* TEST-ONLY (T-439): the pre-T-439 fixed schedule, for A/B */
 +            r->sv_rho = 0;
 +        if (g_diag)
-+            av_log(NULL, AV_LOG_INFO, "[PTV-REGDIAG] in%d earliest waited %.3f s (D %.3f) rho %+"PRId64"ppm held %d\n",
-+                   r->k, r->sv_max / 1e6, r->delay / 1e6, r->sv_rho, r->n);
++            av_log(NULL, AV_LOG_INFO, "[PTV-REGDIAG] in%d earliest waited %.3f s (D %.3f) rho %+"PRId64"ppm held %d "
++                   "clock %+"PRId64"ppm%s (%d bins)\n", r->k, r->sv_max / 1e6, r->delay / 1e6, r->sv_rho, r->n,
++                   r->fe_ppm, r->fe_ok ? "" : "?", r->fe_n);
 +        r->sv_win = now;
 +        r->sv_max = wait;
 +    }
@@ -30337,6 +30802,9 @@ index 0000000000..996ff6b986
 +    if (r->anchor_t == AV_NOPTS_VALUE) {
 +        r->anchor_t = now + r->delay;
 +        r->acc      = 0;
++        fe_reset(r);
++        if (!r->untrusted)
++            fe_feed(r, 0, now);
 +    } else {
 +        int64_t d = pcr - r->last_pcr, gap = now - r->last_pcr_wc, dus;
 +        if (d < -(1LL << 32))
@@ -30348,6 +30816,8 @@ index 0000000000..996ff6b986
 +             * its schedule: the hole plays at its moment and the hold stays D. Continuing the schedule here ate the hold at
 +             * every hole (a Stingray replay: held 8 -> 163 s, FIFO drops, 13 freezes vs 3 unregulated) */
 +            r->acc += d;
++            if (r->fe_on && !r->untrusted)          /* T-471: the clock ran on through the hole */
++                fe_feed(r, dus, now);
 +            if (!r->pid_moved && !r->untrusted && now - r->jump_log_wc >= 10000000) {   /* T-444: not the shadow's */
 +                r->jump_log_wc = now;
 +                av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d hole %.1f s (the source stopped as long as its PCR jumped) — "
@@ -30362,6 +30832,9 @@ index 0000000000..996ff6b986
 +             * to 2.3 s, rising: a false T-441 'runs ahead', or ~1 s more delay. A jump keeps the schedule (see the top) */
 +            r->anchor_t = r->last_due >= now || stop < 1000000 ? r->last_due : now + r->delay;
 +            r->acc      = 0;
++            fe_reset(r);                            /* T-471: a new PCR line (the last measure stays published) */
++            if (!r->untrusted)
++                fe_feed(r, 0, now);
 +            if (!r->untrusted && now - r->jump_log_wc >= 10000000) {
 +                r->jump_log_wc = now;
 +                av_log(NULL, AV_LOG_INFO, "[PTV-REG] in%d PCR jump %+.1f s — schedule continued (%.1f s held)\n",
@@ -30369,6 +30842,8 @@ index 0000000000..996ff6b986
 +            }
 +        } else {
 +            r->acc     += d;
++            if (!r->untrusted)                      /* T-471 */
++                r->fe_on ? fe_feed(r, dus, now) : fe_feed(r, 0, now);
 +            r->sv_frac += dus * r->sv_rho;          /* T-439: the servo's rate, applied as the PCR advances */
 +            r->anchor_t += r->sv_frac / 1000000;
 +            r->sv_frac  %= 1000000;
@@ -30623,10 +31098,10 @@ index 0000000000..996ff6b986
 +}
 diff --git a/fftools/ptvencoder_timeline.c b/fftools/ptvencoder_timeline.c
 new file mode 100644
-index 0000000000..12e7d04e8e
+index 0000000000..78f3dccda8
 --- /dev/null
 +++ b/fftools/ptvencoder_timeline.c
-@@ -0,0 +1,1390 @@
+@@ -0,0 +1,1444 @@
 +/*
 + * ptvencoder — 2.1 T-409: the program timeline, source stage (M_in).
 + *
@@ -30654,6 +31129,7 @@ index 0000000000..12e7d04e8e
 + */
 +
 +#include "ptvencoder.h"
++#include "libavutil/bprint.h"
 +#include "libavutil/mathematics.h"
 +#include "libavutil/time.h"
 +
@@ -31421,7 +31897,15 @@ index 0000000000..12e7d04e8e
 +             * corrupt packet or where the event began — not at the window's close (a big step's window waits up to 3 s for
 +             * its partner; counted, 1.06 s of that wait was kept as a hole: sync_excursion mirror) */
 +            dspan = dmg && t->dmg_start_wc ? FFMAX(t->open_wc, t->dmg_seen_wc) - t->dmg_start_wc : 0;
-+            keep  = FFMIN(J, (FFMAX(W, dspan) + fd / 2) / fd * fd);
++            /* 2.2.1 T-486/T-467: the damage span (first corrupt packet .. the event's window) is an UPPER bound of the
++             * pictures lost — it includes how late the step's packet came. Above one picture: the whole pictures inside
++             * it, not rounded up (vt-ap-ownp: one lost picture, a 61 ms span read as 2 — 80 ms kept, the muted audio's
++             * adopted offset 40 ms early; a few ms of regulator timing flipped it run to run). The wall evidence W keeps
++             * its rounding: real silence */
++            {
++                int64_t kd = dspan < fd ? (dspan + fd / 2) / fd * fd : dspan / fd * fd;
++                keep = FFMIN(J, FFMAX((W + fd / 2) / fd * fd, kd));
++            }
 +            /* 2.2.1 T-463: an audio that did not step and was not damaged flowed through the event — the damage span is
 +             * only an upper bound of the pictures lost: whole pictures, not rounded up (vt-vonly: one lost picture kept
 +             * as an 80 ms hole, the audio on its own clock 40 ms early after) */
@@ -31450,9 +31934,52 @@ index 0000000000..12e7d04e8e
 +        prog_event = 1;
 +        cls = J > 0 && keep == J ? "hole kept" : keep && J > 0 ? "hole, flowing part erased" : J > 0 ? "relabel erased" :
 +              keep ? "new domain, gap kept" : "step back erased";
++        /* 2.2.1 T-476 (owner 2026-11-15: follow the content, as an encoder re-stamping each stream across a timestamp break):
++         * a pure erase of a step BACK (the input flowed: no wall gap with arrivals as evidence, no damage, nothing kept) makes the VIDEO continuous; an audio that
++         * stepped with it by a different amount keeps the difference as a lip-sync error unless its own step is erased on
++         * it too. Its own exact step = first new label - (last old label + one PES). vt-info-a85 sync_bstep: video -120 /
++         * audio -85 ms at 3 points, content continuous -> +35 ms each, +105 ms for good. Once per event, bounded (5-500 ms;
++         * below 5 ms is the PES grid), through the stream's relabel repair (rep_us, bound 2 s); an audio stepping back
++         * further than the video could repeat content -> the T-087 content check reads the seam (as a single-stream relabel) */
++        /* backward only, and only while arrivals are evidence: under a bank / deep prime W is forced to 0, so "no wall gap"
++         * proves nothing (rich2997long-t389 sync_storm_2, dev2: +3.5 s stall steps under the bank, the audio's PES grid
++         * read as its own step -81 / +49 ms — lip sync -30 ms) */
++        if (!keep && !W && !dmg && J < 0 &&
++            !(atomic_load_explicit(&g_bank_us, memory_order_relaxed) > 0 || (int64_t)g_preroll_ms >= 4000)) {
++            for (si = 0; si < t->nst; si++) {
++                TlStream *s = &t->st[si];
++                int64_t ja, rn;
++                if (!s->dense || si == vs || s->res != 1 || s->mute || s->rep_big ||
++                    d->ifmt->streams[si]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO || !s->step_us)
++                    continue;
++                ja = s->new_first_us - (s->old_end_us + s->step_us);
++                rn = J - ja;
++                if (llabs(rn) < 5000 || llabs(rn) > 500000 || llabs(s->rep_us + rn) > 2000000)
++                    continue;
++                s->rep_new = rn;
++                s->rep_us += rn;
++                if (rn > 0 && g_rlcheck) {
++                    int j;
++                    for (j = 0; j < d->n_audio; j++)
++                        if (d->astream[j] == si && d->aglobal[j] >= 0 && d->aglobal[j] < PTV_MAX_AUDIO) {
++                            int g = d->aglobal[j];
++                            atomic_store_explicit(&g_rl_step_us[g], rn, memory_order_relaxed);
++                            atomic_store_explicit(&g_rl_wc[g], nw, memory_order_relaxed);
++                            atomic_fetch_add_explicit(&g_rl_seq[g], 1, memory_order_relaxed);
++                            s->rl_mark = 1;
++                        }
++                }
++                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: its own step %+.3f s vs the program's %+.3f s, the "
++                       "input flowing — the difference erased on the stream (%+.3f s)\n", d->rsync_slot, si, ja / 1e6,
++                       J / 1e6, rn / 1e6);
++            }
++        }
 +        /* the new content resumes at a keyframe only where content was lost (a hole, damage): a relabel while the input
 +         * flowed keeps the bitstream's references — dropping to the next keyframe left ~1 s video PTS holes (sync_bstep) */
-+        if (erase && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
++        /* 2.2.1 T-474: a KEPT hole lost content too (erase 0): the first new picture was a P-frame decoded against the
++         * last pre-outage reference — the frozen picture flashed back on air after the bars (vt-vsw-bars: one picture of
++         * content 26.92 s, then the I-frame 1 picture later). Like a receiver after a discontinuity: wait for a keyframe */
++        if ((erase || keep) && (W > 0 || dmg) && !d->drop_until_kf && g_drop_until_kf) {
 +            int i;
 +            for (i = 0; i < t->nheld; i++)
 +                if (t->held[i].si == vs && t->held[i].path == 1) {
@@ -31532,7 +32059,7 @@ index 0000000000..12e7d04e8e
 +                    }
 +                    s->mute_rep -= js;
 +                }
-+                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s off the program clock "
++                av_log(NULL, AV_LOG_WARNING, "[PTV-TL] in%d stream %d: %s — step %+.3f s, %+.3f s from the program clock "
 +                       "(band %.1f s)\n", d->rsync_slot, si, s->mute ? "MUTED" : "on the program clock", js / 1e6,
 +                       off / 1e6, TL_CLK_US / 1e6);
 +                continue;
@@ -31615,19 +32142,21 @@ index 0000000000..12e7d04e8e
 +        }
 +    }
 +    t->ev_n++;
-+    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-+           "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
-+    if (prog_event)
-+        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO,
-+               " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
-+               J / 1e6, W / 1e6, dmg ? " (damaged)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
-+               k_new / 1e6);
-+    for (si = 0; si < t->nst; si++)
-+        if (t->st[si].dense && t->st[si].res == 1)
-+            av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " [s%d %+.3f s]", si,
-+                   (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
-+    av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, " window %.2f s, %d held\n",
-+           (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
++    {   /* 2.2.1 T-486: ONE av_log — the log mutex is per call, a status line could land inside a multi-call line */
++        AVBPrint bp;
++        av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
++        av_bprintf(&bp, "[PTV-TL] in%d event #%"PRId64" (stream %d opened): %s", d->rsync_slot, t->ev_n, t->trig, cls);
++        if (prog_event)
++            av_bprintf(&bp, " — J %+.3f s, wall %.3f s%s, kept %.3f s, erased %.3f s (%"PRId64" pictures), k %+.3f s",
++                       J / 1e6, W / 1e6, dmg ? " (damaged)" : "", keep / 1e6, erase / 1e6, fd ? erase / fd : 0,
++                       k_new / 1e6);
++        for (si = 0; si < t->nst; si++)
++            if (t->st[si].dense && t->st[si].res == 1)
++                av_bprintf(&bp, " [s%d %+.3f s]", si, (t->st[si].new_first_us - t->st[si].old_end_us) / 1e6);
++        av_bprintf(&bp, " window %.2f s, %d held", (av_gettime_relative() - t->open_wc) / 1e6, t->nheld);
++        av_log(NULL, prog_event ? AV_LOG_WARNING : AV_LOG_INFO, "%s\n", bp.str);
++        av_bprint_finalize(&bp, NULL);
++    }
 +
 +    if (prog_event) {
 +        atomic_store_explicit(&t->prog_wc, nw, memory_order_relaxed);
