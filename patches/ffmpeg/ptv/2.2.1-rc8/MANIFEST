@@ -1,0 +1,8 @@
+version=2.2.1-rc8
+channel=dev
+tag=ptv-2.2.1-rc8
+source_commit=f0a140c93733cfab85ba0c0023d1c7114a8c235b
+branches=master
+verified_master=ebf7955a638ec6a98ff23a2deaa589b87a089dc3
+verified_date=2026-11-15
+supersedes=2.2.1-rc7
