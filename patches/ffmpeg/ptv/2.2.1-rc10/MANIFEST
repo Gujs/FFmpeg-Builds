@@ -1,0 +1,8 @@
+version=2.2.1-rc10
+channel=dev
+tag=ptv-2.2.1-rc10
+source_commit=7925c4ca4786abd541bd6bdc28a2236ee79a0143
+branches=master
+verified_master=6ea799a67599514eae2ac5e8c58db498546520b1
+verified_date=2026-11-16
+supersedes=2.2.1-rc9
