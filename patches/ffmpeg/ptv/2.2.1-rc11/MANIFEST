@@ -1,8 +1,0 @@
-version=2.2.1-rc11
-channel=dev
-tag=ptv-2.2.1-rc11
-source_commit=30f292efd724148d75c1702e99a3020d6504eee8
-branches=master
-verified_master=11337618b235c8cfe529e44fe8559d9689024690
-verified_date=2026-11-16
-supersedes=2.2.1-rc10
