@@ -105,16 +105,47 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..e2f3f4e1d2
+index 0000000000..6c76f49e57
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6344 @@
+@@ -0,0 +1,6375 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.1-rc12 — rc11 + copied subtitle tracks follow the source's PMT (T-493)
++
++**A copied subtitle track takes its language and page data from the source's current PMT, not only from the PMT seen at
++start (T-493, 2.2.1).** glo-2 2.2.0, NOCTOCODE GB_News / Euronews AI subs: the encoder started while the source came back
++from an outage; the source's first PMT gave a language for one of twelve DVB subtitle tracks, the full PMT came 62 ms
++after the bind — eleven tracks went out as "und" (and with the muxer's default page ids) until a restart. Now: when the
++source's PMT says something new about a copied subtitle track (language, subtitling type / composition and ancillary page
++ids, teletext pages, hearing impaired), the outputs carry it and the output PMT version goes up so receivers read it
++again. The PIDs stay as planned at start. Not when `-metadata` or a selection rule set the track's language. A track that
++first appears in a later PMT is still not added (unchanged). New log lines: `[PTV-SRC] inK pid 0xP (codec): the source's
++PMT says LANG (was OLD) — the output follows` and `[PTV-MUX] output PMT version a → b: N copied track(s) take the source's
++language / page data`. Kit: gate28 `vt-cin/pmtlate_15` (media-v39: cap-cinestar with three subtitle PIDs listed language-
++less until content 15 s; judge LANGS = langcheck.py, the output's last PMT carries the source's languages and page data):
++rc11 FAIL (hrv + und und und), rc12 PASS; an output PMT version change with the same PIDs is accepted only as the
++encoder's own `[PTV-MUX]` line.
++
++## 2.2.1-rc11 — rc10 + the sync check's picture times on the exact clock (T-491)
++
++**The post-event sync check no longer steps the sound late on 29.97 / 59.94 channels (T-491, 2.2.1 blocker).** Sandbox
++rc10, live TruBLU measured on content against its source: the sound +67 ms late, then +107 ms after one more step — the
++sum of the check's STEPPED values; cow-1 TruBLU / WildTV the same, while lipsync= read ~0 (the rc10 calibration had set
++it to the check's reading). Cause: the check pairs each sound frame with the picture of the same label and kept each
++picture's output time on the integer tick (33367 us for a 29.97 frame of 33366.67 us), the one output-time map left off
++the exact axis: its reading crept +10 ppm (+1 ms per 100 s) while air stayed put, and at the next splice beyond 25 ms it
++was stepped onto air. Now the exact axis, like every other map (and the mosaic). Replay of the live capture: the reading
++stays at 0 (rc10: 0 -> +20 ms in 20 min), the splices read +0 ms, air within 3 ms. Logs: no new or changed lines.
++Kit: gate28 vt-tbsplice judges VDRIFT (sensorcheck --vdrift: the check's picture lag does not creep between events,
++<= 3 ms per segment; rc10 +4 ms, rc11 +0) and SCREAD (sensorcheck --screads: its post-event readings within 20 ms);
++the gate's lanes share one key queue. Known, not a blocker (T-492): after a splice that is not a whole
++number of frames the check reads the pictures' sub-frame tick phase (up to one frame, constant).
 +
 +## 2.2.1-rc10 — rc9 + the post-event sync check's step reaches the air; the slow corrector acts on drift only (T-488)
 +
@@ -6455,10 +6486,10 @@ index 0000000000..e2f3f4e1d2
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..0ae99271f2
+index 0000000000..f9ac0cd11a
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,7905 @@
+@@ -0,0 +1,7974 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6508,7 +6539,7 @@ index 0000000000..0ae99271f2
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.1-rc10"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.1-rc12"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -6567,6 +6598,8 @@ index 0000000000..0ae99271f2
 +_Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;   /* 2.0.0-pre6.1 rejoin map */
 +_Atomic int     g_rj_epoch;
 +_Atomic int64_t g_house_out_us, g_house_tick_us;
++_Atomic int     g_lang_gen;                            /* 2.2.1 T-493 */
++pthread_mutex_t g_lang_lock = PTHREAD_MUTEX_INITIALIZER;
 +
 +/* 2.0.0 T-100: where the video actually put its content. The master records every fresh frame it puts on the
 + * output (source content time -> output time, both us); sparse copies (DVB subs, SCTE-35) and CC captions are
@@ -10344,7 +10377,57 @@ index 0000000000..0ae99271f2
 +    int                   err;
 +    int                   is_master;                  /* Φ1′: rung 0 — compute the wire-DTS sensor here only */
 +    int                   rung;                       /* pre14: index into g_mux_sent_wc (wire-send watermark) */
++    PassStream           *pass;                       /* 2.2.1 T-493: the copied tracks (lang_*) ... */
++    int                   n_pass;
++    int                   lang_gen;                   /* ... and the g_lang_gen this rung has applied */
 +} MuxArgs;
++
++/* 2.2.1 T-493: put what the source's PMT now says about the copied tracks onto this rung's output streams (the mpegts muxer
++ * writes language, page ids / type and the hearing-impaired flag from them on every PMT) and raise the PMT version, so a
++ * receiver that keeps the PMT by its version reads it again. Mux thread only: the muxer reads these here, nowhere else */
++static void mux_follow_langs(MuxArgs *m)
++{
++    int i, changed = 0, gen = atomic_load_explicit(&g_lang_gen, memory_order_acquire);
++    if (gen == m->lang_gen)
++        return;
++    m->lang_gen = gen;
++    pthread_mutex_lock(&g_lang_lock);
++    for (i = 0; i < m->n_pass; i++) {
++        PassStream *ps = &m->pass[i];
++        AVStream *os = ps->ost[m->rung];
++        const AVDictionaryEntry *ol;
++        int hi;
++        if (!ps->lang_follow || !os || !ps->lang_now[0])
++            continue;
++        ol = av_dict_get(os->metadata, "language", NULL, 0);
++        hi = !!(os->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
++        if (ol && !strcmp(ol->value, ps->lang_now) && hi == ps->lang_hi &&
++            os->codecpar->extradata_size == ps->lang_xd_n &&
++            (!ps->lang_xd_n || !memcmp(os->codecpar->extradata, ps->lang_xd, ps->lang_xd_n)))
++            continue;
++        av_dict_set(&os->metadata, "language", ps->lang_now, 0);
++        os->disposition = (os->disposition & ~AV_DISPOSITION_HEARING_IMPAIRED) |
++                          (ps->lang_hi ? AV_DISPOSITION_HEARING_IMPAIRED : 0);
++        if (ps->lang_xd_n > 0) {
++            uint8_t *xd = av_mallocz(ps->lang_xd_n + AV_INPUT_BUFFER_PADDING_SIZE);
++            if (xd) {
++                memcpy(xd, ps->lang_xd, ps->lang_xd_n);
++                av_freep(&os->codecpar->extradata);
++                os->codecpar->extradata      = xd;
++                os->codecpar->extradata_size = ps->lang_xd_n;
++            }
++        }
++        changed++;
++    }
++    pthread_mutex_unlock(&g_lang_lock);
++    if (changed && m->ofmt->priv_data) {
++        int64_t v = 0;
++        if (av_opt_get_int(m->ofmt->priv_data, "tables_version", 0, &v) >= 0 &&
++            av_opt_set_int(m->ofmt->priv_data, "tables_version", (v + 1) & 31, 0) >= 0 && m->is_master)
++            av_log(NULL, AV_LOG_WARNING, "[PTV-MUX] output PMT version %"PRId64" \xe2\x86\x92 %"PRId64": %d copied track(s) "
++                   "take the source's language / page data\n", v, (v + 1) & 31, changed);
++    }
++}
 +
 +static void *mux_thread(void *arg)
 +{
@@ -10398,6 +10481,7 @@ index 0000000000..0ae99271f2
 +                break;
 +            continue;
 +        }
++        mux_follow_langs(m);                         /* 2.2.1 T-493 */
 +        {
 +            int64_t wt0 = g_diag ? av_gettime_relative() : 0;
 +            int stream_index = pkt->stream_index;
@@ -12699,6 +12783,21 @@ index 0000000000..0ae99271f2
 +                apply_stream_meta(&outs->groups[r], tlet, tidx, os);  /* CLI -metadata:s:<t>:N / -disposition (G5) — copy streams (subs/data/extra-audio) */
 +                pass[n_pass].ost[r] = os;
 +            }
++            /* 2.2.1 T-493: a copied subtitle track whose language came from the source follows the source's PMT (glo-2
++             * NOCTOCODE AI subs: the full PMT with eleven languages came 62 ms after the bind — "und" until a restart).
++             * Not when -metadata or a rule set the language (the output then says what the operator asked for) */
++            if (ist && ipar->codec_type == AVMEDIA_TYPE_SUBTITLE && !pass_olang[n_pass][0]) {
++                const AVDictionaryEntry *ol = av_dict_get(pass[n_pass].ost[0]->metadata, "language", NULL, 0);
++                if (lang ? ol && !strcmp(ol->value, lang->value) : !ol) {
++                    pass[n_pass].lang_follow = 1;
++                    av_strlcpy(pass[n_pass].lang_now, lang ? lang->value : "", sizeof pass[n_pass].lang_now);
++                    if (ipar->extradata_size > 0 && ipar->extradata_size <= (int)sizeof pass[n_pass].lang_xd) {
++                        memcpy(pass[n_pass].lang_xd, ipar->extradata, ipar->extradata_size);
++                        pass[n_pass].lang_xd_n = ipar->extradata_size;
++                    }
++                    pass[n_pass].lang_hi = !!(ist->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
++                }
++            }
 +            avcodec_parameters_free(&phpar);
 +            n_pass++;
 +            inputs[kk].da.n_pass++;
@@ -13079,6 +13178,7 @@ index 0000000000..0ae99271f2
 +        rung[r].ma.ofmt = rung[r].ofmt; rung[r].ma.mux_q = rung[r].mux_q;
 +        rung[r].ma.is_master = (r == 0);                        /* Φ1′: wire-DTS sensor on rung 0 only */
 +        rung[r].ma.rung = r;                                    /* pre14: g_mux_sent_wc slot (wire watermark) */
++        rung[r].ma.pass = pass; rung[r].ma.n_pass = n_pass;     /* 2.2.1 T-493: copied tracks follow the source's PMT */
 +        rung[r].ma.n_producers = 1 + n_audio + n_copy_inputs + n_cc;   /* video out + N audio + per-input copy fan + one CC emitter per extraction */
 +    }
 +    for (k = 0; k < n_cc; k++) {                 /* one emitter per extraction */
@@ -14366,10 +14466,10 @@ index 0000000000..0ae99271f2
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..cb142caf69
+index 0000000000..182cbe8d8c
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2293 @@
+@@ -0,0 +1,2306 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -15795,6 +15895,14 @@ index 0000000000..cb142caf69
 +    int64_t    vwait_po[PTV_VWAIT_MAX];   /* DemuxArgs.prog_off when it arrived (the SCTE-35 rebase term) */
 +    int64_t    vwait_vn[PTV_VWAIT_MAX];   /* 2.0.1 T-332: DemuxArgs.vunwrap_n when it arrived */
 +    int        nvwait;
++    /* 2.2.1 T-493: the output carries what the source's PMT says about this track (language, DVB subtitle page ids and
++     * type / teletext pages, hearing impaired) — lang_follow when no -metadata / rule language replaced it at bind.
++     * lang_now / lang_xd / lang_hi are written by this input's demux thread under g_lang_lock, read by the mux threads */
++    int        lang_follow;
++    char       lang_now[64];
++    uint8_t    lang_xd[64];
++    int        lang_xd_n;
++    int        lang_hi;
 +} PassStream;
 +
 +#define PTV_DISC_THRESHOLD_US    (1 * AV_TIME_BASE)   /* 1 s: a label step this large is a discontinuity, not jitter */
@@ -16186,6 +16294,11 @@ index 0000000000..cb142caf69
 +extern _Atomic int64_t g_rj_off_total, g_rj_off_before, g_rj_from_us;
 +extern _Atomic int     g_rj_epoch;
 +extern _Atomic int64_t g_house_out_us, g_house_tick_us;   /* master: last emitted vpts on the output axis, tick */
++/* 2.2.1 T-493: a copied track's language / descriptor data follows the source's PMT. The demux thread of the track's input
++ * writes PassStream.lang_* under g_lang_lock and bumps g_lang_gen; each rung's mux thread applies them to its own output
++ * stream (the muxer reads them when it writes the PMT) and raises the PMT version */
++extern _Atomic int      g_lang_gen;
++extern pthread_mutex_t  g_lang_lock;
 +/* 2.0.0 T-100: the video's content -> output record (ptvencoder.c) */
 +#define PTV_VMAP_N 4096
 +extern int g_vmap;
@@ -21125,10 +21238,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..cb3ca6e999
+index 0000000000..98116366da
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2207 @@
+@@ -0,0 +1,2212 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -22893,8 +23006,13 @@ index 0000000000..cb3ca6e999
 +                atomic_store_explicit(&g_ch_vout_src, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), memory_order_relaxed);
 +            /* A/V probe (read-only): record this distinct content's first-display output time so the
 +             * audio drain can pair against it (single-input master rung only; multiview → compositor). */
++            /* 2.2.1 T-491: on the exact-rational axis (the mux pts axis, as ptv_vmap_push and the mosaic's mv_tick_us).
++             * The integer tick (33367 us for 29.97) put the picture +10 ppm late in this ring only: the sync check's
++             * vring crept +1 ms / 100 s while air stayed put, and its post-event step put that on air (TruBLU +107 ms) */
 +            if (v->vring && fresh && content_vpts >= 0)
-+                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q), vpts * v->tick_dur_us);
++                vring_put(v->vring, av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q),
++                          v->out_fps.num > 0 ? av_rescale(vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
++                                             : vpts * v->tick_dur_us);
 +            /* 1.0.1-pre9 residual sensor (PASSIVE), video side: m_v = out − src per EMITTED
 +             * frame — dups included (a dup presents old content later: that lateness is REAL
 +             * and must be measured, not read back from house_skew, a control variable). out on
@@ -23338,10 +23456,10 @@ index 0000000000..cb3ca6e999
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..674f688d4a
+index 0000000000..eff96d48bb
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3275 @@
+@@ -0,0 +1,3307 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -25020,6 +25138,38 @@ index 0000000000..674f688d4a
 +        d->pmt_n    = n;
 +        memcpy(d->pmt_pid, pid, n * sizeof(*pid));
 +        break;
++    }
++    /* 2.2.1 T-493: a copied subtitle track follows what the source's PMT now says about it — ffmpeg updates the input
++     * stream at a new PMT version (language, page ids / type, hearing impaired); the mux threads put it on the outputs.
++     * Compared every check, not only at a version change: the version the bind saw may already be the new one */
++    for (i = 0; i < d->n_pass && d->pass; i++) {
++        PassStream *ps = &d->pass[i];
++        const AVStream *is;
++        const AVDictionaryEntry *nl;
++        int nx, hi;
++        if (!ps->lang_follow || ps->in_index < 0 || ps->in_index >= (int)f->nb_streams)
++            continue;
++        is = f->streams[ps->in_index];
++        nl = av_dict_get(is->metadata, "language", NULL, 0);
++        if (!nl || !nl->value[0])
++            continue;                               /* a PMT without the language keeps the last one */
++        nx = is->codecpar->extradata_size > 0 && is->codecpar->extradata_size <= (int)sizeof ps->lang_xd ?
++             is->codecpar->extradata_size : 0;
++        hi = !!(is->disposition & AV_DISPOSITION_HEARING_IMPAIRED);
++        if (!strcmp(nl->value, ps->lang_now) && hi == ps->lang_hi && nx == ps->lang_xd_n &&
++            (!nx || !memcmp(is->codecpar->extradata, ps->lang_xd, nx)))
++            continue;
++        av_log(NULL, AV_LOG_WARNING, "[PTV-SRC] in%d pid 0x%x (%s): the source's PMT says %s%s (was %s) — the output "
++               "follows\n", slot, is->id, avcodec_get_name(is->codecpar->codec_id), nl->value,
++               hi ? ", hearing impaired" : "", ps->lang_now[0] ? ps->lang_now : "und");
++        pthread_mutex_lock(&g_lang_lock);
++        av_strlcpy(ps->lang_now, nl->value, sizeof ps->lang_now);
++        if (nx)
++            memcpy(ps->lang_xd, is->codecpar->extradata, nx);
++        ps->lang_xd_n = nx;
++        ps->lang_hi   = hi;
++        pthread_mutex_unlock(&g_lang_lock);
++        atomic_fetch_add_explicit(&g_lang_gen, 1, memory_order_release);
 +    }
 +    for (j = 0; j < d->n_audio && j < 32 && now - d->v_last_wc < 1000000; j++) {
 +        int s = d->astream[j];
@@ -28580,10 +28730,10 @@ index 0000000000..4a0614cfdc
 +#endif /* FFTOOLS_PTVENCODER_LANG_H */
 diff --git a/fftools/ptvencoder_legend.c b/fftools/ptvencoder_legend.c
 new file mode 100644
-index 0000000000..5fb6dd2ec2
+index 0000000000..fc22f36e79
 --- /dev/null
 +++ b/fftools/ptvencoder_legend.c
-@@ -0,0 +1,786 @@
+@@ -0,0 +1,790 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -28956,7 +29106,9 @@ index 0000000000..5fb6dd2ec2
 +        "  [PTV-SRC] in0 burst: our own depth cut — 'the cut is erased at the door' (source live: no jump)\n"
 +        "                 or 'stays as a hole' (the source paused inside it)\n"
 +        "  [PTV-SRC] inK PMT version a \xe2\x86\x92 b: the source's program changed (PIDs added / gone); inK audio\n"
-+        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n");
++        "                 track N ... silent for 10 s while the video flows / flowing again (2.1, T-003);\n"
++        "                 inK pid 0xP (codec): 'the source's PMT says LANG (was OLD) — the output follows' (a copied\n"
++        "                 subtitle track takes its language / page data from the source's current PMT; 2.2.1, T-493);\n");
 +    av_log(NULL, AV_LOG_INFO,
 +        "                 in0 source frame rate changed a \xe2\x86\x92 b fps (held 30 s; the output rate stays, the\n"
 +        "                 pictures of a slower source are shown on their due ticks — 2.1, T-011)\n"
@@ -29136,7 +29288,9 @@ index 0000000000..5fb6dd2ec2
 +        "                 must stay 0; the line says how far the video is behind\n"
 +        "  [PTV-MUX]      WARNING 'dropped a packet stamped before the start' (start-up only, harmless). FATAL,\n"
 +        "                 each exits for a supervised respawn: 'MUXGUARD drop span 60s with no accepted pkt' (a\n"
-+        "                 stream's labels are dead) | 'egress dead 60s' | 'write failed' (the output is gone)\n"
++        "                 stream's labels are dead) | 'egress dead 60s' | 'write failed' (the output is gone).\n"
++        "                 WARNING 'output PMT version a \xe2\x86\x92 b: N copied track(s) take the source's language / page\n"
++        "                 data' (after a [PTV-SRC] '... the output follows'; receivers re-read the PMT; 2.2.1, T-493)\n"
 +        "  [PTV-MUXGUARD] a packet with a backward dts dropped before the muxer ('remedy leak, channel survives')\n"
 +        "                 + a total per rung at exit. Any line is a label bug to report with the lines before it\n"
 +        "  [PTV-MUXTOL]   a mux write returned ENOMEM / EAGAIN (egress pressure): the packet is dropped, the\n"
