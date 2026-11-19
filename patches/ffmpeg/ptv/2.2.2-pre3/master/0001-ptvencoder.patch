@@ -105,16 +105,69 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..b8ffbeaf6d
+index 0000000000..dfc5b8cf64
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6424 @@
+@@ -0,0 +1,6477 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.2-pre3 — pre2 + the sound follows the shown picture inside the frame (T-499)
++
++**A sub-frame step or a slow walk of the source's picture timestamps no longer moves the lip sync (T-499, GOALS #2 / #6).**
++The house shows a picture on the nearest tick, so it is on air r = tick − label away from its label (up to half a rounding
++period P: ±16.7 ms at 29.97, ±20 ms at 25); the sound was placed on its label exactly. A splice that re-phased the picture
++labels (Biohackingville +18.6 ms; the −14 ms injection) or a 12 ppm label walk (PATRIOT-LVTV_Portugal: +12 → −20 ms in an
++hour) therefore moved A/V by up to P/2 with no event line, dup=0, hs=0. Now:
++- the master measures r of every fresh picture (label arithmetic only — feed-forward, no loop) in half-second windows on
++  the circle of P; a window whose pictures agree (resultant ≥ 0.9) is coherent; after two in a row the target is
++  **F(phase)**: the phase itself, falling linearly to 0 in a 2 ms band next to ±P/2. +P/2 and −P/2 are the same point (the
++  picture moves one tick there), so the target is continuous when a walk crosses it: the sound never makes a step, and the
++  error stays within ±P/2 (it is 0 outside the band);
++- each transcoded track adds its own copy of the target at the house_skew door, moved by at most 2 ms per second of audio
++  (4 for the part beyond 20 ms, and while the phase is in the band next to ±P/2): a soft resample, output labels stay
++  sample-counted. A pause in the arrival never makes it jump; only a real restart of the track's sound (first frame, the
++  end of a hold, a rebuilt audio path or decoder, the record door) starts on the target. Not on the record door (its
++  placement holds the phase already), fills, copies, the mosaic;
++- not followed (target 0 = the 2.2.1 placement): no coherent window for 5 s (film cadence, rate conversions, no pictures:
++  a hold), and a source that slips whole pictures faster than the sound can follow inside P/2 — two slips the same way
++  within P·(P/2 − w)/(w · 4 ms/s) (61 s at 30 fps = 545 ppm, 90 s at 25 fps = 444 ppm; 30.00 → 29.97 is one per 33 s):
++  decimation leaves the sound continuous. A slip is a phase move whose short way round goes through ±P/2; a splice
++  across 0 is none. The estimator restarts when the rounding period changes (T-413 learned / cleared, slow / film path);
++- a house_skew step that comes with the opposite whole-tick move of r (a slip or sub-frame step shown as a repeat because
++  the queue was empty) is taken out of the track's term in the frame whose door applies that step, then slewed back;
++- both sensors and [PTV-AVSYNC] count the term as an actuator (lipsync= and offset read the true rest); the post-event sync
++  check waits while a track is more than 3 ms from its target ("the sound is following a picture phase move").
++Stats: `vph=` (the target, ms) after `fqhw=`. Log: `[PTV-VPHASE]` one line per move of 5 ms or more (at most 1 / 60 s):
++'the pictures' place on the house grid moved …' or 'the picture phase is not followed: <why> …'; the rest under PTV_DIAG. `PTV_NO_VPHASE=1` reverts; `PTV_TEST_VPH_BIAS=<us>` (test hook) adds a bias to the target.
++The video axis (content_index, house_skew, decimation / repeat, T-498, T-501), copied audio, captions and SCTE-35 are
++unchanged.
++
++## 2.2.2-pre2 — pre1 + no output PTS hole at a small source timing gap (T-501)
++
++**A forward step in the source's video timestamps of less than 200 ms no longer leaves a hole in the output video PTS
++(T-501, GOALS #1 / #6).** Sandbox 2026-11-18 (2.2.1): PATRIOT-LVTV_Portugal's output had 8 one-tick + 1 two-tick holes in 2
++min where its video label walk crossed the rounding line; Biohackingville a 3-tick hole at a splice's +118.67 ms label
++step. A clean frame whose content index jumped past the next tick was stamped on its index (the monotonic guard only catches
++backward), so the output skipped ticks; the T-083 gap fill (repeat the held picture up to the frame's slot, residence —
++house_skew and the audio do not move) acted on damage-era frames only, because T-084 showed that filling a gap our own
++queue made (drop-oldest in a backlog) holds the cursor against the cushion servo. Now a gap under 200 ms (the T-413 "a gap"
++line) in front of a clean frame is filled too when this rung's queue dropped nothing since the previous pop (the gap is the
++source's timing); a gap our queue made, or a larger one, keeps the leap. Details from the review (independent agent):
++- the drop-oldest is counted BEFORE the drop takes effect (push_frame_q), so a gap our own drop made can never be read
++  with the old count;
++- on a 2:1 source the surplus picture shown while the next one is parked is a repeat on air: residence too, so
++  house_skew (and the audio) cannot step one tick for one tick;
++- these repeats count as pd= (residence), not dup=, and do NOT feed the [PTV-VFILL] "source frames lost/corrupt" warning;
++  under PTV_DIAG one line per 60 s counts them ('N picture repeat(s) into source timing gaps').
++The T-498 followers copy the repeats (the master's record carries fresh=0 / pd=1 with the same picture serial).
++`PTV_NO_VGAP_SRC=1` reverts. Not covered (follow-up): the film / slow-arm pop path (pulldown, >= 1.5-tick sources).
++Key: an injected +20 ms video label step (bio_clean1852) and the real Biohackingville splice capture: 2.2.2-pre1 a 1-tick /
++3-tick hole, pre2 every output PTS delta one tick.
 +
 +## 2.2.2-pre1 — 2.2.1 + one emit decision for the whole ladder (T-498)
 +
@@ -6535,10 +6588,10 @@ index 0000000000..b8ffbeaf6d
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..d05637b5e9
+index 0000000000..37815c2d3b
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,7990 @@
+@@ -0,0 +1,8002 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6588,7 +6641,7 @@ index 0000000000..d05637b5e9
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.2-pre1"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.2-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -6981,6 +7034,12 @@ index 0000000000..d05637b5e9
 +                                      * ~36ms/h audio-late onto the wire while every internal offset read bounded.
 +                                      * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
 +int     g_vgapfill = 1;       /* 2.0.0-pre9.4 (T-083): a content gap inside frame_q is filled, not leapt */
++int     g_vphase = 1;         /* 2.2.2 T-499: the sound follows the shown picture's sub-frame phase (ptvencoder.h) */
++int64_t g_vph_bias_us;
++_Atomic int64_t g_vph_tgt_us;
++_Atomic int64_t g_vph_jcum_us;
++_Atomic int     g_vph_seam;
++int     g_vgap_src = 1;       /* 2.2.2 T-501: a small source-timing gap in front of a clean frame is filled too */
 +int     g_decimate = 1;       /* v0.9.15.2 cadence decimation (PTV_NO_DECIMATE reverts): a frame whose
 +                                      * content index does not advance past the last emitted tick is surplus
 +                                      * (source delivers MORE real frames than its declared rate — NewsNation
@@ -14249,6 +14308,12 @@ index 0000000000..d05637b5e9
 +    }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
 +    if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
 +    if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
++    if (getenv("PTV_NO_VPHASE")) g_vphase = 0;              /* 2.2.2 T-499 kill switch: the sound stays on the label, as 2.2.1 */
++    if (getenv("PTV_TEST_VPH_BIAS")) {                      /* T-499 test hook: every placement by the picture moves by B us */
++        g_vph_bias_us = atoll(getenv("PTV_TEST_VPH_BIAS"));
++        atomic_store(&g_vph_tgt_us, g_vphase ? g_vph_bias_us : 0);
++    }
++    if (getenv("PTV_NO_VGAP_SRC")) g_vgap_src = 0;          /* 2.2.2 T-501 kill switch: the source-timing gap is leapt again */
 +    if (getenv("PTV_NO_DECIMATE")) g_decimate = 0;         /* v0.9.15.2: keep pop-per-tick even for >house-rate sources (frame_q pins on surplus) */
 +    /* PTV_FRAMEQ stays HERE (not resolve_cushions()): the multiview hold.q alloc consumes
 +     * g_frameq_cap before resolve_cushions() runs in transcode() setup (0.9.18 M1). */
@@ -14531,10 +14596,10 @@ index 0000000000..d05637b5e9
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..0b82c93017
+index 0000000000..de30a55b7b
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2343 @@
+@@ -0,0 +1,2366 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -15859,6 +15924,11 @@ index 0000000000..0b82c93017
 +    int              vm_n, vm_feeding;
 +    int64_t          vm_out_us;              /* this frame's placement from the video's record (output us), or NOPTS */
 +    int64_t          sstep_us;               /* 2.2.1 T-488: the post-event sync check's steps, a door actuator beside corr */
++    int64_t          vph_us;                 /* 2.2.2 T-499: this track's realised picture-phase term at the door (us) */
++    int64_t          vph_wc, vph_mv_wc;      /* T-499: wall time of the last door frame / of the last frame still moving */
++    int64_t          vph_jseen, vph_jwc;     /* T-499: netted house_skew steps taken / when an untaken one was first seen */
++    int              vph_afmt, vph_reop;     /* T-499: afmt_rebuilds / dec_reopens at the last door frame */
++    int64_t          vph_sk_last;            /* T-499: the house_skew the door applied to the previous frame */
 +    int              vm_on;                  /* T-488: the record door is placing (for its on/off DIAG line) */
 +    int64_t          vm_last_lab, vm_last_out;   /* the previous record-door frame: label, placement (or NOPTS) */
 +    int64_t          hold_drop_n;                     /* 2.0.0-pre9.4: real frames dropped while the source held */
@@ -16486,6 +16556,24 @@ index 0000000000..0b82c93017
 +extern int     g_mv_exacttick;
 +extern int     g_decimate;
 +extern int     g_vgapfill;               /* 2.0.0-pre9.4 (T-083): fill a content gap at the tick rate (PTV_NO_VGAPFILL=1 off) */
++extern int     g_vgap_src;               /* 2.2.2 T-501: fill a small source-timing gap in front of a clean frame too (PTV_NO_VGAP_SRC=1 off) */
++/* 2.2.2 T-499: the sound follows the shown picture's sub-frame phase. The house stamps a picture on the nearest tick, so
++ * it is on air r = tick time - label time away from its label (r on a circle of one rounding period P); the sound was
++ * placed on the label exactly, so a sub-frame step of the source's picture labels (a splice) or a slow walk of them
++ * against the house grid moved the lip sync by up to P/2 with no event. The master measures r per shown picture
++ * (clock) and publishes a target; each transcoded track adds its own slewed copy at the house_skew door (audio).
++ * Audio only: the video axis, house_skew, copies and the mosaic are not touched. PTV_NO_VPHASE=1 = off. */
++extern int     g_vphase;
++extern int64_t g_vph_bias_us;            /* test hook PTV_TEST_VPH_BIAS (us): added to the target after the estimator */
++extern _Atomic int64_t g_vph_tgt_us;     /* the target g = F(phase) (+ bias), us; 0 = not followed */
++extern _Atomic int     g_vph_seam;       /* the followed phase is in the band next to +-P/2: the door may move at the far rate */
++extern _Atomic int64_t g_vph_jcum_us;    /* cumulative house_skew steps that came with an equal and opposite phase wrap */
++#define PTV_VPH_BAND_US   2000           /* F falls linearly to 0 in this band next to +-P/2 (wider than label wobble) */
++#define PTV_VPH_SLEW      2              /* us per ms of audio (2 ms/s = 0.2 %) ... */
++#define PTV_VPH_SLEW_FAR  4              /* ... 4 ms/s while more than PTV_VPH_FAR_US away, or in the band (g_vph_seam) */
++#define PTV_VPH_FAR_US    20000
++#define PTV_VPH_MOVE_US   3000           /* the sync check waits while a track is further than this from the target */
++#define PTV_VGAP_SRC_US 200000           /* 2.2.2 T-501: largest source-timing gap filled (the 200 ms "a gap" line of T-413) */
 +extern int     g_pulldown;
 +extern int     g_cad_disarm;
 +extern int     g_frameq_cap;
@@ -16880,10 +16968,10 @@ index 0000000000..0b82c93017
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..c25d6f4a98
+index 0000000000..b0d2be65cc
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,4177 @@
+@@ -0,0 +1,4243 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -17816,6 +17904,8 @@ index 0000000000..c25d6f4a98
 +        return "the resampler has not settled";
 +    if (s->hs_wc && now - s->hs_wc < PTV_SC_HS_US)
 +        return "a house_skew step is in flight";
++    if (a->vph_mv_wc && now - a->vph_mv_wc < PTV_SC_HS_US)     /* 2.2.2 T-499: the frames at the sink carry an older value */
++        return "the sound is following a picture phase move";
 +    return NULL;
 +}
 +
@@ -18222,7 +18312,8 @@ index 0000000000..c25d6f4a98
 +                 * (pre3 steer); glue_off + corr are path-independent. Sign law preserved on
 +                 * both paths: +corr at the door delays audio content ⇒ raises m_a ⇒
 +                 * dR/dcorr = −1 (§2). */
-+                int64_t inj    = a->glue_off_us + a->corr.corr_us + a->sstep_us + hs;   /* T-488: + sstep */
++                int64_t inj    = a->glue_off_us + a->corr.corr_us + a->sstep_us + hs +   /* T-488: + sstep */
++                                 a->vph_us;          /* 2.2.2 T-499: + the picture-phase term (0 on a mosaic track) */
 +                int64_t slip   = 0, m, nowr;
 +                if (a->fg_swr && a->fg_swr_flt &&
 +                    a->fg_swr_flt->nb_inputs > 0 && a->fg_swr_flt->nb_outputs > 0) {
@@ -18492,7 +18583,8 @@ index 0000000000..c25d6f4a98
 +                 * measurement loop that reads sink labels (glue_off stays un-subtracted, as
 +                 * today: glue is the label-truth judgment, not an actuator). */
 +                if (!(a->multiview && g_audio_follow) && a->house_skew)
-+                    content -= *a->house_skew + a->corr.corr_us + a->sstep_us;   /* T-488: an actuator, as corr */
++                    content -= *a->house_skew + a->corr.corr_us + a->sstep_us +  /* T-488: an actuator, as corr */
++                               a->vph_us;            /* 2.2.2 T-499: and the picture-phase term */
 +                else if (a->multiview && g_audio_follow)
 +                    content -= a->corr.corr_us;
 +                if (!(a->multiview && a->mvf_hi_us > a->mvf_lo_us &&             /* T-093: fill phase frames carry no */
@@ -18847,6 +18939,63 @@ index 0000000000..c25d6f4a98
 +
 +static void rj_flush(AudioState *a);
 +static void rj_arm_hold(AudioState *a);
++
++/* 2.2.2 T-499: this track's picture-phase term for a real frame at the house_skew door (sk = the house_skew the door
++ * applies to it, hs_door()'s value). The term moves toward the master's target by at most 2 ms per second of audio (4
++ * while more than 20 ms away) — a soft resample, the output labels stay sample-counted. Not moved while the slow
++ * corrector steers on any track. A house_skew step the master counted as "no change of where the picture is"
++ * (g_vph_jcum_us) is taken out of the term in the frame whose applied house_skew makes exactly that step — so a value
++ * hs_door() keeps is waited for — and dropped when no such frame comes within 4 s. Only a real restart of the track's
++ * sound (its first frame, the end of a hold, a rebuilt audio path or decoder, the record door) starts on the target; a
++ * pause in the arrival does not — bursty audio keeps slewing (a jump of up to P would be a hard compensation click). */
++static int64_t vph_door(AudioState *a, const AVFrame *frame, int64_t sk)
++{
++    int64_t now = av_gettime_relative();
++    int64_t g   = atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed);
++    int64_t jc  = atomic_load(&g_vph_jcum_us);
++    int64_t dur = frame->sample_rate > 0 ? av_rescale(frame->nb_samples, 1000000, frame->sample_rate) : 0;
++    int k, eng = 0;
++    if (!a->vph_wc || atomic_load_explicit(&g_src_rejoin_wall, memory_order_relaxed) > a->vph_wc ||
++        a->afmt_rebuilds != a->vph_afmt || a->dec_reopens != a->vph_reop) {
++        a->vph_us    = g;
++        a->vph_jseen = jc;
++        a->vph_jwc   = 0;
++    } else {
++        int64_t d, lim;
++        if (jc != a->vph_jseen) {
++            if (!a->vph_jwc)
++                a->vph_jwc = now;
++            if (sk - a->vph_sk_last == jc - a->vph_jseen) {
++                if (g_diag)
++                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms with the opposite picture "
++                           "slip: no step in the sound, the phase term takes it and moves back\n", a->dbg_k, a->dbg_in,
++                           (jc - a->vph_jseen) / 1000);
++                a->vph_us   -= jc - a->vph_jseen;
++                a->vph_jseen = jc;
++                a->vph_jwc   = 0;
++            } else if (now - a->vph_jwc > 4000000) {
++                a->vph_jseen = jc;
++                a->vph_jwc   = 0;
++            }
++        }
++        for (k = 0; k < g_rsx.n_a && k < PTV_MAX_AUDIO; k++)
++            eng |= atomic_load_explicit(&g_corr_state_pub[k], memory_order_relaxed) == PTV_CORR_ENGAGED;
++        d   = g - a->vph_us;
++        /* 4 ms/s in the band too: there the target runs (P/2 - w) / w times the phase, and the sound must be near 0
++         * when the picture slips or it is a whole period off (the estimator's slip limit is derived from this rate) */
++        lim = dur * (llabs(d) > PTV_VPH_FAR_US || atomic_load_explicit(&g_vph_seam, memory_order_relaxed)
++                     ? PTV_VPH_SLEW_FAR : PTV_VPH_SLEW) / 1000;
++        if (!eng)
++            a->vph_us += av_clip64(d, -lim, lim);
++    }
++    if (llabs(g - a->vph_us) > PTV_VPH_MOVE_US)                /* not the in-band target jitter of a phase parked at the line */
++        a->vph_mv_wc = now;
++    a->vph_afmt    = a->afmt_rebuilds;
++    a->vph_reop    = a->dec_reopens;
++    a->vph_wc      = now;
++    a->vph_sk_last = sk;
++    return a->vph_us;
++}
 +
 +/* 2.0.0 T-321: the house_skew a real frame meets at the graph door. A short source gap (no hold) ends at the door
 + * before it ends on air: the returning audio arrives while the video still repeats frames through the gap, so
@@ -19609,10 +19758,15 @@ index 0000000000..c25d6f4a98
 +            int64_t h0;
 +            pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
 +            if (h0 != AV_NOPTS_VALUE)               /* output = door - h0: exactly where the video put this content */
-+                frame->pts = av_rescale_q(a->vm_out_us + h0, AV_TIME_BASE_Q, a->ist_tb);
++                frame->pts = av_rescale_q(a->vm_out_us + h0 + g_vph_bias_us, AV_TIME_BASE_Q, a->ist_tb);
++            a->vph_wc = 0;                          /* 2.2.2 T-499: the record holds the picture's phase already; the
++                                                     * first house_skew-door frame after it starts on the target */
++            a->vph_us = atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed);
 +        } else if (g_avlock && a->house_skew && !(a->multiview && g_audio_follow) && frame->pts != AV_NOPTS_VALUE &&
 +            !a->hold_feeding) {
 +            int64_t sk = hs_door(a, frame, *a->house_skew);
++            if (g_vphase && !a->multiview)          /* 2.2.2 T-499: + the shown picture's sub-frame phase */
++                sk += vph_door(a, frame, sk);
 +            if (sk) frame->pts += av_rescale_q(sk, AV_TIME_BASE_Q, a->ist_tb);
 +        }
 +        /* 1.0.1-pre14 steer bus (§5 rule 1): the corrector's cumulative trim, injected at the
@@ -21370,10 +21524,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..35174bf5a2
+index 0000000000..d6f0238a50
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2421 @@
+@@ -0,0 +1,2641 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -21381,8 +21535,10 @@ index 0000000000..35174bf5a2
 +#include <pthread.h>
 +#include <stdatomic.h>
 +#include <time.h>
++#include <math.h>
 +
 +#include "libavutil/avutil.h"
++#include "libavutil/avstring.h"
 +#include "libavutil/log.h"
 +#include "libavutil/opt.h"
 +#include "libavutil/time.h"
@@ -21564,6 +21720,141 @@ index 0000000000..35174bf5a2
 +    if (g_exacttick && v->out_fps.num > 0)
 +        return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
 +    return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
++}
++
++/* 2.2.2 T-499: the picture-phase estimator (master rung, output thread; ptvencoder.h g_vphase). Feed-forward: the samples
++ * are label arithmetic only (the tick a fresh picture's label rounded to, minus the label), so the sound's own move is not
++ * in them — no loop. Half-second windows on the circle of one rounding period P; a window is coherent when its pictures
++ * agree (resultant length >= 0.9: a constant phase, a splice step, a slow walk; not a pulldown or a rate conversion by
++ * repeat / skip, whose pictures land all over the period; a window of under 8 pictures is not coherent either, unless damaged input left them out). The target
++ * is F(phase) of the latest coherent window after two in a row; 5 s without a coherent window, or a source that slips
++ * whole pictures against the grid faster than the sound can follow inside P/2 (vphase_window()), puts the target at 0 =
++ * the label placement of 2.2.1. */
++typedef struct VPhase {
++    int64_t P;                  /* the rounding period the open window is collected on (us) */
++    int     mode;               /* slow_arm | film_arm << 1 of the open window */
++    double  s, c;               /* sums of sin / cos of 2 pi r / P */
++    int     n, dmg;             /* samples; pictures left out for damaged input in this window */
++    int64_t t0;                 /* the output tick the window opened on; -1 = none */
++    int     coh, inc;           /* coherent / incoherent windows in a row */
++    int     have_phi;
++    int64_t phi;                /* the previous coherent window's phase (us, +-P/2) */
++    int64_t phi_g;              /* the phase the target was last taken from; INT64_MIN = none (not followed) */
++    int     wsign, fast;        /* the last whole-picture slip's direction; slips come faster than the sound can follow */
++    int64_t wrap_wc, fast_wc;
++    int64_t r_prev;             /* the previous fresh picture's r (us); INT64_MIN = none */
++    int64_t g;                  /* the target without the test bias (us) */
++    int64_t ev_wc, dg_wc;       /* the last default-log / DIAG line */
++} VPhase;
++
++/* The target for a phase: the phase itself, falling linearly to 0 in a band next to +-P/2. The phase is a point on a
++ * circle and +P/2 and -P/2 are the same point (the picture moves one tick there): F is continuous across it, so the
++ * sound never has a step to make, and |F - phase| <= P/2 everywhere. */
++static int64_t vph_F(int64_t phi, int64_t P)
++{
++    int64_t h = P / 2, w = FFMIN(PTV_VPH_BAND_US, P / 4), a = llabs(phi);
++    if (a <= h - w)
++        return phi;
++    if (a >= h || w <= 0)
++        return 0;
++    return (phi < 0 ? -1 : 1) * ((h - w) * (h - a) / w);
++}
++
++static void vphase_reset(VPhase *p, int64_t P, int mode)
++{
++    p->P = P; p->mode = mode;
++    p->s = p->c = 0; p->n = 0; p->dmg = 0; p->t0 = -1;
++    p->coh = 0; p->have_phi = 0; p->wsign = 0; p->fast = 0;
++    p->phi_g = INT64_MIN;
++    p->r_prev = INT64_MIN;
++}
++
++/* How long the sound takes to move d us: 2 ms/s, 4 ms/s for the part beyond 20 ms (vph_door()). */
++static double vph_move_s(int64_t d)
++{
++    d = llabs(d);
++    return (d > PTV_VPH_FAR_US ? (d - PTV_VPH_FAR_US) / 1e3 / PTV_VPH_SLEW_FAR + PTV_VPH_FAR_US / 1e3 / PTV_VPH_SLEW
++                               : d / 1e3 / PTV_VPH_SLEW);
++}
++
++static void vphase_window(VPhase *p, int64_t now)
++{
++    int64_t g = p->g, h = p->P / 2, w = FFMIN(PTV_VPH_BAND_US, p->P / 4);
++    /* The fastest slip the sound can follow inside P/2: in the band the target moves (h - w) / w times as fast as the
++     * phase, and the door moves the sound at most PTV_VPH_SLEW_FAR us per ms there (g_vph_seam). Two slips the same way
++     * closer than P / that phase rate are a frame-rate conversion (30 fps: 61 s = 545 ppm; 25 fps: 90 s = 444 ppm) */
++    int64_t slip_us = w > 0 ? p->P * (h - w) / w * 1000 / PTV_VPH_SLEW_FAR : 0;
++    double  R = 0;
++    int     coherent = 0, seam = 0, step = 0;
++    const char *why = NULL;             /* why the target left the phase; NULL = it is the phase */
++    if (p->n >= 8) {
++        R = hypot(p->s, p->c) / p->n;
++        coherent = R >= 0.9;
++    }
++    if (coherent) {
++        int64_t phi = llrint(atan2(p->s, p->c) / (2 * M_PI) * p->P);
++        /* a whole picture slipped = the SHORT way from the previous phase to this one goes through +-P/2 (the picture
++         * moved a tick); a splice from +9 to -9 ms goes the long way round the circle's seam and is no slip */
++        int sl = !p->have_phi || p->P - llabs(phi - p->phi) >= p->P / 4 ? 0 : phi < p->phi ? 1 : -1;
++        if (sl) {                       /* back and forth at the line (label wobble) cancels */
++            int recent = p->wsign && now - p->wrap_wc < slip_us;
++            if (recent && sl == p->wsign) {
++                p->fast = 1; p->fast_wc = now; p->wrap_wc = now;
++            } else if (recent)
++                p->wsign = 0;
++            else {
++                p->wsign = sl; p->wrap_wc = now;
++            }
++        }
++        if (p->fast && now - p->fast_wc >= 300000000)
++            p->fast = 0;
++        p->phi = phi; p->have_phi = 1; p->inc = 0;
++        if (++p->coh >= 2) {
++            g    = p->fast ? 0 : vph_F(phi, p->P);
++            seam = !p->fast && llabs(phi) > h - w;
++            /* an event for the default log = the PHASE stepped 5 ms or more the long way (a splice), or following
++             * starts away from 0; not the target's own run in the band, not a slip */
++            step = !p->fast && (p->phi_g == INT64_MIN ||
++                                (llabs(phi - p->phi_g) >= 5000 && p->P - llabs(phi - p->phi_g) >= p->P / 4));
++            p->phi_g = p->fast ? INT64_MIN : phi;
++            if (p->fast)
++                why = "the source slips whole pictures too often to follow (a frame-rate conversion by repeat / skip)";
++        }
++    } else if (p->n < 8 && p->dmg) {
++        ;                               /* pictures were there but damaged input left them out: nothing changes (the
++                                         * phase does not move with a corrupt packet; a source bad for long is held) */
++    } else {
++        p->coh = 0;
++        if (++p->inc >= 10) {           /* 5 s without a coherent window, picture-less windows included: a stale target
++                                         * never stays (a hold, film cadence, a rate conversion) */
++            g = 0;
++            p->have_phi = 0;
++            p->phi_g    = INT64_MIN;
++            why = "no steady picture phase for 5 s (film cadence, a rate conversion or no pictures)";
++        }
++    }
++    p->s = p->c = 0; p->n = 0; p->dmg = 0;
++    atomic_store_explicit(&g_vph_seam, seam, memory_order_relaxed);
++    if (g != p->g) {
++        int64_t d = g - p->g;
++        if (llabs(d) >= 5000 && (why || step) && now - p->ev_wc >= 60000000) {
++            p->ev_wc = p->dg_wc = now;
++            if (why)
++                av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] the picture phase is not followed: %s — the sound returns to its "
++                       "label time (%+.1f ms) over %.1f s\n", why, d / 1e3, vph_move_s(d));
++            else
++                av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] the pictures' place on the house grid moved %+.1f ms (now %+.1f "
++                       "ms %s their labels): the sound follows over %.1f s\n", d / 1e3, g / 1e3,
++                       g < 0 ? "before" : "after", vph_move_s(d));
++        } else if (g_diag && (llabs(d) >= 5000 || now - p->dg_wc >= 10000000)) {
++            p->dg_wc = now;
++            av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] target %+.2f -> %+.2f ms (phase %+.2f ms of %.2f, R %.2f, %s)\n",
++                   p->g / 1e3, g / 1e3, p->phi / 1e3, p->P / 1e3, R,
++                   p->fast ? "not followed: frame rate" : p->coh >= 2 ? "followed" : "no steady phase");
++        }
++        p->g = g;
++        atomic_store_explicit(&g_vph_tgt_us, g + g_vph_bias_us, memory_order_relaxed);
++    }
 +}
 +
 +/* 2.2.1 T-461: n queued SOURCE pictures as OUTPUT ticks of content. A source faster than the house (-r max:30 on 59.94:
@@ -22709,6 +23000,10 @@ index 0000000000..35174bf5a2
 +        int64_t vo_extra = 0;   /* 2.0.0-pre9.8 (T-076): video-only repeat ticks kept out of house_skew */
 +        int64_t vo_prev_c = -1; int vo_fresh_n = 0;   /* 2.0.0 T-345: content of the previous fresh frame; fresh frames since a vo hold */
 +        int vgap_park = 0;                          /* 2.0.0-pre9.4 (T-083): nextf is a frame parked behind a content gap */
++        VPhase vp = { .t0 = -1, .r_prev = INT64_MIN, .phi_g = INT64_MIN };   /* 2.2.2 T-499 */
++        int64_t vg_fd_last = -1;                    /* 2.2.2 T-501: this rung's queue-drop count at the previous pop */
++        int     vgap_src = 0;                       /* T-501: the parked gap is source timing (not damage) */
++        int64_t vgap_src_n = 0, vgap_src_wc = 0;    /* T-501: its repeats since the last DIAG line */
 +        int rj_park = 0, rj_park_n = 0, rj_park_seq = 0;   /* 2.2.1 T-472: nextf is a rejoin's first picture waiting for
 +                                                     * its slot; ticks waited; the g_rj_cls_seq that had its wait */
 +        int64_t blk_wc = 0;                         /* T-472: when this rung last showed its own black picture */
@@ -22737,6 +23032,8 @@ index 0000000000..35174bf5a2
 +        } else if (g_pulldown && (film_arm || slow_arm) && have) {   /* film cadence / a slower source: pop by content time */
 +            if (!next_have) {
 +                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
++                if (ret >= 0)                       /* 2.2.2 T-501: the drop count at this pop */
++                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;
 +                if (ret >= 0) {
 +                    nextf = f; next_have = 1;
 +                    rj_park   = rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq);   /* 2.2.1 T-472 */
@@ -22758,7 +23055,7 @@ index 0000000000..35174bf5a2
 +            /* queue empty + no lookahead: fall through = dup-on-empty exactly as today */
 +        } else if (next_have && vgap_park && content_index(v, nextf->pts) > last_vpts + 1) {
 +            cadence_hold = 1;                       /* 2.0.0-pre9.4 (T-083): still inside the content gap — repeat */
-+            vgap_filled++;
++            if (vgap_src) vgap_src_n++; else vgap_filled++;   /* T-501: source timing is not "frames lost" */
 +        } else if (next_have) {
 +            /* v0.9.16.2 (defensive): drain a PARKED pulldown lookahead first. If cadence ever
 +             * disarms with a frame still in nextf, that frame would sit orphaned until the next
@@ -22807,6 +23104,7 @@ index 0000000000..35174bf5a2
 +                    }
 +                }
 +                if (ret >= 0 && have && rj_prime_park(v, f, last_vpts, base_sp, &rj_park_seq)) {
++                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;   /* 2.2.2 T-501 */
 +                    nextf = f; next_have = 1; rj_park = 1; rj_park_n = 0;   /* 2.2.1 T-472: before the gap fill — these
 +                                                                             * ticks are repeats, not residence */
 +                    break;
@@ -22825,17 +23123,36 @@ index 0000000000..35174bf5a2
 +                    /* 2.0.0 T-377: up to the stall threshold (3 s), not 2 s — a gap between the two was handled by
 +                     * neither path: at 50 fps a 2 s flap is 101 lost frames = 2020 ms, leapt = a 2.04 s video PTS hole
 +                     * (rich50b flapping; 25 fps: 50 frames = 2000 ms, filled). Below the threshold no hold ever starts */
++                    /* 2.2.2 T-501: a SMALL gap (< PTV_VGAP_SRC_US = 200 ms) in front of a clean frame is the source's own
++                     * timing — a sub-frame label re-phase at a splice (Biohackingville +118.67 ms = a 3-tick hole) or a
++                     * label walk crossing the rounding line (LVTV: 8 one-tick holes in 2 min) — and is filled like the
++                     * damage-era gap: whole-picture repeats up to the frame's slot, residence, the output PTS stays one
++                     * tick per picture (GOALS #1 / #6: never a timestamp hole). A gap our own queue made (a drop-oldest
++                     * since the previous pop: a backlog, counted before the drop takes effect) or one of 200 ms or more
++                     * keeps the leap — T-084's reason for marking damage only. The start-up's first pop never reaches
++                     * this test (have = 0); after it only the drop check guards (a <= 200 ms fill is harmless residence).
++                     * PTV_NO_VGAP_SRC=1 reverts */
 +                    int64_t hc = content_index(v, f->pts);
++                    int64_t fd_now = v->framedrop_src ? *v->framedrop_src : v->framedrop;
++                    int dmg = av_dict_get(f->metadata, "ptv_dmg", NULL, 0) != NULL;   /* damage-era frame (emit_video) */
++                    int src_gap = g_vgap_src && vg_fd_last >= 0 && fd_now == vg_fd_last &&
++                                  (hc - last_vpts - 1) * v->tick_dur_us < PTV_VGAP_SRC_US;
 +                    if (hc > last_vpts + 1 && (hc - last_vpts - 1) * v->tick_dur_us <= FFMAX(2000000, g_stall_min_us) &&
-+                        av_dict_get(f->metadata, "ptv_dmg", NULL, 0)) {   /* damage-era frame (emit_video) */
-+                        nextf = f; next_have = 1; vgap_park = 1;
-+                        if (!fresh) {
++                        (src_gap || dmg)) {
++                        nextf = f; next_have = 1; vgap_park = 1; vgap_src = !dmg;
++                        vg_fd_last = fd_now;
++                        /* T-501: on a 2:1 source this tick's fresh picture is the SURPLUS one the decimation was skipping
++                         * (content already shown): on air it is a repeat, so residence too — else house_skew (and the
++                         * audio) would step one tick for one tick on a clean channel */
++                        if (!fresh || (!dmg && have && content_index(v, held_src_pts) <= last_content_vpts)) {
 +                            cadence_hold = 1;
-+                            vgap_filled++;
++                            if (vgap_src) vgap_src_n++; else vgap_filled++;
 +                        }
 +                        break;
 +                    }
 +                }
++                if (ret >= 0)                       /* 2.2.2 T-501: drops after this pop are what the next gap is judged by */
++                    vg_fd_last = v->framedrop_src ? *v->framedrop_src : v->framedrop;
 +                if (ret >= 0) {
 +                    av_frame_unref(held); av_frame_move_ref(held, f); av_frame_free(&f);
 +                    have = 1; fresh = 1; held_src_pts = held->pts;   /* capture before emit overwrites it */
@@ -23254,6 +23571,7 @@ index 0000000000..35174bf5a2
 +            if (v->is_master && !cadence_hold && (content_vpts < 0 || content_vpts <= last_content_vpts))
 +                atomic_fetch_add_explicit(&g_dup_out_us, v->tick_dur_us, memory_order_relaxed);
 +            int dup_tick = content_vpts < 0 || content_vpts <= last_content_vpts;   /* T-076 */
++            int64_t vp_prev_c = last_content_vpts;  /* T-499 */
 +            if (content_vpts >= 0)
 +                last_content_vpts = content_vpts;   /* v0.9.15.3 decimation cursor: real content played
 +                                                     * (held_src_pts survives dups -> idempotent on dup/hold) */
@@ -23295,9 +23613,55 @@ index 0000000000..35174bf5a2
 +            }
 +            if (fresh && content_vpts >= 0)
 +                vo_prev_c = content_vpts;
-+            if (v->is_master && v->house_skew && content_vpts >= 0)   /* against RAW content: −rejoin map (pre6.1) */
-+                *v->house_skew = (vpts - content_vpts - held_extra - vo_extra) * v->tick_dur_us -
-+                                 (src_ts != AV_NOPTS_VALUE ? ptv_rj_off(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q)) : 0);
++            if (v->is_master && v->house_skew && content_vpts >= 0) { /* against RAW content: −rejoin map (pre6.1) */
++                int64_t hsn = (vpts - content_vpts - held_extra - vo_extra) * v->tick_dur_us -
++                              (src_ts != AV_NOPTS_VALUE ? ptv_rj_off(av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q)) : 0);
++                /* 2.2.2 T-499: this fresh picture's r = its tick's time - its label's house time (what content_index()
++                 * rounded away), a sample of the phase estimator; hold / gap-fill / rejoin-wait / video-only repeats and
++                 * damaged input are not sampled. P = the rounding period (T-413: the source's, when it is the faster) */
++                if (g_vphase && !v->passthrough && *v->h0 != AV_NOPTS_VALUE) {
++                    int64_t nwp = av_gettime_relative();
++                    int64_t P   = v->src_per_us > 0 && v->src_per_us < v->tick_dur_us ? v->src_per_us : v->tick_dur_us;
++                    int     md  = slow_arm | film_arm << 1;
++                    int     ok  = fresh && src_ts != AV_NOPTS_VALUE && !cadence_hold && !vo_extra && !rj_park &&
++                                  !ptv_src_holding();
++                    if (llabs(P - vp.P) * 8 > vp.P || md != vp.mode)   /* not the learner's own noise (LVTV: 39.45 / 40.00 ms) */
++                        vphase_reset(&vp, P, md);   /* the period changed: the circle is another one */
++                    if (ok) {
++                        int64_t su = av_rescale_q(src_ts, v->out_tb, AV_TIME_BASE_Q);
++                        int64_t hu = su - *v->h0 - ptv_rj_off(su);
++                        /* the tick's time on content_index()'s own axis (PTV_NO_EXACTTICK: the integer tick) */
++                        int64_t r  = (g_exacttick && v->out_fps.num > 0
++                                      ? av_rescale(content_vpts, 1000000LL * v->out_fps.den, v->out_fps.num)
++                                      : content_vpts * v->tick_dur_us) - hu;
++                        /* A whole-tick house_skew step that comes with the opposite whole-tick move of r is no change
++                         * of where the picture is on air (a label slip or a sub-frame step shown as a repeat because the
++                         * queue was empty, or taken back by a skip): counted, so each track's door takes the step out of
++                         * its phase term in the same frame and slews it back, instead of a one-tick step in the sound.
++                         * Written before house_skew: a door that reads the new house_skew reads this too */
++                        int64_t d = hsn - *v->house_skew, dc = content_vpts - vp_prev_c - 1;
++                        if (d && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
++                            d == -dc * v->tick_dur_us && llabs(r - vp.r_prev + d) < P / 2)
++                            atomic_fetch_add(&g_vph_jcum_us, d);
++                        if (hu >= 0 && llabs(r) <= v->tick_dur_us) {
++                            vp.r_prev = r;
++                            if (slow_dmg_wc && nwp - slow_dmg_wc < 5000000)
++                                vp.dmg = 1;
++                            else if (!dup_tick) {
++                                double an = 2 * M_PI * (double)r / (double)P;
++                                vp.s += sin(an); vp.c += cos(an); vp.n++;
++                            }
++                        }
++                    }
++                    if (vp.t0 < 0)
++                        vp.t0 = vpts;
++                    else if (vpts - vp.t0 >= 12 && (vpts - vp.t0) * v->tick_dur_us >= 500000) {
++                        vphase_window(&vp, nwp);
++                        vp.t0 = vpts;
++                    }
++                }
++                *v->house_skew = hsn;
++            }
 +            /* 2.0.0 T-095: how far the master shows content past its content index (dups / a BURST rejoin keep this;
 +             * 0 in steady state). Captions are stamped from the content index, so they need the same offset or they
 +             * fall behind the video (Racer_Select 2026-10-09: +53 s after two BURST rejoins, every caption dropped by
@@ -23453,6 +23817,13 @@ index 0000000000..35174bf5a2
 +                                                                          * media time reached — every
 +                                                                          * demux stops pulling */
 +        if (!fresh) { if (cadence_hold) v->pd++; else v->dup++; }   /* pd = intentional cadence residence; dup stays the health alarm */
++        if (g_diag && vgap_src_n && v->is_master && av_gettime_relative() - vgap_src_wc >= 60000000) {   /* T-501 */
++            av_log(NULL, AV_LOG_INFO, "[PTV-VFILL] %"PRId64" picture repeat(s) into source timing gaps in 60 s (a forward "
++                   "label step < 200 ms, no frame lost) — output PTS stays continuous (PTV_NO_VGAP_SRC=1 disables)\n",
++                   vgap_src_n);
++            vgap_src_n  = 0;
++            vgap_src_wc = av_gettime_relative();
++        }
 +        if (vgap_filled && v->is_master && av_gettime_relative() - vgap_log_wc >= 10000000) {
 +            av_log(NULL, AV_LOG_WARNING, "[PTV-VFILL] %"PRId64" frame(s) repeated into content gaps (source frames "
 +                   "lost/corrupt) — output PTS stays continuous (PTV_NO_VGAPFILL=1 disables)\n", vgap_filled);
@@ -23640,7 +24011,7 @@ index 0000000000..35174bf5a2
 +                 * wucr_rho IS the source-ppm readout. size=/bitrate= dropped (CBR is configured; cumulative
 +                 * averages carry no signal). speed= (cumulative) replaced by instantaneous fps=. qdrop=
 +                 * dropped (PTV_DIAG demux line still carries it). */
-+                char wu[144] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
++                char wu[176] = "";                                   /* WUCR readout: buffer depth + recovered ρ (go/no-go vs srcppm) */
 +                if (g_wucr) {
 +                    int occ = av_thread_message_queue_nb_elems(v->frame_q);
 +                    int64_t corr = atomic_load_explicit(&v->hr->rho_corr_ppm, memory_order_relaxed);
@@ -23651,6 +24022,9 @@ index 0000000000..35174bf5a2
 +                             (long long)(hsr / 1000),
 +                             (int)((int64_t)sp_cap(v, g_curt.cur_sp) * v->tick_dur_us / 1000),  /* -corr = recovered source dev (+=faster); cushion = adaptive tier target */
 +                             atomic_load_explicit(&g_fq_hw, memory_order_relaxed));
++                    if (g_vphase && !v->passthrough)   /* 2.2.2 T-499: the picture-phase target the sound follows */
++                        av_strlcatf(wu, sizeof wu, " vph=%+.1fms",
++                                    atomic_load_explicit(&g_vph_tgt_us, memory_order_relaxed) / 1e3);
 +                }
 +                char bk[48] = "";                                    /* v0.9.14 AUTO-BANK: actual/target — actual = TOTAL
 +                                                                      * buffered margin (compressed video_q + decoded frame_q) */
@@ -27110,10 +27484,10 @@ index 0000000000..eff96d48bb
 +
 diff --git a/fftools/ptvencoder_gate.c b/fftools/ptvencoder_gate.c
 new file mode 100644
-index 0000000000..5c9acdc9f5
+index 0000000000..3b5e26d2b8
 --- /dev/null
 +++ b/fftools/ptvencoder_gate.c
-@@ -0,0 +1,1127 @@
+@@ -0,0 +1,1130 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -27950,12 +28324,15 @@ index 0000000000..5c9acdc9f5
 +        int ret = av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK);
 +        if (ret == AVERROR(EAGAIN)) {                /* full -> drop oldest, keep newest */
 +            AVFrame *old;
-+            if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0) {
++            /* v0.9.10: count drop-oldest — this is real skipped content (catch-up overflow = the latency-drain meter).
++             * 2.2.2 T-501: counted BEFORE the drop takes effect (the queue mutex orders it before the output thread's
++             * next pop), so the output never sees the gap our drop made with the old count (it would fill it as
++             * source timing — T-084's backlog). Taken back if nothing was dropped */
++            (*framedrop)++;
++            if (av_thread_message_queue_recv(q, &old, AV_THREAD_MESSAGE_NONBLOCK) >= 0)
 +                av_frame_free(&old);
-+                (*framedrop)++;                      /* v0.9.10: count drop-oldest — this is real skipped content
-+                                                      * (catch-up overflow = the latency-drain meter); it was
-+                                                      * silent before, leaving stats drop= misleadingly at 0 */
-+            }
++            else
++                (*framedrop)--;
 +            if (av_thread_message_queue_send(q, &out, AV_THREAD_MESSAGE_NONBLOCK) < 0) {
 +                av_frame_free(&out);
 +                (*framedrop)++;
@@ -29071,10 +29448,10 @@ index 0000000000..4a0614cfdc
 +#endif /* FFTOOLS_PTVENCODER_LANG_H */
 diff --git a/fftools/ptvencoder_legend.c b/fftools/ptvencoder_legend.c
 new file mode 100644
-index 0000000000..bed51034e4
+index 0000000000..fd397b2103
 --- /dev/null
 +++ b/fftools/ptvencoder_legend.c
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,811 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -29289,6 +29666,9 @@ index 0000000000..bed51034e4
 +        "             kept hole, hold, erased relabel and skipped catch-up and does not come back — it is\n"
 +        "             NOT latency (latency = wucr_buf + bank + dlvhold) and not lip sync (that is lipsync=)\n"
 +        "  hsres      always 0 since 2.1 (the LAYERA erase-residue ledger is not run); kept for parsers\n"
++        "  vph        (2.2.2 T-499, single input) the picture-phase target (ms): how far after (+) or before (-)\n"
++        "             their labels the pictures are on air inside one tick; each transcoded track's sound moves\n"
++        "             to it at 2-4 ms/s. 0.0 = not followed (film cadence, a frame-rate conversion, no pictures)\n"
 +        "  cushion    adaptive frame_q target: ~1s lean tier or ~4s raised tier ([PTV-CUSHION] logs\n"
 +        "             each transition: grows on 2 starvations/60min, shrinks after 6h quiet;\n"
 +        "             1.0.1-pre10: [PTV-CUSHREL] releases a raised tier held against a starved-\n"
@@ -29609,6 +29989,18 @@ index 0000000000..bed51034e4
 +        "                 300 s): undecodable video, the process exits for a supervised respawn\n"
 +        "  [PTV-VFILL]    N pictures repeated into content gaps (source pictures lost or corrupt), at most one\n"
 +        "                 line per 10 s; the output timestamps stay continuous. Counts as dup= too\n"
++        "                 (2.2.2 T-501, PTV_DIAG only) 'N picture repeat(s) into source timing gaps in 60 s' = forward\n"
++        "                 label steps < 200 ms with no frame lost (a splice re-phase, a label walk) filled with whole\n"
++        "                 pictures instead of a PTS hole; they count as pd= (residence), not dup= (PTV_NO_VGAP_SRC=1 disables)\n"
++        "  [PTV-VPHASE]   (2.2.2 T-499, single input) 'the pictures' place on the house grid moved +N ms ...: the\n"
++        "                 sound follows over S s' = the source's picture labels stepped by part of a frame (a splice);\n"
++        "                 the transcoded sound moves to the pictures again at 2 ms/s (4 ms/s for the part beyond 20 ms\n"
++        "                 and next to the rounding line), copied tracks do not. 'the picture phase is not followed:\n"
++        "                 <why> — the sound returns to its label time' = no steady phase for 5 s (film cadence, a rate\n"
++        "                 conversion, no pictures) or whole-picture slips too close together (a frame-rate conversion;\n"
++        "                 followed again 5 min after the last). Each at most once per 60 s for moves of 5 ms or more;\n"
++        "                 smaller moves ('target a -> b') and 'house_skew +N ms with the opposite picture slip' (a slip\n"
++        "                 shown as a repeat on an empty queue: no step in the sound) under PTV_DIAG. PTV_NO_VPHASE=1 off\n"
 +        "  [PTV-DUKF]     after a jump of 1 s or more in the video the decoder input waits for the next keyframe:\n"
 +        "                 'resume at keyframe — dropped N video frames' (normal, at most one GOP) | 'escape — no IDR\n"
 +        "                 within 5000ms' (resumed without one: a few damaged pictures may show)\n"
