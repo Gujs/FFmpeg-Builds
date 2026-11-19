@@ -20,7 +20,7 @@ logs safe for sync_check (T-486) and a true legend / -h (T-487).
   or desync verdicts (the one standing error = TMTG_Earning_Calls, source gone the whole soak); RSS max +7.1 MB/h and
   falling (a mosaic, 1024 → 1155 MB), threads and fds flat everywhere. 24 source returns, all clean (hold fill ends 2–5 s
   after the picture returns; the post-event sync check in sync within ±25 ms) — T-489's case confirmed on air.
-  Independent source-vs-output A/V captures on 8 cow channels (PTS-domain match): 7 within ±5 ms; PATRIOT-Outdoor +31 ms
+  Independent source-vs-output A/V captures on 7 cow channels (PTS-domain match): 6 within ±5 ms; PATRIOT-Outdoor +31 ms
   (T-497, below).
 - rc13 gate (12 lanes, kit 41b036c, media-v39): 382 keys, 380 PASS, the 2 accepted SCTE-35 KNOWN lead-outage keys;
   0 regressions vs rc12. Details: `patches/ptv/2.2.1-rc13/README.md`. Baselines: same code as rc13 (no separate 2.2.1 gate).
