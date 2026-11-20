@@ -105,16 +105,49 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..e867635db6
+index 0000000000..8ecc14dd03
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6497 @@
+@@ -0,0 +1,6530 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.2-pre6 — pre5 + the source picture period is the median step, not the shortest (T-512)
++
++**T-512 — one short label step is not the picture rate.** An HLS-origin source re-stamps sound and pictures together at
++every segment join (WildTV, provider HLS -> SRT: -8 / -8 / +15.3 ms every 6 s, content contiguous). The T-413 learner took the
++shortest picture step of each 2 s window, so after every -8 ms join it read 25.4 ms for a 33.37 ms source: for those 2 s
++content_index() moved its rounding line and T-499 measured the picture phase on a 25.4 ms circle. When the join also carried
++the picture across the half tick, the wrong circle read the new phase as the old one, the target did not move, and the sound
++stood a whole 25.4 ms from the picture with its phase term on target — clean for the post-event sync check, which stepped it
++after 2 s of agreement (cow-1 WildTV on pre3/pre4: `[PTV-SYNCCHK] STEPPED` -25 / +25 ms). The period is now the median step
++of the window (lost pictures, the longer steps, are ignored as before). On the kit's source classes the median equals the
++shortest everywhere except LVTV 25p (shortest 39.3-39.5 ms in 16 of 17 windows, median 40.00: the T-510 flip goes too). WildTV
++capture replay: picture-phase lines on the wrong circle 44 of 169 -> 0 of 18, sync-check sensor beyond 21 ms 12 -> 2 (both at
++source damage); with sync-check watches forced every 7 s: STEPPED 4 -> 0 (77 decisions). New `[PTV-SRCPER]` DIAG line;
++`PTV_SRCPER_MIN=1` = the shortest step, as before.
++
++## 2.2.2-pre5 — pre4 + every hold's return is classified (T-502) + a dropped silence-fill frame moves the fill on (T-505)
++
++**T-502 — the rejoin classifier is armed for every hold.** The classifier was re-armed only by a video packet read while
++the source state was LIVE. A return that ends as its hold ends (the source back for ~1 s: the last picture is read as the
++master shows the first) left no such packet, so the next hold's return was never classified; the audio waited for the class
++with its real frames buffered while the hold fill had already stopped, and the 4 s cap released them (blip1000/sync_blip_20:
++189 frames held 4.1 s, the audio PID dark 4.1 s; 12 of 24 runs under 8-at-once load). A class now belongs to one hold: the
++classifier is armed again when the next hold begins (g_src_hold_start, as the audio's rejoin buffer is since T-489).
++Same load: 0 of 40.
++
++**T-505 — a dropped silence-fill frame moves the fill on.** The T-478 snapshot ("keep what a frame dropped whole at the
++door replaces") was also taken for the track's own silence fill. When house_skew stepped back under a running fill (the
++video back on its content after a run of repeats: +240 ms -> 0) each fill frame fell behind the door, was dropped whole and
++"restored": the fill's label never advanced and every later quantum was dropped too, until house_skew moved again or a real
++frame came (Cinestar 10 % loss: 1.4 s on every run plus 0.5-2.1 s by chance; the audio PID dark up to 2.3 s, 6 of 24 runs
++over the 1.5 s bar). The snapshot is now taken for real frames only, so a dropped fill frame loses exactly the step and is
++back at the door: std-cin/loss_100 audio dark 1.2-2.3 s -> 0.46-0.51 s, largest ATRIM 1386-2290 ms -> 240 ms, 0 of 40.
 +
 +## 2.2.2-pre4 — pre3 + a gap-fill repeat never moves the sound (T-507) + a lost picture after a hold is a repeat (T-508)
 +
@@ -6608,10 +6641,10 @@ index 0000000000..e867635db6
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..21e7d6a606
+index 0000000000..3f2dc13696
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,8002 @@
+@@ -0,0 +1,8004 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6661,7 +6694,7 @@ index 0000000000..21e7d6a606
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.2-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.2-pre6"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -7054,6 +7087,7 @@ index 0000000000..21e7d6a606
 +                                      * ~36ms/h audio-late onto the wire while every internal offset read bounded.
 +                                      * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
 +int     g_vgapfill = 1;       /* 2.0.0-pre9.4 (T-083): a content gap inside frame_q is filled, not leapt */
++int     g_srcper_min;         /* 2.2.2 T-512: PTV_SRCPER_MIN=1 — T-413's source period = the shortest step of a window (as before), not the median */
 +int     g_vphase = 1;         /* 2.2.2 T-499: the sound follows the shown picture's sub-frame phase (ptvencoder.h) */
 +int64_t g_vph_bias_us;
 +_Atomic int64_t g_vph_tgt_us;
@@ -14328,6 +14362,7 @@ index 0000000000..21e7d6a606
 +    }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
 +    if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
 +    if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
++    if (getenv("PTV_SRCPER_MIN")) g_srcper_min = 1;         /* 2.2.2 T-512: the T-413 learner as before (the shortest step) */
 +    if (getenv("PTV_NO_VPHASE")) g_vphase = 0;              /* 2.2.2 T-499 kill switch: the sound stays on the label, as 2.2.1 */
 +    if (getenv("PTV_TEST_VPH_BIAS")) {                      /* T-499 test hook: every placement by the picture moves by B us */
 +        g_vph_bias_us = atoll(getenv("PTV_TEST_VPH_BIAS"));
@@ -14616,10 +14651,10 @@ index 0000000000..21e7d6a606
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..de30a55b7b
+index 0000000000..ccadf4f3a2
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2366 @@
+@@ -0,0 +1,2369 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -15571,8 +15606,9 @@ index 0000000000..de30a55b7b
 +    const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
 +                                      * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
 +    int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
-+    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (shortest step of a 2 s content window, every
-+                                      * picture popped; 0 = not learned) — content_index()'s decision line for a faster source */
++    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (median step of a 2 s content window, every
++                                      * picture popped — 2.2.2 T-512, the shortest before; 0 = not learned) —
++                                      * content_index()'s decision line for a faster source */
 +    /* watchdog */
 +    int64_t          last_emit_us;
 +    volatile int     output_done;
@@ -16233,6 +16269,7 @@ index 0000000000..de30a55b7b
 +    int64_t               src_last_vdts_raw; /* 2.0.0-pre3: last video DTS, raw 33-bit (stream tb) */
 +    int64_t               src_last_vwall;   /* 2.0.0-pre3: wall us of that packet */
 +    int                   src_classified;   /* 2.0.0-pre3: rejoin of the current hold already classified */
++    int64_t               src_cls_hold;     /* 2.2.2 T-502: the hold (g_src_hold_start) the classifier was armed for */
 +    int                   src_pend;         /* 2.0.0-pre3: first post-gap packet (the PES tail) seen */
 +    int64_t               src_pend_w, src_pend_raw; /* 2.0.0-pre3: its wall gap; the last pre-gap DTS */
 +    /* 2.0.0 T-103 (owner 2026-10-10: the output delay is pinned): a pause the burst bank cannot absorb is not kept as
@@ -16583,6 +16620,7 @@ index 0000000000..de30a55b7b
 + * against the house grid moved the lip sync by up to P/2 with no event. The master measures r per shown picture
 + * (clock) and publishes a target; each transcoded track adds its own slewed copy at the house_skew door (audio).
 + * Audio only: the video axis, house_skew, copies and the mosaic are not touched. PTV_NO_VPHASE=1 = off. */
++extern int     g_srcper_min;     /* 2.2.2 T-512: PTV_SRCPER_MIN=1 — T-413 learns the shortest step, as before */
 +extern int     g_vphase;
 +extern int64_t g_vph_bias_us;            /* test hook PTV_TEST_VPH_BIAS (us): added to the target after the estimator */
 +extern _Atomic int64_t g_vph_tgt_us;     /* the target g = F(phase) (+ bias), us; 0 = not followed */
@@ -16988,10 +17026,10 @@ index 0000000000..de30a55b7b
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..b0d2be65cc
+index 0000000000..cf3f8aef5f
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,4243 @@
+@@ -0,0 +1,4249 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -19761,7 +19799,13 @@ index 0000000000..b0d2be65cc
 +                        atomic_store_explicit(&g_afill_us[a->dbg_k], 0, memory_order_relaxed);
 +                }
 +            }
-+            if (!a->hold_feeding) {        /* T-478: a real frame — keep what it replaces until it passes the door */
++            /* 2.2.2 T-505: a REAL frame only. The track's own silence fill (nbs) took the snapshot too: when house_skew
++             * stepped back under it (the video back on its content after a run of repeats: +240 ms -> 0) its frames fell
++             * behind the door, each was dropped whole and "restored" — the fill's next label never advanced, so every
++             * later quantum was dropped as well, until house_skew moved again or a real frame came (Cinestar 10 % loss:
++             * 1.4 s on every run, 0.5-2.1 s more by chance — the audio PID dark 2.3 s). A dropped fill frame moves the
++             * fill on: it loses the step (240 ms) and is back at the door */
++            if (!a->nbs_feeding) {         /* T-478: a real frame — keep what it replaces until it passes the door */
 +                a->gs_raw = a->glue_raw_last_us; a->gs_dur = a->glue_raw_dur_us; a->gs_wall = a->glue_wall_last_us;
 +                a->gs_hs  = a->hf_hs_real;       a->gs_dup = a->hf_dup_real;     a->gs_ok   = 1;
 +            }
@@ -21544,10 +21588,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..e6c44ca5c8
+index 0000000000..055897137f
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2669 @@
+@@ -0,0 +1,2699 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -21741,6 +21785,8 @@ index 0000000000..e6c44ca5c8
 +        return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
 +    return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
 +}
++
++#define PTV_PP_STEPS 256    /* 2.2.2 T-512: picture steps kept per 2 s learner window (T-413; 120 fps = 240) */
 +
 +/* 2.2.2 T-499: the picture-phase estimator (master rung, output thread; ptvencoder.h g_vphase). Feed-forward: the samples
 + * are label arithmetic only (the tick a fresh picture's label rounded to, minus the label), so the sound's own move is not
@@ -23013,6 +23059,7 @@ index 0000000000..e6c44ca5c8
 +        int slow_arm = 0;                           /* 2.1 T-011: a source slower than the house (>= 1.5 ticks a picture) */
 +        int64_t pp_prev = AV_NOPTS_VALUE, pp_t0 = AV_NOPTS_VALUE, pp_min = 0;   /* 2.1 T-413: the period over every */
 +        int     pp_n = 0;                           /* picture popped (the learner above sees only the pictures shown) */
++        int64_t pp_step[PTV_PP_STEPS];              /* 2.2.2 T-512: the window's steps, for their median */
 +        int64_t rate_ref_us = 0, rate_new_wc = 0;   /* T-011: the source cadence on record, and since when it differs */
 +        int64_t slow_per = 0, slow_min = 0, slow_min_prev = 0, slow_win_wc = 0;   /* T-011: the source period = the
 +                                                     * shortest picture step in the last 2-4 s (loss only lengthens a step) */
@@ -23107,21 +23154,48 @@ index 0000000000..e6c44ca5c8
 +            for (;;) {
 +                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
 +                if (ret >= 0 && f->pts != AV_NOPTS_VALUE && f->opaque != &ptv_hold_tag) {
-+                    /* 2.1 T-413: the source period for content_index()'s decision line = the shortest step of each 2 s
-+                     * of CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
-+                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count */
++                    /* 2.1 T-413: the source period for content_index()'s decision line, learned over each 2 s of
++                     * CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
++                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count.
++                     * 2.2.2 T-512: the MEDIAN step of the window, not the shortest. One short step is a label step, not
++                     * the picture rate: an HLS-origin source re-stamps sound and pictures together at every segment
++                     * join (WildTV: -8 / -8 / +15.3 ms every 6 s), the shortest step of a window holding a -8 ms join
++                     * read 25.4 ms for a 33.37 ms source, and for those 2 s content_index() put the decision line
++                     * 4 ms nearer the tick (pictures 12.7 .. 16.7 ms before a tick moved one tick: a repeat and a skip
++                     * with no label gap) and T-499 measured the picture phase on a 25.4 ms circle — the sound then
++                     * stood a whole wrong period (25.4 ms) from the picture, which the post-event sync check stepped
++                     * out and back ("STEPPED -25 / +25 ms", each on air for minutes). The median ignores lost
++                     * pictures (longer steps) as the minimum did, as long as most steps are whole.
++                     * PTV_SRCPER_MIN=1 = the shortest step, as before */
 +                    int64_t ps = av_rescale_q(f->pts, v->out_tb, AV_TIME_BASE_Q);
 +                    if (pp_prev != AV_NOPTS_VALUE && ps - pp_prev >= 1000 && ps - pp_prev < 200000) {
 +                        if (!pp_min || ps - pp_prev < pp_min)
 +                            pp_min = ps - pp_prev;
++                        if (pp_n < PTV_PP_STEPS)
++                            pp_step[pp_n] = ps - pp_prev;
 +                        pp_n++;
 +                    }
 +                    pp_prev = ps;
 +                    if (pp_t0 == AV_NOPTS_VALUE || ps < pp_t0)
 +                        pp_t0 = ps;
 +                    else if (ps - pp_t0 >= 2000000) {
-+                        if (pp_n >= 8)
-+                            v->src_per_us = pp_min;
++                        if (pp_n >= 8) {
++                            int     pn  = FFMIN(pp_n, PTV_PP_STEPS), pi, pj;
++                            int64_t med, was = v->src_per_us;
++                            for (pi = 1; pi < pn; pi++) {        /* at most 256 steps every 2 s: an insertion sort */
++                                int64_t x = pp_step[pi];
++                                for (pj = pi; pj > 0 && pp_step[pj - 1] > x; pj--)
++                                    pp_step[pj] = pp_step[pj - 1];
++                                pp_step[pj] = x;
++                            }
++                            med = pp_step[pn / 2];
++                            v->src_per_us = g_srcper_min ? pp_min : med;
++                            if (v->is_master && g_diag && (llabs(v->src_per_us - was) * 100 > v->tick_dur_us ||
++                                                           llabs(med - pp_min) * 100 > v->tick_dur_us))
++                                av_log(NULL, AV_LOG_INFO, "[PTV-SRCPER] source picture period %.2f -> %.2f ms (%d steps "
++                                       "in 2 s: median %.2f, shortest %.2f ms; tick %.2f ms)\n", was / 1e3,
++                                       v->src_per_us / 1e3, pp_n, med / 1e3, pp_min / 1e3, v->tick_dur_us / 1e3);
++                        }
 +                        pp_min = 0;
 +                        pp_n   = 0;
 +                        pp_t0  = ps;
@@ -24219,10 +24293,10 @@ index 0000000000..e6c44ca5c8
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..eff96d48bb
+index 0000000000..fa91dc081f
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3307 @@
+@@ -0,0 +1,3319 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -26421,6 +26495,18 @@ index 0000000000..eff96d48bb
 +                 * packets (copied AC-3 + mid-GOP cut: the state flipped back to LIVE after the tail, the class was
 +                 * never set, the audio waiting for it ran into its 4 s cap and video waited at the gate: 1.9 s dark) */
 +                if (atomic_load_explicit(&g_src_state, memory_order_relaxed) || d->src_pend) {
++                    /* 2.2.2 T-502: a class belongs to ONE hold — the classifier is armed again when the next hold
++                     * begins (g_src_hold_start, as the audio's rejoin buffer is: T-489), not only by a video packet read
++                     * while LIVE. A return that ends as its hold ends (back for 1 s: the last picture is read as the
++                     * master shows the first) left no such packet: the second hold's return was never classified, the
++                     * audio waited for the class with its real frames buffered and the fill stopped — the 4 s cap
++                     * released them (blip1000/sync_blip_20: 189 frames held 4.1 s, the audio PID dark 4.1 s) */
++                    int64_t hid = atomic_load_explicit(&g_src_hold_start, memory_order_relaxed);
++                    if (hid && hid != d->src_cls_hold) {
++                        d->src_cls_hold   = hid;
++                        d->src_classified = 0;
++                        d->src_pend       = 0;
++                    }
 +                    if (!d->src_classified && d->src_last_vwall) {
 +                        if (!d->src_pend) {                 /* first packet after the gap: the held tail */
 +                            d->src_pend     = 1;
@@ -29496,10 +29582,10 @@ index 0000000000..4a0614cfdc
 +#endif /* FFTOOLS_PTVENCODER_LANG_H */
 diff --git a/fftools/ptvencoder_legend.c b/fftools/ptvencoder_legend.c
 new file mode 100644
-index 0000000000..fd397b2103
+index 0000000000..8be3123a42
 --- /dev/null
 +++ b/fftools/ptvencoder_legend.c
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,817 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -30049,6 +30135,12 @@ index 0000000000..fd397b2103
 +        "                 followed again 5 min after the last). Each at most once per 60 s for moves of 5 ms or more;\n"
 +        "                 smaller moves ('target a -> b') and 'house_skew +N ms with the opposite picture slip' (a slip\n"
 +        "                 shown as a repeat on an empty queue: no step in the sound) under PTV_DIAG. PTV_NO_VPHASE=1 off\n"
++        "  [PTV-SRCPER]   (2.2.2 T-512, PTV_DIAG) 'source picture period a -> b ms (N steps in 2 s: median, shortest)':\n"
++        "                 the source's picture period as learned over the last 2 s of content (the median label step;\n"
++        "                 it places the rounding line of a source faster than the house and is the period of\n"
++        "                 [PTV-VPHASE]). Printed when it moved by 1 %% of a tick or the shortest step differs from the\n"
++        "                 median (a label step: a segment join of an HLS-origin feed). PTV_SRCPER_MIN=1 = the shortest\n"
++        "                 step, as before 2.2.2\n"
 +        "  [PTV-DUKF]     after a jump of 1 s or more in the video the decoder input waits for the next keyframe:\n"
 +        "                 'resume at keyframe — dropped N video frames' (normal, at most one GOP) | 'escape — no IDR\n"
 +        "                 within 5000ms' (resumed without one: a few damaged pictures may show)\n"
