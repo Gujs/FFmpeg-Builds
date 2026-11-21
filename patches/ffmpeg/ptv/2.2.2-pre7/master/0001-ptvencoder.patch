@@ -105,16 +105,46 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..8ac54150c9
+index 0000000000..c790543ef3
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6515 @@
+@@ -0,0 +1,6545 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.2-pre7 — pre6 + a delay kept after a stall no longer breaks film cadence or walks the sound (T-516)
++
++**T-516 — film cadence while the output keeps a delay.** After a stall of the encoder (the input still arriving, the
++backlog kept as a delay: house_skew > 0) two defects stacked on film content (3:2 soft telecine). (1) Pre-existing (2.2.1
++too): the cadence path judged a picture due at its content index, which under a kept delay lies behind the output cursor
++for every picture — the residence never happened, film went out a picture a tick until the queue was empty, and from
++then on house_skew see-sawed one tick (-1 at each 50 ms label step, +1 at each repeat on the empty queue): the sound was
++cut and padded 33 ms at every film pair (AWE_Plus 1056 / PATRIOT-OAN 3654 `[PTV-ATRIM] input stepped back 33 ms` while
++a delay was kept). Residence is now judged where the pictures are on air (T-508's lag), as the gap fill already is.
++(2) Since T-499 (pre3): those -1 ticks sit exactly on the opposite-slip test's line (a 1.5-tick label step) and were
++counted as slips while the +1 that gave them back never was, so the sound walked 33 ms late per pair — seconds within a
++minute (OAN_Plus: +4.6 s and a sync_check restart). A step is now counted only while a picture phase is followed, and the
++phase term holds at most one slip on its way back; a step beyond that goes into the sound. Local replay (film + a 20 s
++encoder stall): pre6 sensor worst +5.1 s and 540 sound steps, 2.2.1 682 steps, pre7 worst +16 ms and 0 steps.
++
++## 2.2.2-pre6 — pre5 + the source picture period is the median step, not the shortest (T-512)
++
++**T-512 — one short label step is not the picture rate.** An HLS-origin source re-stamps sound and pictures together at
++every segment join (WildTV, provider HLS -> SRT: -8 / -8 / +15.3 ms every 6 s, content contiguous). The T-413 learner took the
++shortest picture step of each 2 s window, so after every -8 ms join it read 25.4 ms for a 33.37 ms source: for those 2 s
++content_index() moved its rounding line and T-499 measured the picture phase on a 25.4 ms circle. When the join also carried
++the picture across the half tick, the wrong circle read the new phase as the old one, the target did not move, and the sound
++stood a whole 25.4 ms from the picture with its phase term on target — clean for the post-event sync check, which stepped it
++after 2 s of agreement (cow-1 WildTV on pre3/pre4: `[PTV-SYNCCHK] STEPPED` -25 / +25 ms). The period is now the median step
++of the window (lost pictures, the longer steps, are ignored as before). On the kit's source classes the median equals the
++shortest everywhere except LVTV 25p (shortest 39.3-39.5 ms in 16 of 17 windows, median 40.00: the T-510 flip goes too). WildTV
++capture replay: picture-phase lines on the wrong circle 44 of 169 -> 0 of 18, sync-check sensor beyond 21 ms 12 -> 2 (both at
++source damage); with sync-check watches forced every 7 s: STEPPED 4 -> 0 (77 decisions). New `[PTV-SRCPER]` DIAG line;
++`PTV_SRCPER_MIN=1` = the shortest step, as before.
 +
 +## 2.2.2-pre5 — pre4 + every hold's return is classified (T-502) + a dropped silence-fill frame moves the fill on (T-505)
 +
@@ -6626,10 +6656,10 @@ index 0000000000..8ac54150c9
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..e4d7ded3db
+index 0000000000..d197b32f2d
 --- /dev/null
 +++ b/fftools/ptvencoder.c
-@@ -0,0 +1,8002 @@
+@@ -0,0 +1,8004 @@
 +/*
 + * ptvencoder — purpose-built live MPEG-TS re-encoder on a house-clock timing engine.
 + * Architecture & design: analysis/ptvencoder-functional-spec.md
@@ -6679,7 +6709,7 @@ index 0000000000..e4d7ded3db
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.2-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.2-pre7"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -7072,6 +7102,7 @@ index 0000000000..e4d7ded3db
 +                                      * ~36ms/h audio-late onto the wire while every internal offset read bounded.
 +                                      * See analysis/ptvencoder-0911-multiview-tick-audit.md. */
 +int     g_vgapfill = 1;       /* 2.0.0-pre9.4 (T-083): a content gap inside frame_q is filled, not leapt */
++int     g_srcper_min;         /* 2.2.2 T-512: PTV_SRCPER_MIN=1 — T-413's source period = the shortest step of a window (as before), not the median */
 +int     g_vphase = 1;         /* 2.2.2 T-499: the sound follows the shown picture's sub-frame phase (ptvencoder.h) */
 +int64_t g_vph_bias_us;
 +_Atomic int64_t g_vph_tgt_us;
@@ -14346,6 +14377,7 @@ index 0000000000..e4d7ded3db
 +    }   /* v0.9.14: revert to advisor-only (manual PTV_PREROLL_MS recipe) */
 +    if (getenv("PTV_NO_CLOCKFOLLOW")) g_clockfollow = 0;   /* v0.9.15: never follow a large source-clock offset (buffers pin + resampler churns on such sources) */
 +    if (getenv("PTV_NO_VGAPFILL")) g_vgapfill = 0;          /* 2.0.0-pre9.4 (T-083) kill switch */
++    if (getenv("PTV_SRCPER_MIN")) g_srcper_min = 1;         /* 2.2.2 T-512: the T-413 learner as before (the shortest step) */
 +    if (getenv("PTV_NO_VPHASE")) g_vphase = 0;              /* 2.2.2 T-499 kill switch: the sound stays on the label, as 2.2.1 */
 +    if (getenv("PTV_TEST_VPH_BIAS")) {                      /* T-499 test hook: every placement by the picture moves by B us */
 +        g_vph_bias_us = atoll(getenv("PTV_TEST_VPH_BIAS"));
@@ -14634,10 +14666,10 @@ index 0000000000..e4d7ded3db
 +}
 diff --git a/fftools/ptvencoder.h b/fftools/ptvencoder.h
 new file mode 100644
-index 0000000000..ba7d42c978
+index 0000000000..ccadf4f3a2
 --- /dev/null
 +++ b/fftools/ptvencoder.h
-@@ -0,0 +1,2367 @@
+@@ -0,0 +1,2369 @@
 +#ifndef FFTOOLS_PTVENCODER_H
 +#define FFTOOLS_PTVENCODER_H
 +
@@ -15589,8 +15621,9 @@ index 0000000000..ba7d42c978
 +    const int64_t   *framedrop_src;  /* 2.0.0-pre9.6: single input — the decode thread's drop-oldest count for this rung
 +                                      * (push_frame_q counts there; VideoCtx->framedrop was never written: drop= read 0) */
 +    int64_t          decim;          /* v0.9.15.2: surplus frames decimated by content mapping (>house-rate source) */
-+    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (shortest step of a 2 s content window, every
-+                                      * picture popped; 0 = not learned) — content_index()'s decision line for a faster source */
++    int64_t          src_per_us;     /* 2.1 T-413: the source's picture period (median step of a 2 s content window, every
++                                      * picture popped — 2.2.2 T-512, the shortest before; 0 = not learned) —
++                                      * content_index()'s decision line for a faster source */
 +    /* watchdog */
 +    int64_t          last_emit_us;
 +    volatile int     output_done;
@@ -16602,6 +16635,7 @@ index 0000000000..ba7d42c978
 + * against the house grid moved the lip sync by up to P/2 with no event. The master measures r per shown picture
 + * (clock) and publishes a target; each transcoded track adds its own slewed copy at the house_skew door (audio).
 + * Audio only: the video axis, house_skew, copies and the mosaic are not touched. PTV_NO_VPHASE=1 = off. */
++extern int     g_srcper_min;     /* 2.2.2 T-512: PTV_SRCPER_MIN=1 — T-413 learns the shortest step, as before */
 +extern int     g_vphase;
 +extern int64_t g_vph_bias_us;            /* test hook PTV_TEST_VPH_BIAS (us): added to the target after the estimator */
 +extern _Atomic int64_t g_vph_tgt_us;     /* the target g = F(phase) (+ bias), us; 0 = not followed */
@@ -17007,10 +17041,10 @@ index 0000000000..ba7d42c978
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..cf3f8aef5f
+index 0000000000..2ea4c8b296
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,4249 @@
+@@ -0,0 +1,4259 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -19005,11 +19039,21 @@ index 0000000000..cf3f8aef5f
 +            if (!a->vph_jwc)
 +                a->vph_jwc = now;
 +            if (sk - a->vph_sk_last == jc - a->vph_jseen) {
-+                if (g_diag)
-+                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms with the opposite picture "
-+                           "slip: no step in the sound, the phase term takes it and moves back\n", a->dbg_k, a->dbg_in,
-+                           (jc - a->vph_jseen) / 1000);
-+                a->vph_us   -= jc - a->vph_jseen;
++                /* T-516: the term is the target (within +-P/2) plus at most ONE slip on its way back. A step that
++                 * would put it further than a tick and a half from the target is not a slip of a followed phase but
++                 * house_skew moving for real (a delay draining, a lag change): the sound takes it, as before T-499 */
++                int64_t jd  = jc - a->vph_jseen;
++                int64_t far = a->tick_dur_us > 0 ? a->tick_dur_us + a->tick_dur_us / 2 : 50000;
++                if (llabs(a->vph_us - jd - g) <= far) {
++                    if (g_diag)
++                        av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms with the opposite picture "
++                               "slip: no step in the sound, the phase term takes it and moves back\n", a->dbg_k, a->dbg_in,
++                               jd / 1000);
++                    a->vph_us -= jd;
++                } else if (g_diag)
++                    av_log(NULL, AV_LOG_INFO, "[PTV-VPHASE] a%d(in%d) house_skew %+"PRId64" ms: the phase term is %+.1f ms "
++                           "from its target already, the sound takes the step\n", a->dbg_k, a->dbg_in, jd / 1000,
++                           (a->vph_us - g) / 1e3);
 +                a->vph_jseen = jc;
 +                a->vph_jwc   = 0;
 +            } else if (now - a->vph_jwc > 4000000) {
@@ -21569,10 +21613,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..e6c44ca5c8
+index 0000000000..2d17e96c61
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2669 @@
+@@ -0,0 +1,2712 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -21766,6 +21810,8 @@ index 0000000000..e6c44ca5c8
 +        return av_rescale_rnd(house_us, v->out_fps.num, 1000000LL * v->out_fps.den, AV_ROUND_NEAR_INF);
 +    return (house_us + v->tick_dur_us / 2) / v->tick_dur_us;
 +}
++
++#define PTV_PP_STEPS 256    /* 2.2.2 T-512: picture steps kept per 2 s learner window (T-413; 120 fps = 240) */
 +
 +/* 2.2.2 T-499: the picture-phase estimator (master rung, output thread; ptvencoder.h g_vphase). Feed-forward: the samples
 + * are label arithmetic only (the tick a fresh picture's label rounded to, minus the label), so the sound's own move is not
@@ -23038,6 +23084,7 @@ index 0000000000..e6c44ca5c8
 +        int slow_arm = 0;                           /* 2.1 T-011: a source slower than the house (>= 1.5 ticks a picture) */
 +        int64_t pp_prev = AV_NOPTS_VALUE, pp_t0 = AV_NOPTS_VALUE, pp_min = 0;   /* 2.1 T-413: the period over every */
 +        int     pp_n = 0;                           /* picture popped (the learner above sees only the pictures shown) */
++        int64_t pp_step[PTV_PP_STEPS];              /* 2.2.2 T-512: the window's steps, for their median */
 +        int64_t rate_ref_us = 0, rate_new_wc = 0;   /* T-011: the source cadence on record, and since when it differs */
 +        int64_t slow_per = 0, slow_min = 0, slow_min_prev = 0, slow_win_wc = 0;   /* T-011: the source period = the
 +                                                     * shortest picture step in the last 2-4 s (loss only lengthens a step) */
@@ -23095,7 +23142,13 @@ index 0000000000..e6c44ca5c8
 +                /* residence CAP: film holds a picture 1 tick extra at most (3:2); a slower source as many as its
 +                 * cadence needs (29.97 in 59.94: 1, 25 in 59.94: 2) */
 +                int cap = film_arm ? 1 : (int)((slow_per + v->tick_dur_us - 1) / v->tick_dur_us) - 1;
-+                if (nc < 0 || nc <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
++                /* T-516: due where the pictures are on air (T-508's vg_lag), not at the content index. While the output
++                 * keeps a delay (house_skew > 0 after a hold) every content index lies behind the output cursor: each
++                 * picture was "due" at once, the residence never happened, film was shown a picture a tick — 30 of the
++                 * source's 24 a second — until the queue was empty, and from then on the output ran on the empty queue:
++                 * -1 tick of house_skew at every 1.5-tick label step, +1 at every repeat on empty, the sound cut and
++                 * padded 33 ms each time (PATRIOT-OAN 2026-11-20: 3654 "[PTV-ATRIM] input stepped back 33 ms") */
++                if (nc < 0 || nc + vg_lag <= last_vpts + 1 || held_extra >= cap) {   /* due, unstampable, or residence CAP hit */
 +                    av_frame_unref(held); av_frame_move_ref(held, nextf); av_frame_free(&nextf);
 +                    next_have = 0; fresh = 1; held_src_pts = held->pts; held_extra = 0; vgap_park = 0;
 +                } else
@@ -23132,21 +23185,48 @@ index 0000000000..e6c44ca5c8
 +            for (;;) {
 +                ret = av_thread_message_queue_recv(v->frame_q, &f, AV_THREAD_MESSAGE_NONBLOCK);
 +                if (ret >= 0 && f->pts != AV_NOPTS_VALUE && f->opaque != &ptv_hold_tag) {
-+                    /* 2.1 T-413: the source period for content_index()'s decision line = the shortest step of each 2 s
-+                     * of CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
-+                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count */
++                    /* 2.1 T-413: the source period for content_index()'s decision line, learned over each 2 s of
++                     * CONTENT (every rung pops the same pictures: the same period at the same picture, the rungs
++                     * stamp alike), from 8 steps; steps under 1 ms (a doubled stamp) or over 200 ms (a gap) do not count.
++                     * 2.2.2 T-512: the MEDIAN step of the window, not the shortest. One short step is a label step, not
++                     * the picture rate: an HLS-origin source re-stamps sound and pictures together at every segment
++                     * join (WildTV: -8 / -8 / +15.3 ms every 6 s), the shortest step of a window holding a -8 ms join
++                     * read 25.4 ms for a 33.37 ms source, and for those 2 s content_index() put the decision line
++                     * 4 ms nearer the tick (pictures 12.7 .. 16.7 ms before a tick moved one tick: a repeat and a skip
++                     * with no label gap) and T-499 measured the picture phase on a 25.4 ms circle — the sound then
++                     * stood a whole wrong period (25.4 ms) from the picture, which the post-event sync check stepped
++                     * out and back ("STEPPED -25 / +25 ms", each on air for minutes). The median ignores lost
++                     * pictures (longer steps) as the minimum did, as long as most steps are whole.
++                     * PTV_SRCPER_MIN=1 = the shortest step, as before */
 +                    int64_t ps = av_rescale_q(f->pts, v->out_tb, AV_TIME_BASE_Q);
 +                    if (pp_prev != AV_NOPTS_VALUE && ps - pp_prev >= 1000 && ps - pp_prev < 200000) {
 +                        if (!pp_min || ps - pp_prev < pp_min)
 +                            pp_min = ps - pp_prev;
++                        if (pp_n < PTV_PP_STEPS)
++                            pp_step[pp_n] = ps - pp_prev;
 +                        pp_n++;
 +                    }
 +                    pp_prev = ps;
 +                    if (pp_t0 == AV_NOPTS_VALUE || ps < pp_t0)
 +                        pp_t0 = ps;
 +                    else if (ps - pp_t0 >= 2000000) {
-+                        if (pp_n >= 8)
-+                            v->src_per_us = pp_min;
++                        if (pp_n >= 8) {
++                            int     pn  = FFMIN(pp_n, PTV_PP_STEPS), pi, pj;
++                            int64_t med, was = v->src_per_us;
++                            for (pi = 1; pi < pn; pi++) {        /* at most 256 steps every 2 s: an insertion sort */
++                                int64_t x = pp_step[pi];
++                                for (pj = pi; pj > 0 && pp_step[pj - 1] > x; pj--)
++                                    pp_step[pj] = pp_step[pj - 1];
++                                pp_step[pj] = x;
++                            }
++                            med = pp_step[pn / 2];
++                            v->src_per_us = g_srcper_min ? pp_min : med;
++                            if (v->is_master && g_diag && (llabs(v->src_per_us - was) * 100 > v->tick_dur_us ||
++                                                           llabs(med - pp_min) * 100 > v->tick_dur_us))
++                                av_log(NULL, AV_LOG_INFO, "[PTV-SRCPER] source picture period %.2f -> %.2f ms (%d steps "
++                                       "in 2 s: median %.2f, shortest %.2f ms; tick %.2f ms)\n", was / 1e3,
++                                       v->src_per_us / 1e3, pp_n, med / 1e3, pp_min / 1e3, v->tick_dur_us / 1e3);
++                        }
 +                        pp_min = 0;
 +                        pp_n   = 0;
 +                        pp_t0  = ps;
@@ -23702,9 +23782,16 @@ index 0000000000..e6c44ca5c8
 +                         * of where the picture is on air (a label slip or a sub-frame step shown as a repeat because the
 +                         * queue was empty, or taken back by a skip): counted, so each track's door takes the step out of
 +                         * its phase term in the same frame and slews it back, instead of a one-tick step in the sound.
-+                         * Written before house_skew: a door that reads the new house_skew reads this too */
++                         * Written before house_skew: a door that reads the new house_skew reads this too.
++                         * T-516: only while the phase is followed (two coherent windows, no rate conversion). The step
++                         * taken out of the sound is the wrap of a phase the target tracks; with no steady phase the
++                         * target is 0 and house_skew alone places the sound, as in 2.2.1. Film cadence under a kept
++                         * delay is the case that showed it: no residence there (every label is due), the 50 ms label
++                         * steps are 1.5 ticks = on this test's line, so each second picture's -1 tick was counted and
++                         * the repeat on the empty queue that gave the tick back (not a fresh picture) never was: the
++                         * sound walked 33 ms late per pair, seconds within a minute (OAN_Plus 2026-11-20, +4.6 s) */
 +                        int64_t d = hsn - *v->house_skew, dc = content_vpts - vp_prev_c - 1;
-+                        if (d && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
++                        if (d && vp.coh >= 2 && !vp.fast && vp_prev_c >= 0 && vp.r_prev != INT64_MIN && (dc == 1 || dc == -1) &&
 +                            d == -dc * v->tick_dur_us && llabs(r - vp.r_prev + d) < P / 2)
 +                            atomic_fetch_add(&g_vph_jcum_us, d);
 +                        if (hu >= 0 && llabs(r) <= v->tick_dur_us) {
@@ -29533,10 +29620,10 @@ index 0000000000..4a0614cfdc
 +#endif /* FFTOOLS_PTVENCODER_LANG_H */
 diff --git a/fftools/ptvencoder_legend.c b/fftools/ptvencoder_legend.c
 new file mode 100644
-index 0000000000..fd397b2103
+index 0000000000..aafbe81980
 --- /dev/null
 +++ b/fftools/ptvencoder_legend.c
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,820 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -30085,7 +30172,16 @@ index 0000000000..fd397b2103
 +        "                 conversion, no pictures) or whole-picture slips too close together (a frame-rate conversion;\n"
 +        "                 followed again 5 min after the last). Each at most once per 60 s for moves of 5 ms or more;\n"
 +        "                 smaller moves ('target a -> b') and 'house_skew +N ms with the opposite picture slip' (a slip\n"
-+        "                 shown as a repeat on an empty queue: no step in the sound) under PTV_DIAG. PTV_NO_VPHASE=1 off\n"
++        "                 shown as a repeat on an empty queue: no step in the sound; counted only while the phase is\n"
++        "                 followed, and 'house_skew +N ms: the phase term is ... from its target already, the sound takes\n"
++        "                 the step' when a second one comes before the first is back, T-516) under PTV_DIAG.\n"
++        "                 PTV_NO_VPHASE=1 off\n"
++        "  [PTV-SRCPER]   (2.2.2 T-512, PTV_DIAG) 'source picture period a -> b ms (N steps in 2 s: median, shortest)':\n"
++        "                 the source's picture period as learned over the last 2 s of content (the median label step;\n"
++        "                 it places the rounding line of a source faster than the house and is the period of\n"
++        "                 [PTV-VPHASE]). Printed when it moved by 1 %% of a tick or the shortest step differs from the\n"
++        "                 median (a label step: a segment join of an HLS-origin feed). PTV_SRCPER_MIN=1 = the shortest\n"
++        "                 step, as before 2.2.2\n"
 +        "  [PTV-DUKF]     after a jump of 1 s or more in the video the decoder input waits for the next keyframe:\n"
 +        "                 'resume at keyframe — dropped N video frames' (normal, at most one GOP) | 'escape — no IDR\n"
 +        "                 within 5000ms' (resumed without one: a few damaged pictures may show)\n"
