@@ -105,16 +105,50 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..875ae551f5
+index 0000000000..7c6e6732ed
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6634 @@
+@@ -0,0 +1,6668 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.3-pre4 — 2.2.3-pre3 + a half-wrap source step keeps sound and picture together (T-530)
++
++**T-530 — a source that steps its whole program by half the timestamp wrap no longer splits video and audio.** glo-4
++EPIC_BHARAT (an HLS source, the ingest copies its bytes) steps its PCR and every label by about 2^32 ticks (13.25 h, half the
++33-bit wrap: `[PTV-REG] in0 PCR jump +47720.6 s`) every few hours. Each stream decided "forward or backward wrap" from its own
++last label; a step that close to half lands a few hundred ms either side of it on the video and the audio (a delivery hole,
++the interleave), so the two ended 2^33 apart: `[PTV-TL]` video `+95443.758 s`, the audio MUTED as off the program clock, the
++wire A/V offset -15 s and a sync_check restart (00:44, 10:01, 17:52, 22:48 on 2026-11-22; EPIC_MUSIC too). A step within 10
++minutes of half now takes the wrap that lands it nearest the other stream of the program, so the program steps once. The
++return from a single label with bit 32 set (EPIC 22:46) lands back by the other stream as well. Logged as `[PTV-DISCONT]
++stream N: a half-wrap step (... s) — wrap taken by the program`.
++
++Keys (kit 86c3312, media-v48 `b1a91b69a32a`): `sync_halfwrap` (the whole program +2^32 - 1.26 s at 40 s and again at 85 s)
++with a 1.6 s hole before each FAILs on 2.2.3-pre3 (the audio 2^33 off, MUXGUARD exit) and PASSes on pre4; with a 1.2 s hole
++(the step within ms of half), without a hole and on std, and the HLS-repeat keys `sync_hlsrepeat_12` / `_2` (a hole, content
++back, the audio first; one video label with bit 32 set after / before the step) PASS.
++
++## 2.2.3-pre3 — 2.2.3-pre2 + sound through a rejoin after a video-only hole (T-503, T-528)
++
++**T-503 — a rejoin's wait after a video-only hold no longer skips live sound.** When the source's video stops while its
++sound keeps flowing, the returning first picture waits about a base cushion for its slot (T-472). Those waiting ticks were
++counted into house_skew because the video was being read again, so the sound jumped ahead by up to the cushion (3.88 s at
++a 4 s pre-roll) and then the next seconds were dropped as overlap: 1-3 returning pictures without their sound on every
++video-null event since 2.2.1-rc4. The wait now counts as a video-only repeat, like the hold itself.
++
++**T-528 — the silence fill never runs past the picture on air.** On sources with subtitles/teletext (record door active)
++the fill after a video-only hole started from the last real frame placed, which in such a hole was before the hole; it read
++up to 1.4 s past the returning sound and dropped it as overlap (1-2 pictures without sound, since 2.2.1-rc7). The fill is
++now bounded by where the video is on air, so the wire stays continuous but no returning sound is thrown away.
++
++Keys: every sync_vnull_20 (vt-nowall, rich2997b/5994b/25b/50b) now judged strictly (`T056_UNPAIRED_MAX=0`, no returning
++picture may lack its beep): 5/5 FAIL on 2.2.3-pre2, 5/5 PASS on pre3. Full gate (media-v47, 414 keys): no change against
++pre2 except these, the only FAILs the two known SCTE-35 lead-outage keys.
 +
 +## 2.2.3-pre2 — 2.2.3-pre1 + two mosaic slots never share a regulator port (T-526), the legend explains a slot's sk (T-522)
 +
@@ -6745,7 +6779,7 @@ index 0000000000..875ae551f5
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..32964a8850
+index 0000000000..f376cd48f1
 --- /dev/null
 +++ b/fftools/ptvencoder.c
 @@ -0,0 +1,8016 @@
@@ -6798,7 +6832,7 @@ index 0000000000..32964a8850
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.3-pre2"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.3-pre4"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -17156,10 +17190,10 @@ index 0000000000..ba1e7696b1
 +#endif /* FFTOOLS_PTVENCODER_H */
 diff --git a/fftools/ptvencoder_audio.c b/fftools/ptvencoder_audio.c
 new file mode 100644
-index 0000000000..38de3c09b1
+index 0000000000..ed8987cd2d
 --- /dev/null
 +++ b/fftools/ptvencoder_audio.c
-@@ -0,0 +1,4394 @@
+@@ -0,0 +1,4407 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -21245,6 +21279,19 @@ index 0000000000..38de3c09b1
 +    door   = a->acomp_exp_us;
 +    if (target - door > 2000000)
 +        target = door + 2000000;                 /* catch up at most 2 s per sentinel (100 ms apart) */
++    /* 2.2.3 T-528: and never past where the video is on air — the record door's bound above (house output + h0 is the
++     * door's own domain whatever house_skew is). After a hold under the record door this target starts from the last
++     * REAL frame placed, and in a video-only hole none was (they waited at the record door and were dropped whole
++     * behind its fill; T-478 keeps the snapshot of the last one played): from 35.9 s + 17 s of hold ticks it read 1.4 s
++     * past the returning sound, the fill leapt there and the returning sound was dropped as overlap — 1-2 returning
++     * pictures without their beep on every rich*b sync_vnull_20 since 2.2.1-rc7. The bound follows the pictures in real
++     * time, so the fill still keeps the wire continuous (T-478); it only stops filling sound for pictures not shown */
++    {
++        int64_t h0, pos = atomic_load_explicit(&g_house_out_us, memory_order_relaxed);
++        pthread_mutex_lock(a->h0_lock); h0 = *a->h0; pthread_mutex_unlock(a->h0_lock);
++        if (h0 != AV_NOPTS_VALUE && pos > 0)
++            target = FFMIN(target, pos + h0 + a->corr.corr_us + a->sstep_us - 200000);
++    }
 +    n = dur_us > 0 ? (int)((target - door) / dur_us) : 0;
 +    if (n < 1)
 +        return;
@@ -21863,10 +21910,10 @@ index 0000000000..9274708292
 +}
 diff --git a/fftools/ptvencoder_clock.c b/fftools/ptvencoder_clock.c
 new file mode 100644
-index 0000000000..cd1c1eaf97
+index 0000000000..5d1dcdacbd
 --- /dev/null
 +++ b/fftools/ptvencoder_clock.c
-@@ -0,0 +1,2724 @@
+@@ -0,0 +1,2733 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -23368,7 +23415,8 @@ index 0000000000..cd1c1eaf97
 +            PTV_HB_OUT(PTV_HB_OUT_LOOP);   /* 1.0.1-pre21 heartbeat: stats-thread loop top */
 +        /* 2.2.1 T-472: a rejoin's first picture waits in nextf until its slot is due (rj_prime_park). These ticks are
 +         * the hold's own repeats — a dup each, the hold picture on air, house_skew and the fills' clock moving on — not
-+         * cadence residence, so the audio fill runs up to the tick the picture is shown on. Bounded by the base cushion
++         * cadence residence, so the audio fill runs up to the tick the picture is shown on (2.2.3 T-503: not after a
++         * video-only hold — the sound kept flowing, the wait is a video-only repeat). Bounded by the base cushion
 +         * (+2 ticks: h0 or the map moving under it must not hold the picture back) */
 +        if (rj_park && (!next_have || content_index(v, nextf->pts) <= last_vpts + 1 ||
 +                        ++rj_park_n > sp_cap(v, base_sp) + 2))
@@ -23992,6 +24040,14 @@ index 0000000000..cd1c1eaf97
 +                int64_t vr = atomic_load_explicit(&g_src_vread_wc, memory_order_relaxed);
 +                int64_t ar = atomic_load_explicit(&g_src_aread_wc, memory_order_relaxed);
 +                vo_rep = vr && ar && nwv - vr >= 500000 && nwv - ar < 1000000;
++                /* 2.2.3 T-503: also a rejoin's wait for its slot (T-472) after a video-only hold — the video is read
++                 * again (the frame queue fills), so the rule above saw no outage, and the wait's repeats (the base
++                 * cushion, 3.88 s at a 4 s pre-roll) went into house_skew: the live sound was skipped by that much while
++                 * the picture waited ([PTV-ASTEP] +80..+600 ms steps) and the next 4 s dropped as overlap when house_skew
++                 * came back ([PTV-ATRIM] stepped back 4 s) — 1-3 returning pictures without their beep on every
++                 * sync_vnull_20 since 2.2.1-rc4. The sound never stopped: its place is its label, as through the hold */
++                if (!vo_rep && rj_park && vo_extra && ar && nwv - ar < 1000000)
++                    vo_rep = 1;
 +                if (vo_rep) { vo_extra++; vo_fresh_n = 0; }
 +            }
 +            /* content moves again: house_skew back on the formula (the rejoin's map step lands here). 2.0.0 T-345: not on
@@ -24593,10 +24649,10 @@ index 0000000000..cd1c1eaf97
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..fa91dc081f
+index 0000000000..30b31eff19
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3319 @@
+@@ -0,0 +1,3363 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -25487,6 +25543,27 @@ index 0000000000..fa91dc081f
 + * multiple-of-2^bits offset so every downstream consumer sees one continuous
 + * timeline. Keyed on DTS (decode order, monotonic); the SAME offset is added to
 + * PTS so A/V copy stays aligned. mpegtsenc masks back to 33 bits on the wire. */
++/* 2.2.3 T-530: the program's position for a half-wrap step — the unwrapped last label of the other dense (video / audio)
++ * stream delivered most recently within 10 s, in this stream's time base (same time base only, as in mpegts);
++ * AV_NOPTS_VALUE when there is none (the stream decides on its own, as before) */
++static int64_t halfwrap_ref(const DemuxArgs *d, int si, int64_t wall_now)
++{
++    const AVStream *st = d->ifmt->streams[si];
++    int64_t best = AV_NOPTS_VALUE, best_wc = 0;
++    int o;
++
++    for (o = 0; o < d->nb_streams_open && o < (int)d->ifmt->nb_streams; o++) {
++        const AVStream *os = d->ifmt->streams[o];
++        if (o == si || d->wrap_last[o] == AV_NOPTS_VALUE || d->wrap_wall_last[o] <= best_wc ||
++            wall_now - d->wrap_wall_last[o] > 10000000 || av_cmp_q(os->time_base, st->time_base) ||
++            (os->codecpar->codec_type != AVMEDIA_TYPE_VIDEO && os->codecpar->codec_type != AVMEDIA_TYPE_AUDIO))
++            continue;
++        best    = d->wrap_last[o] + d->wrap_off[o];
++        best_wc = d->wrap_wall_last[o];
++    }
++    return best;
++}
++
 +static void demux_unwrap(DemuxArgs *d, AVPacket *pkt)
 +{
 +    AVStream *st = d->ifmt->streams[pkt->stream_index];
@@ -25679,6 +25756,29 @@ index 0000000000..fa91dc081f
 +                       "[PTV-DISCONT] stream %d: re-anchored after %.1fh silence (%+"PRId64" wraps; "
 +                       "delta heuristic aliases past %.1fh)\n",
 +                       pkt->stream_index, (wall_now - wl) / 3600.0e6, k, guard_us / 3600.0e6);
++            }
++            else if (llabs(llabs(delta) - half) < av_rescale(600, st->time_base.den, st->time_base.num) &&
++                     (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO || st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) &&
++                     halfwrap_ref(d, pkt->stream_index, wall_now) != AV_NOPTS_VALUE) {
++                /* 2.2.3 T-530: a step of about HALF the wrap (2^32 ticks, 13.25 h) reads +half on one stream and -half
++                 * on the next by a few hundred ms either way — the +-half rule below decides each stream on its own,
++                 * so the video and the audio of one program step ended 2^33 apart (glo-4 EPIC_BHARAT, an HLS source
++                 * whose PCR and labels jump +2^32 - 1.2 s: [PTV-TL] video J +95443.758 s, the audio MUTED as off the
++                 * program clock, wire A/V -15 s, sync_check restarts; key sync_halfwrap T056_HW_GAP=1.6: the audio
++                 * 2^33 off, MUXGUARD exit). There the wrap count is the one that lands the packet nearest the other
++                 * dense stream of the program (the one delivered last): the program steps once, its streams together.
++                 * Also the return from one label with bit 32 set (EPIC 22:46): it lands back by the other stream. */
++                int64_t ref = halfwrap_ref(d, pkt->stream_index, wall_now);
++                int64_t cur = raw + d->wrap_off[pkt->stream_index], k;
++                int64_t diff = ref - cur;
++                k = diff >= 0 ? (diff + half) / mask : -((-diff + half) / mask);
++                if (k) {
++                    d->wrap_off[pkt->stream_index] += k * mask;
++                    if (ol) ol->wrap_dw = k * mask;
++                }
++                av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: a half-wrap step (%+.3f s) — wrap taken by the "
++                       "program (%+"PRId64" wraps, nearest the other stream)\n",
++                       pkt->stream_index, delta * av_q2d(st->time_base), k);
 +            }
 +            else if (delta < -half) {
 +                d->wrap_off[pkt->stream_index] += mask;  /* 33-bit wrap: rolled forward */

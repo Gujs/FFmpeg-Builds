@@ -1,0 +1,8 @@
+version=2.2.3-pre4
+channel=dev
+tag=ptv-2.2.3-pre4
+source_commit=997edfba0a38e342e2171c00517681204317fc9e
+branches=master
+verified_master=05c674c9132eb13e65e3fb6e9b4cf1cad1219fd5
+verified_date=2026-11-23
+supersedes=2.2.3-pre3
