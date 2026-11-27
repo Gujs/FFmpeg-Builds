@@ -105,16 +105,50 @@ index 3ffcedf1b8..26f4687d63 100644
      fftools/textformat/tf_compact.o   \
 diff --git a/fftools/ptvencoder-changelog.md b/fftools/ptvencoder-changelog.md
 new file mode 100644
-index 0000000000..9f4de1bfb5
+index 0000000000..668ee65a69
 --- /dev/null
 +++ b/fftools/ptvencoder-changelog.md
-@@ -0,0 +1,6793 @@
+@@ -0,0 +1,6827 @@
 +# ptvencoder version history
 +
 +Per-release notes, extracted verbatim from the `ptvencoder.c` header on 2026-07-03
 +(the in-code block had grown to ~190 comment lines). **Add new release notes HERE,**
 +keep only the current `PTVENCODER_VERSION` define in the source. This file is part of
 +the v2 `0001` patch (additive, travels with the source to the build box).
++
++## 2.2.4-pre5 — 2.2.4-pre4 + a stream whose labels flip bit 32 lands back by its partner (T-537)
++
++**T-537 — a half-wrap step is undone in half wraps.** glo-4 EPIC_MUSIC (2.2.3, 2026-11-27 02:57 and 03:22 GMT): only the
++video's labels and its PCR flipped bit 32 (-2^32 ticks for 0.7 s, back, -2^32 for 0.3 s, back), right after a 3.2 s stall;
++the audio never moved. The T-530 rule (2.2.3-pre4) took a step of about half the 33-bit wrap to the wrap count nearest the
++other stream, but counted in whole 2^33 wraps: a 2^32 error stays 2^32 either way ('+0 wraps' when the step read just under
++half). The timeline then took one step as a new domain and the return as sent: video and sound 2^32 ticks (13.3 h) apart,
++lipsync= +4.77e7 ms, sync_check restarts, ~33 min with the sound lost. Now the correction is counted in half wraps: the
++stepped stream lands back next to the other one at every step and nothing reaches the timeline but the real part of the
++step. A whole-program step of about half (T-530) is undone on each stream as it crosses: both stay together and the
++timeline sees only the small real step. Log: `[PTV-DISCONT] stream N: a half-wrap step (...) — wrap taken by the program
++(+-1 half wraps, nearest the other stream)`.
++
++Keys (kit 9f4afe8, media-v55 `4e9fd1272c9e`): `vt-t537` (sync_hwflip, T056_HW_GAP=3.2 T056_HWF_X=-4.2: the first step
++just under half, as at 03:22) 2.2.4-pre4 FAIL (lip sync -47679144 ms, video PTS hole 47718 s, PIDs dark 2.5-2.9 s) -> PASS
++(lip sync +0/+1 ms); `vt-t537n` (no stall, steps at exactly half) pre4 FAIL (video PTS holes up to 1 s, PCR) -> PASS with no
++timeline event; `vt-t537g` (stall, steps just over half) PASS on both. The 8 T-530 keys PASS.
++
++## 2.2.4-pre4 — 2.2.4-pre3 + a mosaic slot with a sliding phase keeps its sound in place (T-536)
++
++**T-536 — the sound of a mosaic slot whose phase slides against the house no longer jumps after its pictures.** A slot whose
++pictures walk through the pick window (a 30.00 fps source in a 29.97 mosaic, or a source clock off ours: cow-2 REVn in0, a
++30.00 source at +1000..+1800 ppm) jumps back a whole picture each time it leaves the window (every ~33 s there). The sound
++followed the pictures' 1/32 average (re-placed in 10.7 ms steps) and took each jump over ~3 s: +21..+29 ms on air at every jump
++(the -31..-54 ms single status readings on REVn). Now the slot's realized lag is its lag + the MEAN of where the shown pictures
++landed in the pick window over the last 60 s (6 bins of 10 s; re-seeded at a re-lock, not at a drift step): as a frame sync,
++the error is the picture's own phase, within half a picture, and the sound is not re-placed for it. (A min/max middle was
++tried first: one late picture under a loaded CPU moved it, and two mosaic keys failed in the 12-lane gate.) A slot whose phase stands still keeps its
++sound on its pictures exactly, as before.
++
++Key (kit 6481171, media-v54 `11f7402e2bb7`): `mv-t536 slide` (t536key.sh: the production 1x2 mosaic, slot 0 an exact 30.000 fps
++ruler, 1100 ppm, 300 s; every slot-0 marker within +-21 ms): 2.2.4-pre3 worst +29 ms (12 markers beyond 21 ms) -> worst
++-19.7 ms (4 beyond 17 ms), slot-0 sound re-placement lines 16 -> 5. All 61 mosaic keys PASS.
 +
 +## 2.2.4-pre3 — 2.2.4-pre2 + no output PTS hole at a small label step on film / slower sources (T-504)
 +
@@ -6904,7 +6938,7 @@ index 0000000000..9f4de1bfb5
 +via the banner / `-version`.
 diff --git a/fftools/ptvencoder.c b/fftools/ptvencoder.c
 new file mode 100644
-index 0000000000..a04bc74037
+index 0000000000..14e3d6884c
 --- /dev/null
 +++ b/fftools/ptvencoder.c
 @@ -0,0 +1,8019 @@
@@ -6957,7 +6991,7 @@ index 0000000000..a04bc74037
 +const char program_name[] = "ptvencoder";
 +const int  program_birth_year = 2026;
 +
-+#define PTVENCODER_VERSION "2.2.4-pre3"   /* bump per release; notes go in ptvencoder-changelog.md */
++#define PTVENCODER_VERSION "2.2.4-pre5"   /* bump per release; notes go in ptvencoder-changelog.md */
 +#define PTV_FRAME_QDEPTH 48    /* decode->output jitter buffer (frames); holds the pre-roll cushion */
 +int     g_diag;
 +/* A/V common-mode lock: the video frame-synchronizer's dup/drop makes the house
@@ -24839,10 +24873,10 @@ index 0000000000..bfae00c9ca
 +
 diff --git a/fftools/ptvencoder_demux.c b/fftools/ptvencoder_demux.c
 new file mode 100644
-index 0000000000..06d87d6b59
+index 0000000000..fae10dcc24
 --- /dev/null
 +++ b/fftools/ptvencoder_demux.c
-@@ -0,0 +1,3419 @@
+@@ -0,0 +1,3426 @@
 +#include <unistd.h>   /* _exit() — 2.0.0-pre5 reshaped-source exit, the pre26 wedge-free fatal path */
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -25957,17 +25991,24 @@ index 0000000000..06d87d6b59
 +                 * program clock, wire A/V -15 s, sync_check restarts; key sync_halfwrap T056_HW_GAP=1.6: the audio
 +                 * 2^33 off, MUXGUARD exit). There the wrap count is the one that lands the packet nearest the other
 +                 * dense stream of the program (the one delivered last): the program steps once, its streams together.
-+                 * Also the return from one label with bit 32 set (EPIC 22:46): it lands back by the other stream. */
++                 * Also the return from one label with bit 32 set (EPIC 22:46): it lands back by the other stream.
++                 * 2.2.4 T-537: the correction is counted in HALF wraps (2^32 ticks), not whole ones. glo-4 EPIC_MUSIC
++                 * (2026-11-27 02:57 + 03:22 GMT, 2.2.3): only the VIDEO's labels (and its PCR) flipped bit 32 —
++                 * -2^32 for 0.7 s, back, -2^32 for 0.3 s, back — and the audio never moved. Rounded to whole 2^33
++                 * wraps, a 2^32 error stays 2^32 either way ('+0 wraps' / '+1 wraps'): [PTV-TL] then took one step as a
++                 * new domain and the return as sent, video and sound left 2^32 apart (lipsync= +4.77e7 ms, sync_check
++                 * restarts). In half wraps the stepped stream lands back next to the other one at every step; a whole
++                 * program step of ~half (T-530) is then undone on each stream as it crosses (both stay together). */
 +                int64_t ref = halfwrap_ref(d, pkt->stream_index, wall_now);
 +                int64_t cur = raw + d->wrap_off[pkt->stream_index], k;
 +                int64_t diff = ref - cur;
-+                k = diff >= 0 ? (diff + half) / mask : -((-diff + half) / mask);
++                k = diff >= 0 ? (diff + half / 2) / half : -((-diff + half / 2) / half);
 +                if (k) {
-+                    d->wrap_off[pkt->stream_index] += k * mask;
-+                    if (ol) ol->wrap_dw = k * mask;
++                    d->wrap_off[pkt->stream_index] += k * half;
++                    if (ol) ol->wrap_dw = k * half;
 +                }
 +                av_log(NULL, AV_LOG_WARNING, "[PTV-DISCONT] stream %d: a half-wrap step (%+.3f s) — wrap taken by the "
-+                       "program (%+"PRId64" wraps, nearest the other stream)\n",
++                       "program (%+"PRId64" half wraps, nearest the other stream)\n",
 +                       pkt->stream_index, delta * av_q2d(st->time_base), k);
 +            }
 +            else if (delta < -half) {
@@ -31067,10 +31108,10 @@ index 0000000000..18046fa2c5
 +}
 diff --git a/fftools/ptvencoder_mv.c b/fftools/ptvencoder_mv.c
 new file mode 100644
-index 0000000000..1868300c57
+index 0000000000..f7dcbf390a
 --- /dev/null
 +++ b/fftools/ptvencoder_mv.c
-@@ -0,0 +1,1237 @@
+@@ -0,0 +1,1271 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -31180,6 +31221,10 @@ index 0000000000..1868300c57
 +                                                     * boundary, from skip_from on, is gone (pictures there are dropped) */
 +    int64_t skip_from;
 +    int     pend_gap;                               /* the pending picture: the full queue dropped pictures before it */
++    int64_t ph_sum[6], ph_wc;                       /* 2.2.4 T-536: the shown pictures' place in the pick window (smp -
++                                                     * lag), summed per 10 s bin; the newest bin opened at ph_wc */
++    int     ph_cnt[6];                              /* ... pictures per bin */
++    int     ph_n;                                   /* ... bins so far (0 = none: re-seeded at a re-lock) */
 +} MvTlSlot;
 +
 +/* TEST-ONLY (PTV_TEST_MVSTEP_AT=K:FILE[:MS], 2.2.3 T-523): slot K's lag steps take their boundary at the first flash of the
@@ -31374,6 +31419,7 @@ index 0000000000..1868300c57
 +                       "pictures before this one are gone, %"PRId64" dropped so far)\n", k, (out - tgt - s->lag) / 1000,
 +                       s->ovf_seen);
 +                mv_tl_step(c, k, s, out - tgt, h0, now_us, tgt);
++                s->ph_n = 0;                        /* a new phase (T-536) */
 +                s->ovf_wc = now_us;
 +                gap = 0;
 +                if (fs < tgt) {                     /* this one is inside the skip too */
@@ -31391,6 +31437,7 @@ index 0000000000..1868300c57
 +                av_log(NULL, AV_LOG_WARNING, "[PTV-MV] in%d re-locked: picture %+"PRId64" ms (content ahead)\n",
 +                       k, (out - fs + margin - s->lag) / 1000);
 +                mv_tl_step(c, k, s, out - fs + margin, h0, now_us, AV_NOPTS_VALUE);
++                s->ph_n = 0;                        /* a new phase (T-536) */
 +            }
 +            *pending = nx;                          /* not due yet */
 +            s->pend_gap = gap;
@@ -31447,6 +31494,7 @@ index 0000000000..1868300c57
 +                   (relock - s->lag) / 1000);
 +            s->late_wc = 0;
 +            mv_tl_step(c, k, s, relock, h0, now_us, AV_NOPTS_VALUE);
++            s->ph_n = 0;                            /* a new phase (T-536) */
 +        } else
 +            relock = AV_NOPTS_VALUE;
 +        if (src != AV_NOPTS_VALUE) {
@@ -31470,15 +31518,42 @@ index 0000000000..1868300c57
 +            }
 +            if (!s->shown_wc)
 +                s->real = s->lag;
-+            /* ... by at most a picture per sample: two source pictures labelled 29 pictures old (RAV slot 1, a 29.97i
-+             * feed, at 36 s) moved it 30 ms, the sound chased it there and back in half-frame steps and kept -7.5 ms */
-+            /* 2.2.3 T-518: ... and only from a picture on its place. A backlog's pictures are shown late while the slot
-+             * catches up (above) and realize no lag: 3.8 s of them walked this +126 ms (a picture per sample, / 32), the
-+             * sound was re-placed after it ("+81.2 ms (drift)") and played up to 116 ms late for 6 s after the return
-+             * (sync_catchup_8, flash against beep) */
-+            if (smp - s->lag <= 500000) {
-+                int64_t w = FFMAX(c->tick_dur_us, s->cad);
-+                s->real += av_clip64(smp - s->real, -w, w) / 32;
++            /* 2.2.4 T-536: the sound sits on the shown pictures' place averaged over the last minute, not over ~1 s.
++             * The pick window puts a picture between half a picture early and half a picture late of the lag (above): a
++             * slot whose phase to the house SLIDES (a 30.00 source in a 29.97 mosaic, or a source clock off ours) walks
++             * through that window and jumps back a whole picture each time it leaves it (30.00 in 29.97: every 33.4 s).
++             * The 1/32 average (~1 s) followed the walk and the sound with it (re-placed in 10.7 ms steps); at the jump
++             * the picture moved a whole picture at once and the sound followed over ~3 s: +21..+29 ms on air at every
++             * jump (cow-2 REVn in0, mv02-t536). A frame sync leaves the sound alone and drops / repeats whole pictures:
++             * averaged over a minute (more than one walk) the place is the middle of the window the pictures use, the
++             * error is the picture's own phase, within half a picture, and the sound is not re-placed for it (a partial
++             * walk in the window moves the mean ~1.5 ms). A slot whose phase stands still keeps the sound on its
++             * pictures' average, as before. The mean, not the middle of lowest and highest: one jittered picture moves
++             * the middle by up to half a picture (a slot at the window's edge, under load: mv01 sync_gap_20 -34 ms).
++             * The window = the last 60 s (6 bins of 10 s); re-seeded at a re-lock (a new phase), not at a drift step
++             * (the walk goes on across it).
++             * Only a picture on its place counts (2.2.3 T-518: a backlog's late pictures realize no lag — 3.8 s of them
++             * walked the average +126 ms; two pictures labelled 29 pictures old moved it 30 ms) */
++            {
++                int64_t dev = smp - s->lag, c2 = FFMIN(half, s->cad / 2);
++                if (dev >= -c2 - 2000 && dev <= s->cad - c2 + 2000) {
++                    int64_t sum = 0;
++                    int x, nb, cnt = 0;
++                    if (!s->ph_n || now_us - s->ph_wc >= 10000000) {
++                        s->ph_sum[s->ph_n % 6] = 0;
++                        s->ph_cnt[s->ph_n % 6] = 0;
++                        s->ph_n++;
++                        s->ph_wc = now_us;
++                    }
++                    s->ph_sum[(s->ph_n - 1) % 6] += dev;
++                    s->ph_cnt[(s->ph_n - 1) % 6]++;
++                    nb = FFMIN(s->ph_n, 6);
++                    for (x = 0; x < nb; x++) {
++                        sum += s->ph_sum[x];
++                        cnt += s->ph_cnt[x];
++                    }
++                    s->real = s->lag + sum / cnt;
++                }
 +            }
 +        }
 +        if (src != AV_NOPTS_VALUE)
